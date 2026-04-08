@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.claude/
+output/
+*.ply
+*.glb
+*.zip
