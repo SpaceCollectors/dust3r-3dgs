@@ -6,3 +6,9 @@ output/
 *.ply
 *.glb
 *.zip
+refine_debug/
+imgui.ini
+mast3r/
+vggt/
+StableNormal/
+models/

@@ -314,8 +314,8 @@ def update_preview(scene, min_conf_thr, as_pointcloud, mask_sky,
                           mask_sky, clean_depth, transparent_cams, cam_size)
 
 
-def refine_mesh_fn(scene, min_conf_thr, clean_depth, refine_iters, depth_reg, smooth_reg,
-                   progress=gr.Progress(track_tqdm=False)):
+def refine_mesh_fn(scene, min_conf_thr, clean_depth, refine_iters, compare_mode,
+                   depth_reg, smooth_reg, progress=gr.Progress(track_tqdm=False)):
     """Export mesh, then refine with multi-view photoconsistency."""
     if scene is None:
         raise gr.Error("No reconstruction available. Run reconstruction first!")
@@ -362,6 +362,7 @@ def refine_mesh_fn(scene, min_conf_thr, clean_depth, refine_iters, depth_reg, sm
         '--mesh_path', mesh_path,
         '--output_path', output_path,
         '--iterations', str(int(refine_iters)),
+        '--compare_mode', str(compare_mode),
         '--depth_reg', str(float(depth_reg)),
         '--smooth_reg', str(float(smooth_reg)),
     ]
@@ -652,6 +653,13 @@ def build_ui():
             gr.HTML('<p style="color: #666;">Moves vertices to minimize color disagreement between cameras. Export Dense Mesh first.</p>')
             with gr.Row():
                 refine_iters = gr.Number(value=500, precision=0, label="Iterations")
+                refine_compare = gr.Dropdown(
+                    [("Edges (geometry-focused)", "edges"),
+                     ("High Frequency (edges + texture)", "highfreq"),
+                     ("Color (raw RGB)", "color"),
+                     ("Both (edges + color)", "both")],
+                    value="edges", label="Compare Mode",
+                    info="Edges = best for geometry, ignores flat color differences")
                 refine_depth_reg = gr.Slider(value=0.1, minimum=0.0, maximum=1.0, step=0.01,
                                               label="Depth Reg", info="How much to anchor to original position")
                 refine_smooth_reg = gr.Slider(value=0.01, minimum=0.0, maximum=0.1, step=0.005,
@@ -714,7 +722,8 @@ def build_ui():
 
         refine_btn.click(fn=refine_mesh_fn,
                          inputs=[scene_state, min_conf_thr, clean_depth,
-                                 refine_iters, refine_depth_reg, refine_smooth_reg],
+                                 refine_iters, refine_compare,
+                                 refine_depth_reg, refine_smooth_reg],
                          outputs=refine_output)
 
         train_btn.click(fn=export_and_train,
