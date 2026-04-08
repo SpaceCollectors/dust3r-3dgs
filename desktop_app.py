@@ -504,15 +504,17 @@ class GLScene:
             np.add.at(vert_normals[:, ax], faces[:, 2], fn[:, ax].astype(np.float32))
         vert_normals /= (np.linalg.norm(vert_normals, axis=-1, keepdims=True) + 1e-8)
 
-        # Light direction = from vertex toward camera
+        # Light direction = from vertex toward camera (headlamp)
         if camera_pos is not None:
             light_dirs = camera_pos[None, :] - verts
             light_dirs /= (np.linalg.norm(light_dirs, axis=-1, keepdims=True) + 1e-8)
-            ndotl = (vert_normals * light_dirs).sum(axis=-1).clip(0, 1)
+            ndotl = (vert_normals * light_dirs).sum(axis=-1)
+            # Use abs(dot) so both-sided lighting works (handles flipped normals)
+            ndotl = np.abs(ndotl)
         else:
             ndotl = np.full(V, 0.7, dtype=np.float32)
 
-        ambient = 0.15
+        ambient = 0.2
         brightness = ambient + (1.0 - ambient) * ndotl
         grey = (brightness * 220).clip(0, 255).astype(np.uint8)
         shaded = np.stack([grey, grey, grey], axis=-1)

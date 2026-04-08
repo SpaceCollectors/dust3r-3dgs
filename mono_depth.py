@@ -104,51 +104,100 @@ def unproject_depth(depth, K, c2w):
 
 def align_mono_depth_to_reconstruction(mono_depth, recon_pts3d, K, w2c, conf=None, conf_thr=1.0):
     """
-    Align monocular (relative) depth to the reconstruction's (metric) depth.
-    Finds scale and shift: aligned = scale * mono + shift
+    Align monocular depth to reconstruction depth using a nonlinear transfer curve.
+
+    The mono depth has the right relative ordering but the wrong gamma/curve.
+    We fit a monotonic piecewise-linear transfer function:
+      real_depth = transfer(mono_depth)
+
+    Built by:
+    1. Collect (mono_val, dust3r_val) pairs from all valid pixels
+    2. Sort by mono_val, bin into N buckets
+    3. For each bucket: median of dust3r values → one control point
+    4. Interpolate → smooth transfer curve
+    5. Apply to all pixels
 
     Args:
-        mono_depth: (H, W) monocular relative depth
-        recon_pts3d: (H, W, 3) reconstruction 3D points (from dust3r etc.)
-        K: (3, 3) intrinsics
-        w2c: (4, 4) world-to-camera
-        conf: optional (H, W) confidence mask
+        mono_depth: (H, W) monocular depth (already inverted if needed)
+        recon_pts3d: (H, W, 3) reconstruction 3D points
+        K, w2c: camera matrices
+        conf: optional (H, W) confidence
 
     Returns:
-        aligned_depth: (H, W) depth in metric scale
-        scale, shift: alignment parameters
+        aligned_depth: (H, W) corrected depth
+        transfer_curve: (N, 2) array of [mono_val, real_val] control points
     """
     H, W = mono_depth.shape
 
-    # Get reconstruction depth by projecting recon points to camera
+    # Get reconstruction depth
     R = w2c[:3, :3]
     t = w2c[:3, 3]
     pts_flat = recon_pts3d.reshape(-1, 3)
     pts_cam = (R @ pts_flat.T).T + t
     recon_depth = pts_cam[:, 2].reshape(H, W)
 
-    # Valid pixels: positive depth in both, and within confidence
+    # Valid correspondences
     valid = (mono_depth > 0.01) & (recon_depth > 0.01)
     if conf is not None:
         valid &= conf > conf_thr
 
-    if valid.sum() < 100:
-        # Not enough overlap, use median ratio
-        med_mono = np.median(mono_depth[mono_depth > 0.01])
-        med_recon = np.median(recon_depth[recon_depth > 0.01]) if (recon_depth > 0.01).any() else 1.0
-        scale = med_recon / (med_mono + 1e-8)
-        shift = 0.0
-    else:
-        # Least squares: recon_depth = scale * mono_depth + shift
-        m = mono_depth[valid].ravel()
-        r = recon_depth[valid].ravel()
-        A = np.stack([m, np.ones_like(m)], axis=-1)
-        result = np.linalg.lstsq(A, r, rcond=None)
-        scale, shift = result[0]
+    n_valid = valid.sum()
+    print(f"    Transfer curve: {n_valid:,d} valid correspondences")
 
-    aligned = scale * mono_depth + shift
-    aligned = np.clip(aligned, 0.001, None)
-    return aligned, scale, shift
+    if n_valid < 50:
+        med_mono = np.median(mono_depth[mono_depth > 0.01]) + 1e-8
+        med_recon = np.median(recon_depth[recon_depth > 0.01]) if (recon_depth > 0.01).any() else 1.0
+        scale = med_recon / med_mono
+        curve = np.array([[0, 0], [1, scale]])
+        return mono_depth * scale, curve
+
+    # Collect pairs
+    mono_vals = mono_depth[valid].ravel()
+    recon_vals = recon_depth[valid].ravel()
+
+    # Remove outliers
+    p2, p98 = np.percentile(recon_vals, [2, 98])
+    good = (recon_vals > p2) & (recon_vals < p98)
+    mono_vals = mono_vals[good]
+    recon_vals = recon_vals[good]
+
+    # Sort by mono value
+    sort_idx = np.argsort(mono_vals)
+    mono_sorted = mono_vals[sort_idx]
+    recon_sorted = recon_vals[sort_idx]
+
+    # Bin into N buckets, take median of each
+    N_BINS = 64
+    bin_size = max(1, len(mono_sorted) // N_BINS)
+    control_mono = []
+    control_recon = []
+
+    for bi in range(0, len(mono_sorted), bin_size):
+        chunk_m = mono_sorted[bi:bi + bin_size]
+        chunk_r = recon_sorted[bi:bi + bin_size]
+        if len(chunk_m) > 0:
+            control_mono.append(np.median(chunk_m))
+            control_recon.append(np.median(chunk_r))
+
+    control_mono = np.array(control_mono, dtype=np.float64)
+    control_recon = np.array(control_recon, dtype=np.float64)
+
+    # Ensure monotonic (both should increase together)
+    # If not, enforce by taking cumulative max
+    for i in range(1, len(control_recon)):
+        if control_recon[i] < control_recon[i - 1]:
+            control_recon[i] = control_recon[i - 1]
+
+    print(f"    Transfer curve: {len(control_mono)} control points")
+    print(f"    Mono range: [{control_mono[0]:.4f}, {control_mono[-1]:.4f}]")
+    print(f"    Recon range: [{control_recon[0]:.4f}, {control_recon[-1]:.4f}]")
+
+    # Apply transfer curve via interpolation
+    aligned = np.interp(mono_depth.ravel(), control_mono, control_recon).reshape(H, W)
+    aligned = np.clip(aligned, 0.001, None).astype(np.float32)
+
+    curve = np.stack([control_mono, control_recon], axis=-1)
+    return aligned, curve
 
 
 # ── Full Pipeline ────────────────────────────────────────────────────────────
@@ -214,12 +263,50 @@ def generate_enhanced_pointcloud(scene, image_paths, progress_fn=None, device='c
         # 1. Predict monocular depth
         mono_depth = predict_depth(img, device=device)
 
-        # 2. Align to reconstruction scale
+        # 2. Get dust3r depth for this view (project recon points to camera)
+        R_w2c = w2c[:3, :3]
+        t_w2c = w2c[:3, 3]
+        recon_pts_cam = (R_w2c @ recon_pts3d[i].reshape(-1, 3).T).T + t_w2c
+        dust3r_depth = recon_pts_cam[:, 2].reshape(H, W)
+
+        # Debug: save both depth maps for comparison
+        debug_dir = os.path.join(os.path.dirname(__file__), 'refine_debug')
+        os.makedirs(debug_dir, exist_ok=True)
+        from PIL import Image as _PILImg
+
+        # Normalize both to [0, 255] for visualization
+        def _depth_to_vis(d, name):
+            valid = d > 0.01
+            if valid.any():
+                d_vis = d.copy()
+                d_vis[~valid] = 0
+                d_min, d_max = d_vis[valid].min(), d_vis[valid].max()
+                d_vis = ((d_vis - d_min) / (d_max - d_min + 1e-8) * 255).clip(0, 255).astype(np.uint8)
+                d_vis[~valid] = 0
+                _PILImg.fromarray(d_vis).save(os.path.join(debug_dir, f'{name}_view{i}.png'))
+                print(f"    {name}: range [{d_min:.4f}, {d_max:.4f}]")
+
+        _depth_to_vis(mono_depth, 'mono_depth')
+        _depth_to_vis(dust3r_depth, 'dust3r_depth')
+
+        # Check if monocular depth is inverted relative to dust3r
+        valid_both = (mono_depth > 0.01) & (dust3r_depth > 0.01)
+        if valid_both.sum() > 100:
+            corr = np.corrcoef(mono_depth[valid_both].ravel(), dust3r_depth[valid_both].ravel())[0, 1]
+            print(f"    Correlation mono vs dust3r: {corr:.4f}")
+            if corr < -0.3:
+                print(f"    *** INVERTING monocular depth (negative correlation detected) ***")
+                mono_max = mono_depth[mono_depth > 0.01].max()
+                mono_depth = mono_max - mono_depth
+                mono_depth = np.clip(mono_depth, 0.001, None)
+                _depth_to_vis(mono_depth, 'mono_depth_inverted')
+
+        # 3. Align to reconstruction scale using per-pixel LUT
         if recon_pts3d[i] is not None:
             conf = recon_confs[i] if recon_confs[i] is not None else None
-            aligned_depth, scale, shift = align_mono_depth_to_reconstruction(
+            aligned_depth, correction_map = align_mono_depth_to_reconstruction(
                 mono_depth, recon_pts3d[i], K, w2c, conf=conf)
-            print(f"    Depth aligned: scale={scale:.4f}, shift={shift:.4f}")
+            _depth_to_vis(aligned_depth, 'aligned_depth')
         else:
             aligned_depth = mono_depth
 
