@@ -233,8 +233,10 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
     for i in range(n_images):
         dust3r_H, dust3r_W = imgs[i].shape[:2]
         orig_W, orig_H = original_sizes[i]
-        print(f"    image {i}: {dust3r_W}x{dust3r_H} -> {orig_W}x{orig_H} "
-              f"(scale {scale_factors[i][0]:.2f}x, {scale_factors[i][1]:.2f}x)")
+        orient = "landscape" if orig_W >= orig_H else "portrait"
+        W_c, H_c, fx, fy, cx, cy = cam_params[i]
+        print(f"    image {i}: {dust3r_W}x{dust3r_H} -> {orig_W}x{orig_H} [{orient}] "
+              f"(fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f})")
     print(f"  - {len(all_pts)} 3D points")
     return output_dir
 

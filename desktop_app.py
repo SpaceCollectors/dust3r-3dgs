@@ -546,7 +546,7 @@ class AppState:
         self.image_dir = ""
 
         # Backend
-        self.backend_idx = 1  # 0=dust3r, 1=mast3r, 2=vggt
+        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt
         self.backends = ['dust3r', 'mast3r', 'vggt']
 
         # Reconstruction
@@ -586,6 +586,17 @@ class AppState:
         # Mesh data (numpy, for saving)
         self.mesh_data = None  # (verts, faces, colors)
         self.target_faces = 100000  # target face count for dense mesh
+        self.ai_depth_mix = 0.7  # 0=pure dust3r, 1=full AI detail
+        self.ai_highpass_radius = 10.0  # high-pass sigma in pixels
+        self.ai_refine_poses = True  # re-optimize poses after depth injection
+        self.ai_pose_iters = 100
+        self.ai_merge_points = True  # average overlapping points from different views
+        self.merge_radius_mult = 1.5  # merge radius multiplier (1.0 = tight, 3.0 = aggressive)
+
+        # Mesh generation settings
+        self.poisson_depth = 8      # octree depth (6=coarse/fast, 10=fine/slow)
+        self.normal_radius = 3.0    # % of scene extent for normal estimation
+        self.trim_percentile = 5    # % of low-density verts to remove
 
         # Scene orientation transform (applied in shader)
         self.scene_rot_x = 0.0  # degrees
@@ -785,10 +796,21 @@ def run_reconstruction(state, scene_gl):
                     all_colors.append((rgbimg[i].reshape(-1, 3) * 255).astype(np.uint8))
 
             if all_pts:
+                # Build view_ids: which camera each point came from
+                all_view_ids = []
+                for vi in range(len(all_pts)):
+                    all_view_ids.append(np.full(len(all_pts[vi]), vi, dtype=np.int32))
+
                 points = np.concatenate(all_pts, axis=0)
                 colors = np.concatenate(all_colors, axis=0)
+                pt_view_ids = np.concatenate(all_view_ids, axis=0)
 
-                # Subsample if too many
+                # Merge overlapping points (cross-view only)
+                if state.ai_merge_points and len(points) > 0:
+                    from depth_inject import merge_overlapping_points
+                    points, colors = merge_overlapping_points(
+                        points, colors, view_ids=pt_view_ids)
+
                 if len(points) > 200000:
                     idx = np.random.choice(len(points), 200000, replace=False)
                     points, colors = points[idx], colors[idx]
@@ -822,6 +844,19 @@ def run_reconstruction(state, scene_gl):
             except Exception:
                 pass
 
+        # Auto-fix orientation: dust3r often outputs upside-down
+        # Heuristic: if most cameras are below the point cloud center, flip
+        if state.has_points and backend != 'vggt':
+            try:
+                cam_y_values = np.array([c2w_all[i][1, 3] for i in range(len(c2w_all))])
+                pts_center_y = points[:, 1].mean()
+                # If cameras are below center, scene is likely upside down
+                if cam_y_values.mean() < pts_center_y:
+                    state.scene_rot_x = 180.0
+                    print("  Auto-flipped scene (detected upside-down)")
+            except Exception:
+                pass
+
         state.status = "Reconstruction complete!"
         state.error_msg = ""
 
@@ -835,6 +870,135 @@ def run_reconstruction(state, scene_gl):
 
 
 # ── Main App ─────────────────────────────────────────────────────────────────
+
+def run_depth_injection(state, scene_gl):
+    """Inject AI depth into dust3r's scene and regenerate point cloud."""
+    state.status = "Injecting AI depth..."
+    try:
+        from depth_inject import inject_ai_depth
+        from dust3r.utils.device import to_numpy
+
+        def progress(frac, msg):
+            state.status = msg
+
+        new_pts3d = inject_ai_depth(
+            state.scene, state.scene.imgs,
+            mix=state.ai_depth_mix,
+            highpass_sigma=state.ai_highpass_radius,
+            device='cuda', progress_fn=progress)
+
+        # Optionally refine poses to fit the new depth
+        if state.ai_refine_poses:
+            from depth_inject import refine_poses_with_ai_depth
+            state.status = "Refining camera poses..."
+            refine_poses_with_ai_depth(
+                state.scene, niter=state.ai_pose_iters, lr=0.005,
+                progress_fn=progress)
+            # Re-get point cloud with refined poses
+            new_pts3d = to_numpy(state.scene.get_pts3d())
+
+        # Update viewport
+        imgs = state.scene.imgs
+        all_pts = []
+        all_colors = []
+        all_view_ids = []
+        for i in range(len(imgs)):
+            pts = new_pts3d[i]
+            flat = pts.reshape(-1, 3)
+            all_pts.append(flat)
+            all_colors.append((imgs[i].reshape(-1, 3) * 255).clip(0, 255).astype(np.uint8))
+            all_view_ids.append(np.full(len(flat), i, dtype=np.int32))
+
+        points = np.concatenate(all_pts, axis=0)
+        colors = np.concatenate(all_colors, axis=0)
+        pt_view_ids = np.concatenate(all_view_ids, axis=0)
+
+        # Merge overlapping points (cross-view only)
+        if state.ai_merge_points and len(points) > 0:
+            state.status = "Merging overlapping points..."
+            from depth_inject import merge_overlapping_points
+            points, colors = merge_overlapping_points(
+                points, colors, view_ids=pt_view_ids)
+
+        if len(points) > 200000:
+            idx = np.random.choice(len(points), 200000, replace=False)
+            points, colors = points[idx], colors[idx]
+
+        scene_gl.set_points(points, colors)
+        state.has_points = True
+        state.draw_mode = 0
+
+        # Show cameras (with potentially updated poses)
+        try:
+            c2w_all = to_numpy(state.scene.get_im_poses().cpu())
+            cam_poses = [c2w_all[i] for i in range(len(imgs))]
+            ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+            scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+        except Exception:
+            pass
+
+        pose_str = " + poses refined" if state.ai_refine_poses else ""
+        state.status = f"AI depth injected (mix={state.ai_depth_mix:.2f}){pose_str}. {len(points):,d} points."
+
+    except Exception as e:
+        state.error_msg = str(e)
+        state.status = f"Depth injection failed: {e}"
+        import traceback
+        traceback.print_exc()
+
+    state.reconstructing = False
+
+
+def _run_merge_points(state, scene_gl):
+    """Merge overlapping points as a standalone operation."""
+    state.refine_progress = "Merging overlapping points..."
+    try:
+        from depth_inject import merge_overlapping_points
+        from dust3r.utils.device import to_numpy
+
+        # Get current point cloud from scene
+        scene = state.scene
+        imgs = scene.imgs
+        pts3d = to_numpy(scene.get_pts3d())
+
+        all_pts = []
+        all_colors = []
+        all_view_ids = []
+        for i in range(len(imgs)):
+            flat = pts3d[i].reshape(-1, 3)
+            all_pts.append(flat)
+            all_colors.append((imgs[i].reshape(-1, 3) * 255).clip(0, 255).astype(np.uint8))
+            all_view_ids.append(np.full(len(flat), i, dtype=np.int32))
+
+        points = np.concatenate(all_pts, axis=0)
+        colors = np.concatenate(all_colors, axis=0)
+        pt_view_ids = np.concatenate(all_view_ids, axis=0)
+
+        # Auto radius with multiplier
+        from scipy.spatial import cKDTree
+        sample = points[np.random.choice(len(points), min(10000, len(points)), replace=False)]
+        tree = cKDTree(sample)
+        dists, _ = tree.query(sample, k=2)
+        radius = float(np.median(dists[:, 1])) * state.merge_radius_mult
+
+        points, colors = merge_overlapping_points(
+            points, colors, merge_radius=radius, view_ids=pt_view_ids)
+
+        if len(points) > 200000:
+            idx = np.random.choice(len(points), 200000, replace=False)
+            points, colors = points[idx], colors[idx]
+
+        scene_gl.set_points(points, colors)
+        state.status = f"Merged to {len(points):,d} points (radius={radius:.6f})"
+    except Exception as e:
+        state.error_msg = str(e)
+        state.status = f"Merge failed: {e}"
+        import traceback
+        traceback.print_exc()
+
+    state.refining = False
+    state.refine_progress = ""
+
 
 def run_dense_mesh(state, scene_gl):
     """Generate dense mesh from reconstruction via TSDF fusion."""
@@ -894,7 +1058,10 @@ def run_dense_mesh(state, scene_gl):
 
         verts, faces, colors = create_dense_mesh(
             imgs, pts3d_list, confs_list,
-            cam2world_list=cam_poses, min_conf=mesh_min_conf)
+            cam2world_list=cam_poses, min_conf=mesh_min_conf,
+            poisson_depth=state.poisson_depth,
+            normal_radius=state.normal_radius / 100.0,
+            trim_percentile=state.trim_percentile)
 
         if len(faces) > 0:
             # Decimate to target face count if needed
@@ -1355,6 +1522,53 @@ def run_enhanced_mesh(state, scene_gl, debug_imgs=None):
     state.refine_progress = ""
 
 
+def _recolor_from_cameras(verts, faces, views):
+    """Re-color vertices by projecting into cameras with incidence weighting."""
+    V = len(verts)
+    color_accum = np.zeros((V, 3), dtype=np.float64)
+    weight_accum = np.zeros(V, dtype=np.float64)
+
+    # Vertex normals
+    v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
+    fn = np.cross(v1 - v0, v2 - v0)
+    fn /= (np.linalg.norm(fn, axis=-1, keepdims=True) + 1e-8)
+    vn = np.zeros((V, 3), dtype=np.float64)
+    for ax in range(3):
+        np.add.at(vn[:, ax], faces[:, 0], fn[:, ax])
+        np.add.at(vn[:, ax], faces[:, 1], fn[:, ax])
+        np.add.at(vn[:, ax], faces[:, 2], fn[:, ax])
+    vn /= (np.linalg.norm(vn, axis=-1, keepdims=True) + 1e-8)
+
+    for view in views:
+        R = view['w2c'][:3, :3]
+        t = view['w2c'][:3, 3]
+        c2w = np.linalg.inv(view['w2c'])
+        cam_center = c2w[:3, 3]
+
+        pc = (R @ verts.T).T + t
+        zz = np.clip(pc[:, 2], 0.01, None)
+        uu = (pc[:, 0] / zz * view['K'][0, 0] + view['K'][0, 2]).astype(int)
+        vv = (pc[:, 1] / zz * view['K'][1, 1] + view['K'][1, 2]).astype(int)
+        ok = (zz > 0.01) & (uu >= 0) & (uu < view['W']) & (vv >= 0) & (vv < view['H'])
+
+        if ok.any():
+            view_dirs = cam_center[None, :] - verts[ok]
+            view_dirs /= (np.linalg.norm(view_dirs, axis=-1, keepdims=True) + 1e-8)
+            dots = (vn[ok] * view_dirs).sum(axis=-1).clip(0, 1)
+            w = dots ** 2
+
+            sampled = view['pixels'][vv[ok], uu[ok]]
+            color_accum[ok] += sampled * w[:, None]
+            weight_accum[ok] += w
+
+    has_w = weight_accum > 0.001
+    if not has_w.any():
+        return None
+    colors = np.zeros((V, 3), dtype=np.uint8)
+    colors[has_w] = (color_accum[has_w] / weight_accum[has_w, None] * 255).clip(0, 255).astype(np.uint8)
+    return colors
+
+
 def run_texture(state, scene_gl):
     """Generate UV-mapped textured mesh."""
     state.refine_progress = "Generating texture..."
@@ -1385,7 +1599,12 @@ def run_texture(state, scene_gl):
         state.refine_progress = f"UV unwrapping + projecting {len(faces):,d} faces..."
         obj_path = create_textured_mesh(verts, faces, colors, views, output_dir)
 
-        # Update mesh data + viewport with the (possibly decimated) textured mesh
+        # Re-color vertices from the projected texture for viewport display
+        state.refine_progress = "Updating vertex colors from texture..."
+        new_colors = _recolor_from_cameras(verts, faces, views)
+        if new_colors is not None:
+            colors = new_colors
+
         state.mesh_data = (verts, faces, colors)
         scene_gl.set_mesh(verts, faces, colors)
 
@@ -1474,7 +1693,8 @@ def main():
         # ── Side Panel ──
         imgui.set_next_window_position(0, 0)
         imgui.set_next_window_size(400, glfw.get_window_size(window)[1])
-        imgui.begin("Controls", flags=imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_RESIZE)
+        imgui.begin("Controls", flags=imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_TITLE_BAR)
+        imgui.begin_child("ScrollRegion", 0, 0, border=False)
 
         # Status
         imgui.text_colored(state.status, 0.4, 0.8, 1.0)
@@ -1499,6 +1719,21 @@ def main():
                 ])
                 state.image_dir = folder
                 state.status = f"Loaded {len(state.image_paths)} images from {folder}"
+        imgui.same_line()
+        if imgui.button("Select Files..."):
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            files = filedialog.askopenfilenames(
+                title="Select Images",
+                filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.heic"),
+                           ("All files", "*.*")])
+            root.destroy()
+            if files:
+                state.image_paths = sorted(files)
+                state.image_dir = os.path.dirname(files[0])
+                state.status = f"Loaded {len(state.image_paths)} images"
 
         if state.image_paths:
             imgui.text(f"  {len(state.image_paths)} images")
@@ -1531,6 +1766,30 @@ def main():
         if state.reconstructing:
             imgui.text("Reconstructing...")
             imgui.progress_bar(-1.0 * time.time() % 1.0)  # indeterminate
+
+        # ── AI Depth Enhancement ──
+        if state.scene is not None and state.has_points and not state.reconstructing and not state.refining:
+            imgui.separator()
+            imgui.text("AI Depth Enhancement")
+            _, state.ai_depth_mix = imgui.slider_float(
+                "Detail Strength", state.ai_depth_mix, 0.0, 2.0,
+                format="%.2f")
+            _, state.ai_highpass_radius = imgui.slider_float(
+                "Highpass Radius", state.ai_highpass_radius, 1.0, 50.0,
+                format="%.1f px")
+
+            has_depthmaps = hasattr(state.scene, 'im_depthmaps')
+            if has_depthmaps:
+                _, state.ai_refine_poses = imgui.checkbox("Refine poses after injection", state.ai_refine_poses)
+                if state.ai_refine_poses:
+                    _, state.ai_pose_iters = imgui.input_int("Pose Iters", state.ai_pose_iters, 25, 50)
+                if imgui.button("Inject AI Depth (highpass blend)", width=-1):
+                    state.reconstructing = True
+                    state.recon_thread = threading.Thread(
+                        target=run_depth_injection, args=(state, scene_gl), daemon=True)
+                    state.recon_thread.start()
+            else:
+                imgui.text_colored("(Depth injection needs DUSt3R backend)", 0.7, 0.7, 0.3)
 
         imgui.separator()
 
@@ -1567,10 +1826,28 @@ def main():
 
         imgui.separator()
 
+        # ── Point Cloud Tools ──
+        imgui.text("Point Cloud")
+        _, state.ai_merge_points = imgui.checkbox("Merge overlapping", state.ai_merge_points)
+        if state.ai_merge_points:
+            imgui.same_line()
+            _, state.merge_radius_mult = imgui.slider_float(
+                "##radius", state.merge_radius_mult, 0.5, 5.0, format="%.1fx")
+        if state.has_points and not state.refining:
+            if imgui.button("Merge Points Now", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=_run_merge_points, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
+        imgui.separator()
+
         # ── Dense Mesh ──
         imgui.text("Dense Mesh")
         _, state.target_faces = imgui.input_int("Target Faces", state.target_faces, 10000, 50000)
         state.target_faces = max(1000, state.target_faces)
+        _, state.poisson_depth = imgui.slider_int("Poisson Depth", state.poisson_depth, 5, 11)
+        _, state.normal_radius = imgui.slider_float("Normal Radius %%", state.normal_radius, 0.5, 10.0, format="%.1f%%")
+        _, state.trim_percentile = imgui.slider_float("Trim %%", state.trim_percentile, 0, 20, format="%.0f%%")
         if state.has_points and not state.refining:
             if imgui.button("Generate Dense Mesh (from reconstruction)", width=-1):
                 state.refining = True
@@ -1635,6 +1912,7 @@ def main():
                     save_ply_mesh(path, v, f, c)
                     state.status = f"Saved to {path}"
 
+        imgui.end_child()
         imgui.end()
 
         # ── 3D Viewport ──

@@ -11,7 +11,8 @@ import struct
 
 
 def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
-                      intrinsics_list=None, min_conf=2.0):
+                      intrinsics_list=None, min_conf=2.0,
+                      poisson_depth=8, normal_radius=0.03, trim_percentile=5):
     """
     Create a dense mesh from reconstruction point maps.
 
@@ -95,7 +96,10 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
 
     # Try Open3D methods
     try:
-        return _mesh_open3d(points, colors, normals)
+        return _mesh_open3d(points, colors, normals,
+                           poisson_depth=poisson_depth,
+                           normal_radius=normal_radius,
+                           trim_percentile=trim_percentile)
     except ImportError:
         print("  Open3D not available, falling back to simple mesh")
     except Exception as e:
@@ -105,7 +109,7 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
     return _mesh_from_points(points, colors)
 
 
-def _mesh_open3d(points, colors, normals):
+def _mesh_open3d(points, colors, normals, poisson_depth=8, normal_radius=0.03, trim_percentile=5):
     """Create mesh using Open3D's Poisson reconstruction."""
     import open3d as o3d
 
@@ -113,22 +117,24 @@ def _mesh_open3d(points, colors, normals):
     pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
 
+    extent = np.linalg.norm(np.asarray(pcd.points).max(0) - np.asarray(pcd.points).min(0))
+
     if normals is not None and len(normals) == len(points):
         pcd.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
     else:
-        print("  Estimating normals...")
+        print(f"  Estimating normals (radius={normal_radius * 100:.1f}% of extent)...")
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=np.linalg.norm(np.asarray(pcd.points).max(0) - np.asarray(pcd.points).min(0)) * 0.02,
+            radius=extent * normal_radius,
             max_nn=30))
         pcd.orient_normals_consistent_tangent_plane(k=15)
 
-    print("  Running Poisson reconstruction...")
+    print(f"  Running Poisson reconstruction (depth={poisson_depth}, trim={trim_percentile}%)...")
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=9, width=0, scale=1.1, linear_fit=False)
+        pcd, depth=poisson_depth, width=0, scale=1.2, linear_fit=False)
 
     # Remove low-density vertices (outlier faces)
     densities = np.asarray(densities)
-    density_threshold = np.quantile(densities, 0.05)
+    density_threshold = np.quantile(densities, trim_percentile / 100.0)
     vertices_to_remove = densities < density_threshold
     mesh.remove_vertices_by_mask(vertices_to_remove)
 
