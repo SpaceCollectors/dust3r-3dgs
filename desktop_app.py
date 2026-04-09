@@ -1019,14 +1019,14 @@ def run_reconstruction(state, scene_gl):
                         K_scaled = K.copy().astype(np.float32)
                         K_scaled[0, :] *= W_p / W_cam
                         K_scaled[1, :] *= H_p / H_cam
-                        img_dict['camera_intrinsics'] = K_scaled
-                        img_dict['camera_pose'] = c2w.astype(np.float32)
+                        img_dict['camera_intrinsics'] = torch.from_numpy(K_scaled).float()
+                        img_dict['camera_pose'] = torch.from_numpy(c2w.astype(np.float32)).float()
                     else:
                         # Default intrinsics (approximate 60° FOV)
                         focal = max(W_p, H_p) * 0.85
-                        K_default = np.array([[focal, 0, W_p/2],
-                                              [0, focal, H_p/2],
-                                              [0, 0, 1]], dtype=np.float32)
+                        K_default = torch.tensor([[focal, 0, W_p/2],
+                                                  [0, focal, H_p/2],
+                                                  [0, 0, 1]], dtype=torch.float32)
                         img_dict['camera_intrinsics'] = K_default
 
                 # Run pairwise on all consecutive pairs
