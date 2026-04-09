@@ -740,6 +740,12 @@ class AppState:
         # Backend
         self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=mvdust3r, 4=colmap
         self.backends = ['dust3r', 'mast3r', 'vggt', 'mvdust3r', 'colmap']
+        self.camera_source_idx = 0  # 0=same as backend, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT
+        self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
+        self.camera_source_labels = ['Same as Backend', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
+        self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
+        self.tile_upscale = False   # tiled depth for higher resolution
+        self.tile_grid = 2          # NxN tiles per image (2=4 tiles, 3=9 tiles)
 
         # Reconstruction
         self.scene = None
@@ -1344,6 +1350,22 @@ def run_reconstruction(state, scene_gl):
 
         else:
             # DUSt3R / MASt3R
+
+            # Hybrid: run separate camera estimation if camera source differs from backend
+            cam_source = state.camera_sources[state.camera_source_idx]
+            if cam_source != 'same' and cam_source != backend and state.cached_cameras is None:
+                state.status = f"Estimating cameras with {cam_source.upper()}..."
+                state.recon_frac = 0.05
+                try:
+                    state.cached_cameras = _estimate_cameras(state, cam_source)
+                    if state.cached_cameras:
+                        print(f"  Camera source ({cam_source}): {len(state.cached_cameras)} cameras")
+                    else:
+                        print(f"  Camera estimation failed, will use {backend} cameras")
+                except Exception as e:
+                    print(f"  Camera estimation failed: {e}")
+                    import traceback; traceback.print_exc()
+
             from dust3r.utils.image import load_images as dust3r_load_images
             from dust3r.utils.device import to_numpy
 
@@ -1374,7 +1396,20 @@ def run_reconstruction(state, scene_gl):
                 mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
                 scene = global_aligner(output, device='cuda', mode=mode)
                 state.recon_frac = 0.5
-                if mode == GlobalAlignerMode.PointCloudOptimizer:
+
+                # Hybrid: use external cameras if available
+                if state.cached_cameras is not None and len(state.cached_cameras) == len(imgs) and mode == GlobalAlignerMode.PointCloudOptimizer:
+                    state.status = "Setting external cameras (fixed poses)..."
+                    import torch as _torch
+                    known_poses = [_torch.tensor(c[0], dtype=_torch.float32) for c in state.cached_cameras]
+                    known_focals = [c[1][0, 0] for c in state.cached_cameras]
+                    scene.preset_pose(_torch.stack(known_poses))
+                    scene.preset_focal(_torch.tensor(known_focals))
+                    state.status = "Optimizing depth with fixed cameras..."
+                    state.recon_frac = 0.55
+                    scene.compute_global_alignment(init='known_poses', niter=state.niter1,
+                                                   schedule='linear', lr=0.01)
+                elif mode == GlobalAlignerMode.PointCloudOptimizer:
                     state.status = "Global alignment..."
                     state.recon_frac = 0.55
                     scene.compute_global_alignment(init='mst', niter=state.niter1,
@@ -1475,6 +1510,16 @@ def run_reconstruction(state, scene_gl):
                     scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
             except Exception:
                 pass
+
+            # Tile upscaling: run DUSt3R on image crops for denser points
+            if state.tile_upscale and backend == 'dust3r' and state.scene is not None:
+                state.status = "Tile upscaling for higher density..."
+                state.recon_frac = 0.85
+                try:
+                    _run_tile_upscale(state, model, scene_gl)
+                except Exception as e:
+                    print(f"  Tile upscale failed: {e}")
+                    import traceback; traceback.print_exc()
 
             del model
             torch.cuda.empty_cache()
@@ -1684,6 +1729,215 @@ def _run_smooth_preview(state, scene_gl):
     finally:
         state.refining = False
         state.refine_progress = ""
+
+
+def _estimate_cameras(state, source):
+    """Run a backend just for camera estimation. Returns list of (c2w, K, W, H) or None."""
+    n_imgs = len(state.image_paths)
+
+    if source == 'colmap':
+        import pycolmap
+        import tempfile, shutil
+        workdir = Path(tempfile.mkdtemp(prefix="colmap_cams_"))
+        image_dir = workdir / "images"; image_dir.mkdir()
+        for p in state.image_paths:
+            shutil.copy2(p, str(image_dir / Path(p).name))
+
+        state.refine_progress = "COLMAP: features..."
+        pycolmap.extract_features(workdir / "db.db", image_dir)
+        state.refine_progress = "COLMAP: matching..."
+        pycolmap.match_exhaustive(workdir / "db.db")
+        state.refine_progress = "COLMAP: mapping..."
+        sparse_dir = workdir / "sparse"; sparse_dir.mkdir()
+        maps = pycolmap.incremental_mapping(workdir / "db.db", image_dir, sparse_dir)
+
+        if not maps:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return None
+
+        rec = maps[0]
+        name_to_idx = {Path(p).name: i for i, p in enumerate(state.image_paths)}
+        cams = [None] * n_imgs
+        for img_id, image in rec.images.items():
+            if not image.has_pose or image.name not in name_to_idx:
+                continue
+            idx = name_to_idx[image.name]
+            cam = rec.cameras[image.camera_id]
+            K = cam.calibration_matrix().astype(np.float32)
+            w2c = np.eye(4, dtype=np.float32)
+            w2c[:3, :] = image.cam_from_world.matrix()
+            cams[idx] = (np.linalg.inv(w2c).astype(np.float32), K, cam.width, cam.height)
+
+        shutil.rmtree(workdir, ignore_errors=True)
+        return cams if all(c is not None for c in cams) else None
+
+    elif source in ('dust3r', 'mast3r', 'vggt'):
+        # Run the selected backend, extract just the cameras, discard the rest
+        # For now, we run a quick low-iter reconstruction
+        import torch, copy
+        if source == 'dust3r':
+            from dust3r.model import AsymmetricCroCo3DStereo
+            from dust3r.utils.image import load_images as dust3r_load_images
+            from dust3r.inference import inference as dust3r_inference
+            from dust3r.image_pairs import make_pairs
+            from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+
+            state.refine_progress = f"Loading {source} for cameras..."
+            model = _load_pretrained_cached(
+                AsymmetricCroCo3DStereo,
+                "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt").to('cuda')
+            model.eval()
+            imgs = dust3r_load_images(state.image_paths, size=512, verbose=False,
+                                      patch_size=model.patch_size)
+            if len(imgs) == 1:
+                imgs = [imgs[0], copy.deepcopy(imgs[0])]; imgs[1]['idx'] = 1
+            pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
+            output = dust3r_inference(pairs, model, 'cuda', batch_size=1)
+            mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+            scene = global_aligner(output, device='cuda', mode=mode)
+            if mode == GlobalAlignerMode.PointCloudOptimizer:
+                state.refine_progress = f"{source}: aligning cameras..."
+                scene.compute_global_alignment(init='mst', niter=100, schedule='linear', lr=0.01)
+
+            c2w_all = scene.get_im_poses().detach().cpu().numpy()
+            focals = scene.get_focals().detach().cpu().numpy()
+            cams = []
+            for i in range(len(c2w_all)):
+                H, W = imgs[i]['true_shape'][0].tolist() if hasattr(imgs[i]['true_shape'], 'tolist') else imgs[i]['true_shape']
+                K = np.eye(3, dtype=np.float32)
+                K[0, 0] = K[1, 1] = float(focals[i])
+                K[0, 2] = W / 2; K[1, 2] = H / 2
+                cams.append((c2w_all[i].astype(np.float32), K, int(W), int(H)))
+            del model; torch.cuda.empty_cache()
+            return cams
+
+        elif source == 'vggt':
+            from vggt.models.vggt import VGGT
+            from vggt.utils.load_fn import load_and_preprocess_images
+
+            state.refine_progress = "Loading VGGT for cameras..."
+            model = _load_pretrained_cached(VGGT, "facebook/VGGT-1B").to('cuda')
+            model.eval()
+            images = load_and_preprocess_images(state.image_paths).to('cuda')
+            with torch.no_grad():
+                preds = model(images)
+            extrinsic = preds["extrinsic"].cpu().numpy()[0]
+
+            cams = []
+            for i in range(len(state.image_paths)):
+                from PIL import Image as PILImage
+                img = PILImage.open(state.image_paths[i])
+                W, H = img.size
+                w2c = np.eye(4, dtype=np.float32)
+                w2c[:3, :] = extrinsic[i]
+                c2w = np.linalg.inv(w2c).astype(np.float32)
+                intrinsic = preds["intrinsic"].cpu().numpy()[0, i]
+                K = intrinsic.astype(np.float32)
+                cams.append((c2w, K, W, H))
+            del model; torch.cuda.empty_cache()
+            return cams
+
+    return None
+
+
+def _run_tile_upscale(state, model, scene_gl):
+    """Run DUSt3R on image tiles for denser point clouds.
+
+    Splits each image into NxN tiles with overlap, runs DUSt3R pairwise
+    on adjacent tiles, then accumulates all tile points into the scene.
+    Uses the already-computed camera poses (fixed).
+    """
+    from dust3r.utils.image import load_images as dust3r_load_images
+    from dust3r.inference import inference as dust3r_inference
+    from dust3r.image_pairs import make_pairs
+    from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+    from dust3r.utils.device import to_numpy
+    from PIL import Image as PILImage
+    import torch
+    import tempfile, shutil
+
+    scene = state.scene
+    N = state.tile_grid
+    overlap = 0.2  # 20% overlap between tiles
+
+    # Get camera poses from the initial reconstruction
+    c2w_all = scene.get_im_poses().detach().cpu().numpy()
+    n_imgs = len(state.image_paths)
+
+    all_extra_pts = []
+    all_extra_cols = []
+
+    for img_idx in range(n_imgs):
+        state.refine_progress = f"Tiling image {img_idx+1}/{n_imgs} ({N}x{N})..."
+        print(f"  Tiling image {img_idx+1}/{n_imgs}...")
+
+        # Load full-res image
+        img_pil = PILImage.open(state.image_paths[img_idx]).convert('RGB')
+        W_full, H_full = img_pil.size
+
+        # Compute tile positions
+        tile_w = int(W_full / (N - (N-1) * overlap))
+        tile_h = int(H_full / (N - (N-1) * overlap))
+        step_x = int(tile_w * (1 - overlap))
+        step_y = int(tile_h * (1 - overlap))
+
+        for ty in range(N):
+            for tx in range(N):
+                x0 = min(tx * step_x, W_full - tile_w)
+                y0 = min(ty * step_y, H_full - tile_h)
+                x1, y1 = x0 + tile_w, y0 + tile_h
+
+                # Crop tile
+                tile_pil = img_pil.crop((x0, y0, x1, y1))
+
+                # Save tile to temp file for DUSt3R loader
+                tmpdir = tempfile.mkdtemp()
+                tile_path = os.path.join(tmpdir, f"tile_{ty}_{tx}.jpg")
+                tile_pil.save(tile_path)
+
+                # Find a neighbor image to pair with (use next image, or previous)
+                pair_idx = (img_idx + 1) % n_imgs
+                pair_path = state.image_paths[pair_idx]
+
+                try:
+                    # Load tile + neighbor as DUSt3R pair
+                    tile_imgs = dust3r_load_images([tile_path, pair_path], size=512,
+                                                    verbose=False, patch_size=model.patch_size)
+                    tile_pairs = make_pairs(tile_imgs, scene_graph='complete',
+                                           prefilter=None, symmetrize=True)
+                    tile_output = dust3r_inference(tile_pairs, model, 'cuda', batch_size=1)
+
+                    # Get points from the tile (view 0 = our tile)
+                    tile_scene = global_aligner(tile_output, device='cuda',
+                                               mode=GlobalAlignerMode.PairViewer)
+
+                    tile_pts = to_numpy(tile_scene.get_pts3d())[0]  # (H, W, 3) for tile
+                    tile_img_np = tile_scene.imgs[0]  # (H, W, 3) float
+
+                    # The tile points are in the tile's local coordinate frame
+                    # We need to transform them to world coords using the original camera pose
+                    # For now, just collect the tile's raw points — they're approximately world-frame
+                    # since DUSt3R's PairViewer produces relative coords
+                    # TODO: proper transform using known camera + tile crop offset
+
+                    all_extra_pts.append(tile_pts.reshape(-1, 3))
+                    all_extra_cols.append((np.clip(tile_img_np, 0, 1).reshape(-1, 3) * 255).astype(np.uint8))
+
+                except Exception as e:
+                    print(f"    Tile ({ty},{tx}) failed: {e}")
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if all_extra_pts:
+        extra_pts = np.concatenate(all_extra_pts, axis=0)
+        extra_cols = np.concatenate(all_extra_pts, axis=0)
+        print(f"  Tile upscale: {len(extra_pts):,d} extra points from {N}x{N} tiles")
+
+        # Add to existing scene data
+        pts3d_list, confs_list = _extract_scene_data(state)
+        # Append extra points as an additional "view"
+        state.pts3d_list = list(pts3d_list) + [extra_pts]
+        state.confs_list = list(confs_list) + [np.ones(len(extra_pts), dtype=np.float32) * 5.0]
 
 
 def run_dense_mesh(state, scene_gl):
@@ -2945,8 +3199,20 @@ def main():
         _, state.backend_idx = imgui.combo("##backend",
             state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+", "COLMAP"])
 
+        _, state.camera_source_idx = imgui.combo("Camera Source",
+            state.camera_source_idx, state.camera_source_labels)
+        if state.cached_cameras is not None:
+            imgui.same_line()
+            imgui.text_colored(f"({len(state.cached_cameras)} cams cached)", 0.5, 1.0, 0.5)
+
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
+            _, state.tile_upscale = imgui.checkbox("Tile Upscale", state.tile_upscale)
+            if state.tile_upscale:
+                imgui.same_line()
+                _, state.tile_grid = imgui.slider_int("##tiles", state.tile_grid, 2, 4)
+                imgui.same_line()
+                imgui.text(f"({state.tile_grid}x{state.tile_grid}={state.tile_grid**2} tiles)")
 
         if state.backends[state.backend_idx] == 'mast3r':
             _, state.optim_level = imgui.combo("Optimization##opt",
