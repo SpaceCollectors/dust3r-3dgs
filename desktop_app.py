@@ -926,15 +926,25 @@ def run_reconstruction(state, scene_gl):
                 imgs_list.append(img_i)
                 pts3d_all.append(pts3d[i])
                 conf_all.append(conf_i)
-            state.scene = VGGTScene(imgs_list, extrinsic, intrinsic,
-                                    pts3d_all, conf_all, orig_sizes)
-
             # VGGT cameras: extrinsic is w2c (3x4), invert to c2w
             cam_poses = []
             for i in range(len(extrinsic)):
                 w2c_44 = np.eye(4, dtype=np.float32)
                 w2c_44[:3, :] = extrinsic[i]
                 cam_poses.append(np.linalg.inv(w2c_44))
+
+            # Align to cached cameras if available
+            if state.cached_cameras is not None and len(state.cached_cameras) == len(cam_poses):
+                print("  Aligning VGGT to cached cameras...")
+                pts3d_all, cam_poses = _align_to_cached_cameras(pts3d_all, cam_poses, state.cached_cameras)
+                # Rebuild extrinsics from aligned poses
+                for i in range(len(cam_poses)):
+                    extrinsic[i] = np.linalg.inv(cam_poses[i])[:3, :].astype(np.float32)
+                # Use cached intrinsics
+                intrinsic = np.stack([c[1].astype(np.float32) for c in state.cached_cameras])
+
+            state.scene = VGGTScene(imgs_list, extrinsic, intrinsic,
+                                    pts3d_all, conf_all, orig_sizes)
             if cam_poses:
                 ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0)) if len(points) > 0 else 1.0
                 scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
@@ -1052,6 +1062,16 @@ print('SUCCESS')
                 for p in state.image_paths:
                     im = PILImage.open(p).convert('RGB')
                     orig_sizes.append(im.size)
+
+                # Align to cached cameras if available
+                cam_poses_pow3r = [c2w_all[i] for i in range(len(c2w_all))]
+                if state.cached_cameras is not None and len(state.cached_cameras) == len(cam_poses_pow3r):
+                    print("  Aligning Pow3R to cached cameras...")
+                    pts3d, cam_poses_pow3r = _align_to_cached_cameras(pts3d, cam_poses_pow3r, state.cached_cameras)
+                    # Rebuild extrinsics + intrinsics from cached cameras
+                    for i in range(len(cam_poses_pow3r)):
+                        extrinsic[i] = np.linalg.inv(cam_poses_pow3r[i])[:3, :].astype(np.float32)
+                    intrinsic_all = [c[1].astype(np.float32) for c in state.cached_cameras]
 
                 state.scene = VGGTScene(imgs_np, extrinsic, np.stack(intrinsic_all),
                                         pts3d, confs, orig_sizes)
@@ -1259,6 +1279,7 @@ print('SUCCESS')
                 state.recon_frac = 0.5
 
                 # Hybrid: use external cameras if available
+                print(f"  Cached cameras: {len(state.cached_cameras) if state.cached_cameras else 'None'}, imgs: {len(imgs)}, mode: {mode}")
                 if state.cached_cameras is not None and len(state.cached_cameras) == len(imgs) and mode == GlobalAlignerMode.PointCloudOptimizer:
                     state.status = "Setting external cameras (fixed poses)..."
                     import torch as _torch
@@ -1646,6 +1667,44 @@ def _run_stacked_reconstruction(state, scene_gl):
     state.status = f"Stacked: {len(all_pts3d)} views from {len(stack_backends)} backends, {sum(len(p.reshape(-1,3)) for p in all_pts3d):,d} total points"
     state.reconstructing = False
     state.recon_frac = 1.0
+
+
+def _align_to_cached_cameras(pts3d_list, cam_poses_c2w, cached_cameras):
+    """Align a reconstruction to the cached camera frame via Procrustes.
+    Returns transformed pts3d_list and new c2w poses."""
+    n = min(len(cam_poses_c2w), len(cached_cameras))
+    if n < 2:
+        return pts3d_list, cam_poses_c2w
+
+    # Camera centers from both systems
+    src_centers = np.array([cam_poses_c2w[i][:3, 3] for i in range(n)])
+    tgt_centers = np.array([cached_cameras[i][0][:3, 3] for i in range(n)])
+
+    # Procrustes: find scale, rotation, translation
+    src_mean = src_centers.mean(axis=0)
+    tgt_mean = tgt_centers.mean(axis=0)
+    src_c = src_centers - src_mean
+    tgt_c = tgt_centers - tgt_mean
+    scale = np.linalg.norm(tgt_c) / max(np.linalg.norm(src_c), 1e-8)
+    H_mat = src_c.T @ tgt_c
+    U, _, Vt = np.linalg.svd(H_mat)
+    R = (Vt.T @ U.T).astype(np.float32)
+    if np.linalg.det(R) < 0:
+        Vt[-1] *= -1
+        R = (Vt.T @ U.T).astype(np.float32)
+    t = tgt_mean - scale * (R @ src_mean)
+
+    print(f"  Procrustes alignment: scale={scale:.4f}")
+
+    # Transform all 3D points
+    for i in range(len(pts3d_list)):
+        pts = pts3d_list[i].reshape(-1, 3).astype(np.float64)
+        pts = scale * (pts @ R.T) + t
+        pts3d_list[i] = pts.reshape(pts3d_list[i].shape).astype(np.float32)
+
+    # Use cached cameras directly
+    new_c2w = [cached_cameras[i][0] for i in range(len(cached_cameras))]
+    return pts3d_list, new_c2w
 
 
 def _extract_scene_data(state):
