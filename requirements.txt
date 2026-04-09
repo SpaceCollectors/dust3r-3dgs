@@ -15,3 +15,10 @@ scikit-learn
 pillow
 safetensors
 scikit-image
+torchmetrics
+imgui[glfw]
+PyOpenGL
+glfw
+xatlas
+open3d
+pymeshlab

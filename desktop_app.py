@@ -21,10 +21,45 @@ import OpenGL.GL as gl
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
 
+def _find_cached_model_path(repo_id):
+    """Find the local cache path for a HuggingFace model, or None if not cached."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache_info = scan_cache_dir()
+        for repo in cache_info.repos:
+            if repo.repo_id == repo_id:
+                for rev in repo.revisions:
+                    snapshot_path = rev.snapshot_path
+                    if os.path.isdir(snapshot_path):
+                        print(f"  Found cached model: {repo_id} -> {snapshot_path}")
+                        return str(snapshot_path)
+    except Exception:
+        pass
+    return None
+
+
+def _load_pretrained_cached(model_class, repo_id):
+    """Load a pretrained model from local cache if available, else download."""
+    # Try loading from local cache first (no network)
+    cached_path = _find_cached_model_path(repo_id)
+    if cached_path:
+        try:
+            model = model_class.from_pretrained(cached_path)
+            print(f"  Loaded {repo_id} from local cache (offline)")
+            return model
+        except Exception as e:
+            print(f"  Cache load failed ({e}), downloading...")
+
+    # Not cached or cache load failed — download
+    print(f"  Downloading {repo_id}...")
+    return model_class.from_pretrained(repo_id)
+
+
 # Add our repos to path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MAST3R_DIR = os.path.join(SCRIPT_DIR, 'mast3r')
 VGGT_DIR = os.path.join(SCRIPT_DIR, 'vggt')
+MVDUST3R_DIR = os.path.join(SCRIPT_DIR, 'mvdust3r')
 sys.path.insert(0, MAST3R_DIR)
 sys.path.insert(0, os.path.join(MAST3R_DIR, 'dust3r'))
 sys.path.insert(0, VGGT_DIR)
@@ -111,20 +146,30 @@ VERT_SHADER = """
 uniform mat4 mvp;
 in vec3 position;
 in vec3 color;
+in vec2 uv;
 out vec3 v_color;
+out vec2 v_uv;
 void main() {
     gl_Position = mvp * vec4(position, 1.0);
     gl_PointSize = 3.0;
     v_color = color;
+    v_uv = uv;
 }
 """
 
 FRAG_SHADER = """
 #version 330
+uniform sampler2D tex;
+uniform int use_texture;
 in vec3 v_color;
+in vec2 v_uv;
 out vec4 frag_color;
 void main() {
-    frag_color = vec4(v_color, 1.0);
+    if (use_texture == 1 && v_uv.x >= 0.0) {
+        frag_color = texture(tex, v_uv);
+    } else {
+        frag_color = vec4(v_color, 1.0);
+    }
 }
 """
 
@@ -205,6 +250,8 @@ class GLScene:
     def __init__(self):
         self.program = self._compile_shader()
         self.mvp_loc = gl.glGetUniformLocation(self.program, "mvp")
+        self.use_tex_loc = gl.glGetUniformLocation(self.program, "use_texture")
+        self.tex_loc = gl.glGetUniformLocation(self.program, "tex")
         self.point_vao = None
         self.point_vbo = None
         self.point_count = 0
@@ -213,6 +260,8 @@ class GLScene:
         self.mesh_ebo = None
         self.mesh_vertex_count = 0
         self.mesh_face_count = 0
+        self.mesh_tex_id = None  # OpenGL texture for UV-mapped mesh
+        self.mesh_has_uvs = False
         self.cam_vao = None
         self.cam_vbo = None
         self.cam_line_count = 0
@@ -307,13 +356,20 @@ class GLScene:
         gl.glBindVertexArray(0)
         self.point_count = len(points)
 
-    def _upload_mesh(self, verts, faces, colors):
+    def _upload_mesh(self, verts, faces, colors, uvs=None):
         if len(verts) == 0 or len(faces) == 0:
             self.mesh_face_count = 0
             return
-        data = np.empty((len(verts), 6), dtype=np.float32)
+        # Layout: pos(3) + color(3) + uv(2) = 8 floats = 32 bytes per vertex
+        data = np.empty((len(verts), 8), dtype=np.float32)
         data[:, :3] = verts.astype(np.float32)
         data[:, 3:6] = colors.astype(np.float32) / 255.0
+        if uvs is not None and len(uvs) == len(verts):
+            data[:, 6:8] = uvs.astype(np.float32)
+            self.mesh_has_uvs = True
+        else:
+            data[:, 6:8] = -1.0  # signal "no UV" to shader
+            self.mesh_has_uvs = False
         indices = faces.astype(np.uint32).ravel()
 
         if self.mesh_vao is None:
@@ -323,15 +379,60 @@ class GLScene:
         gl.glBindVertexArray(self.mesh_vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.mesh_vbo)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_DYNAMIC_DRAW)
-        gl.glEnableVertexAttribArray(0)
-        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, False, 24, None)
-        gl.glEnableVertexAttribArray(1)
-        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, False, 24, gl.ctypes.c_void_p(12))
+        stride = 32  # 8 floats * 4 bytes
+        gl.glEnableVertexAttribArray(0)  # position
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, False, stride, None)
+        gl.glEnableVertexAttribArray(1)  # color
+        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, False, stride, gl.ctypes.c_void_p(12))
+        gl.glEnableVertexAttribArray(2)  # uv
+        gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, False, stride, gl.ctypes.c_void_p(24))
         gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.mesh_ebo)
         gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, gl.GL_DYNAMIC_DRAW)
         gl.glBindVertexArray(0)
         self.mesh_vertex_count = len(verts)
         self.mesh_face_count = len(faces)
+
+    def set_texture(self, texture_image, uvs, uv_faces, verts, faces, colors):
+        """Queue texture data for upload. texture_image: (H,W,3) uint8, uvs: per-uv-vertex, uv_faces: per-face UV indices."""
+        with self._lock:
+            self._pending_texture = (texture_image, uvs, uv_faces, verts, faces, colors)
+
+    def _upload_texture(self, texture_image, uvs, uv_faces, verts, faces, colors):
+        """Upload texture to GPU and rebuild mesh VBO with per-face-vertex UVs."""
+        # Expand mesh to per-face-vertex (so each face corner can have its own UV)
+        n_faces = len(faces)
+        expanded_verts = np.zeros((n_faces * 3, 3), dtype=np.float32)
+        expanded_colors = np.zeros((n_faces * 3, 3), dtype=np.uint8)
+        expanded_uvs = np.zeros((n_faces * 3, 2), dtype=np.float32)
+        expanded_faces = np.arange(n_faces * 3, dtype=np.int32).reshape(-1, 3)
+
+        for fi in range(n_faces):
+            for vi in range(3):
+                expanded_verts[fi * 3 + vi] = verts[faces[fi, vi]]
+                expanded_colors[fi * 3 + vi] = colors[faces[fi, vi]]
+                expanded_uvs[fi * 3 + vi] = uvs[uv_faces[fi, vi]]
+
+        # Upload mesh with UVs
+        self._upload_mesh(expanded_verts, expanded_faces, expanded_colors, expanded_uvs)
+        # Store expanded data for draw mode switching
+        self._mesh_verts = expanded_verts
+        self._mesh_faces = expanded_faces
+        self._base_colors = expanded_colors
+        self._mesh_uvs = expanded_uvs
+
+        # Upload texture image to OpenGL
+        H, W = texture_image.shape[:2]
+        if self.mesh_tex_id is None:
+            self.mesh_tex_id = gl.glGenTextures(1)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.mesh_tex_id)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, W, H, 0,
+                        gl.GL_RGB, gl.GL_UNSIGNED_BYTE, texture_image)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        print(f"  Uploaded {W}x{H} texture to GPU")
 
     def draw(self, mvp_grid, mvp_scene, draw_mode='points', camera_pos=None):
         gl.glUseProgram(self.program)
@@ -344,10 +445,11 @@ class GLScene:
 
         # Swap mesh colors based on draw mode
         if self.mesh_face_count > 0 and getattr(self, '_mesh_verts', None) is not None:
+            stored_uvs = getattr(self, '_mesh_uvs', None)
             if draw_mode == 'normals':
                 alt = getattr(self, '_normal_colors', None)
                 if alt is not None:
-                    self._upload_mesh(self._mesh_verts, self._mesh_faces, alt)
+                    self._upload_mesh(self._mesh_verts, self._mesh_faces, alt, stored_uvs)
                 draw_mode = 'mesh'
             elif draw_mode == 'shaded':
                 # Compute shading from current camera position (headlamp effect)
@@ -356,7 +458,7 @@ class GLScene:
             elif draw_mode in ('mesh', 'wireframe'):
                 base = getattr(self, '_base_colors', None)
                 if base is not None:
-                    self._upload_mesh(self._mesh_verts, self._mesh_faces, base)
+                    self._upload_mesh(self._mesh_verts, self._mesh_faces, base, stored_uvs)
 
         # Scene content: rotated
         gl.glUniformMatrix4fv(self.mvp_loc, 1, gl.GL_TRUE, mvp_scene)
@@ -367,9 +469,21 @@ class GLScene:
             gl.glDrawArrays(gl.GL_POINTS, 0, self.point_count)
 
         if draw_mode == 'mesh' and self.mesh_face_count > 0:
+            # Enable texture if available
+            if self.mesh_tex_id is not None and self.mesh_has_uvs:
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.mesh_tex_id)
+                gl.glUniform1i(self.tex_loc, 0)
+                gl.glUniform1i(self.use_tex_loc, 1)
+            else:
+                gl.glUniform1i(self.use_tex_loc, 0)
             gl.glBindVertexArray(self.mesh_vao)
             gl.glDrawElements(gl.GL_TRIANGLES, self.mesh_face_count * 3,
                               gl.GL_UNSIGNED_INT, None)
+            # Disable texture after drawing
+            gl.glUniform1i(self.use_tex_loc, 0)
+            if self.mesh_tex_id is not None:
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
         if draw_mode == 'wireframe' and self.mesh_face_count > 0:
             gl.glBindVertexArray(self.mesh_vao)
@@ -424,9 +538,11 @@ class GLScene:
             pts = self._pending_points
             msh = self._pending_mesh
             cams = getattr(self, '_pending_cams', None)
+            tex = getattr(self, '_pending_texture', None)
             self._pending_points = None
             self._pending_mesh = None
             self._pending_cams = None
+            self._pending_texture = None
 
         if pts is not None:
             self._upload_points(pts[0], pts[1])
@@ -439,6 +555,8 @@ class GLScene:
                 self._base_colors = msh[2]
                 self._mesh_verts = msh[0]
                 self._mesh_faces = msh[1]
+        if tex is not None:
+            self._upload_texture(*tex)
         if cams is not None:
             self._upload_cams(cams)
 
@@ -519,7 +637,8 @@ class GLScene:
         grey = (brightness * 220).clip(0, 255).astype(np.uint8)
         shaded = np.stack([grey, grey, grey], axis=-1)
 
-        self._upload_mesh(verts, faces, shaded)
+        stored_uvs = getattr(self, '_mesh_uvs', None)
+        self._upload_mesh(verts, faces, shaded, stored_uvs)
 
     def _upload_cams(self, data):
         # data is already (N, 6) float32 numpy array
@@ -546,13 +665,14 @@ class AppState:
         self.image_dir = ""
 
         # Backend
-        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt
-        self.backends = ['dust3r', 'mast3r', 'vggt']
+        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=mvdust3r
+        self.backends = ['dust3r', 'mast3r', 'vggt', 'mvdust3r']
 
         # Reconstruction
         self.scene = None
         self.reconstructing = False
         self.recon_progress = ""
+        self.recon_frac = 0.0  # 0.0–1.0 progress fraction
         self.recon_thread = None
 
         # Point cloud / Mesh
@@ -583,20 +703,23 @@ class AppState:
         self.compare_mode = 0  # 0=edges, 1=highfreq, 2=color, 3=both
         self.compare_modes = ['edges', 'highfreq', 'color', 'both', 'normals']
 
+        # Normalized scene data (backend-agnostic, set after reconstruction)
+        self.pts3d_list = None   # list of (H,W,3) or (N,3) numpy arrays per view
+        self.confs_list = None   # list of (H,W) or (N,) confidence arrays per view
+
         # Mesh data (numpy, for saving)
         self.mesh_data = None  # (verts, faces, colors)
         self.target_faces = 100000  # target face count for dense mesh
+        self.mesh_mode_idx = 0     # 0=reprojected grid, 1=ball pivot
+        self.mesh_modes = ['reprojected', 'ballpivot']
+        self.mesh_mode_labels = ['Reprojected Grid', 'Ball Pivot']
+        self.hole_cap_size = 50    # max boundary edges to cap a hole (higher = close bigger holes)
         self.ai_depth_mix = 0.7  # 0=pure dust3r, 1=full AI detail
         self.ai_highpass_radius = 10.0  # high-pass sigma in pixels
         self.ai_refine_poses = True  # re-optimize poses after depth injection
         self.ai_pose_iters = 100
-        self.ai_merge_points = True  # average overlapping points from different views
-        self.merge_radius_mult = 1.5  # merge radius multiplier (1.0 = tight, 3.0 = aggressive)
 
-        # Mesh generation settings
-        self.poisson_depth = 8      # octree depth (6=coarse/fast, 10=fine/slow)
-        self.normal_radius = 3.0    # % of scene extent for normal estimation
-        self.trim_percentile = 5    # % of low-density verts to remove
+        # Mesh generation settings (kept for compatibility)
 
         # Scene orientation transform (applied in shader)
         self.scene_rot_x = 0.0  # degrees
@@ -606,6 +729,7 @@ class AppState:
 
         # Stop flag
         self.stop_requested = False
+        self.needs_recenter = False
 
         # Status
         self.status = "Ready. Load images to begin."
@@ -620,6 +744,7 @@ def run_reconstruction(state, scene_gl):
     import copy
 
     state.reconstructing = True
+    state.recon_frac = 0.0
     state.status = "Loading model..."
 
     try:
@@ -632,10 +757,12 @@ def run_reconstruction(state, scene_gl):
             from vggt.utils.geometry import unproject_depth_map_to_point_map
 
             state.status = "Loading VGGT model..."
-            model = VGGT.from_pretrained("facebook/VGGT-1B").to('cuda')
+            state.recon_frac = 0.1
+            model = _load_pretrained_cached(VGGT, "facebook/VGGT-1B").to('cuda')
             model.eval()
 
             state.status = "Running VGGT inference..."
+            state.recon_frac = 0.3
             images = load_and_preprocess_images(state.image_paths).to('cuda')
             dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
@@ -652,15 +779,23 @@ def run_reconstruction(state, scene_gl):
 
             if depth_map.ndim == 3:
                 depth_map = depth_map[..., None]
+            state.status = "Unprojecting depth maps..."
+            state.recon_frac = 0.6
             pts3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
 
             imgs_np = images.cpu().numpy().transpose(0, 2, 3, 1)
 
-            # Build simple scene data
+            state.status = "Extracting point cloud..."
+            state.recon_frac = 0.7
+            # Build simple scene data — filter out white padding pixels
             all_pts = []
             all_colors = []
             for i in range(len(state.image_paths)):
-                mask = depth_conf[i] > state.min_conf
+                conf_mask = depth_conf[i] > state.min_conf
+                # Mask out white padding from mixed aspect ratios
+                # Padding is white (1.0, 1.0, 1.0) — detect pixels where all channels > 0.95
+                not_padding = imgs_np[i].mean(axis=-1) < 0.95
+                mask = conf_mask & not_padding
                 all_pts.append(pts3d[i][mask])
                 all_colors.append((imgs_np[i][mask] * 255).astype(np.uint8))
 
@@ -671,8 +806,10 @@ def run_reconstruction(state, scene_gl):
                     idx = np.random.choice(len(points), 200000, replace=False)
                     points, colors = points[idx], colors[idx]
                 scene_gl.set_points(points, colors)
-                state.has_points = True
+                state.has_points = True; state.needs_recenter = True
 
+            state.status = "Building scene..."
+            state.recon_frac = 0.85
             # Build VGGTScene for downstream use (mesh gen, export)
             from app import VGGTScene
             from PIL import Image as PILImage
@@ -682,9 +819,19 @@ def run_reconstruction(state, scene_gl):
                 im = exif_transpose(PILImage.open(p)).convert('RGB')
                 orig_sizes.append(im.size)
 
-            imgs_list = [imgs_np[i] for i in range(len(state.image_paths))]
-            pts3d_all = [pts3d[i] for i in range(len(state.image_paths))]
-            conf_all = [depth_conf[i] for i in range(len(state.image_paths))]
+            # Zero out confidence for padding pixels so downstream ignores them
+            imgs_list = []
+            pts3d_all = []
+            conf_all = []
+            for i in range(len(state.image_paths)):
+                img_i = imgs_np[i]
+                conf_i = depth_conf[i].copy()
+                # Mark padding as zero confidence
+                padding_mask = img_i.mean(axis=-1) > 0.95
+                conf_i[padding_mask] = 0
+                imgs_list.append(img_i)
+                pts3d_all.append(pts3d[i])
+                conf_all.append(conf_i)
             state.scene = VGGTScene(imgs_list, extrinsic, intrinsic,
                                     pts3d_all, conf_all, orig_sizes)
 
@@ -701,6 +848,273 @@ def run_reconstruction(state, scene_gl):
             del model, predictions
             torch.cuda.empty_cache()
 
+        elif backend == 'mvdust3r':
+            # MV-DUSt3R+ — single-pass multi-view reconstruction
+            # Temporarily swap sys.path to use mvdust3r's own dust3r fork
+            import copy as _copy
+            _saved_path = _copy.copy(sys.path)
+            # Remove mast3r/dust3r paths, insert mvdust3r first
+            sys.path = [p for p in sys.path if 'mast3r' not in p.replace('\\', '/')]
+            sys.path.insert(0, MVDUST3R_DIR)
+            sys.path.insert(0, os.path.join(MVDUST3R_DIR, 'croco'))
+            # Clear cached dust3r modules so mvdust3r's version loads
+            _cached_mods = {k: v for k, v in sys.modules.items()
+                           if k.startswith('dust3r') or k.startswith('models')}
+            for k in _cached_mods:
+                del sys.modules[k]
+
+            try:
+                # Shim pytorch3d and gsplat so mvdust3r imports work without them
+                import types as _types
+
+                class _StubModule(_types.ModuleType):
+                    def __getattr__(self, name):
+                        return None
+
+                for _mod_name in ['pytorch3d', 'pytorch3d.ops', 'pytorch3d.transforms',
+                                  'pytorch3d.structures', 'pytorch3d.renderer',
+                                  'gsplat', 'gsplat.rendering']:
+                    if _mod_name not in sys.modules:
+                        sys.modules[_mod_name] = _StubModule(_mod_name)
+
+                from dust3r.model import AsymmetricCroCo3DStereoMultiView
+                from dust3r.inference import inference_mv
+                from dust3r.utils.image import load_images as mvd_load_images
+                from dust3r.utils.device import to_numpy
+                import cv2
+
+                def _estimate_focal(pts3d, valid_mask):
+                    """Estimate focal length from 3D points (no pytorch3d needed)."""
+                    B, H, W, _ = pts3d.shape
+                    pp = torch.tensor([[W/2, H/2]], dtype=torch.float32, device=pts3d.device)
+                    pixels = torch.stack(torch.meshgrid(torch.arange(W, device=pts3d.device),
+                                torch.arange(H, device=pts3d.device), indexing='xy'), dim=-1
+                              ).float().reshape(1, -1, 2) - pp.view(-1, 1, 2)
+                    pts_flat = pts3d.flatten(1, 2)
+                    vm_flat = valid_mask.flatten(1, 2)
+                    pixels = pixels[vm_flat].unsqueeze(0)
+                    pts_flat = pts_flat[vm_flat].unsqueeze(0)
+                    xy_over_z = (pts_flat[..., :2] / pts_flat[..., 2:3]).nan_to_num(posinf=0, neginf=0)
+                    dot_xy_px = (xy_over_z * pixels).sum(dim=-1)
+                    dot_xy_xy = xy_over_z.square().sum(dim=-1)
+                    focal = dot_xy_px.mean(dim=1) / dot_xy_xy.mean(dim=1)
+                    for _ in range(10):
+                        dis = (pixels - focal.view(-1, 1, 1) * xy_over_z).norm(dim=-1)
+                        w = dis.clip(min=1e-8).reciprocal()
+                        focal = (w * dot_xy_px).mean(dim=1) / (w * dot_xy_xy).mean(dim=1)
+                    return focal
+
+                def _pnp_ransac(pointclouds, img_points, masks, intrinsics):
+                    """PnP-RANSAC camera calibration (no pytorch3d needed)."""
+                    bs = pointclouds.shape[0]
+                    camera_matrix = intrinsics.cpu().numpy()
+                    dist_coeffs = np.zeros((5, 1))
+                    c2ws = []
+                    for i in range(bs):
+                        obj_pts = pointclouds[i][masks[i]].cpu().numpy()
+                        img_pts = img_points[i][masks[i]].cpu().numpy()
+                        ok, rvec, tvec, _ = cv2.solvePnPRansac(obj_pts, img_pts, camera_matrix[i], dist_coeffs)
+                        if ok:
+                            R, _ = cv2.Rodrigues(rvec)
+                            w2c = np.eye(4, dtype=np.float32)
+                            w2c[:3, :3] = R; w2c[:3, 3] = tvec.ravel()
+                            c2ws.append(torch.from_numpy(np.linalg.inv(w2c)))
+                        else:
+                            c2ws.append(torch.eye(4))
+                    return torch.stack(c2ws).to(pointclouds.device)
+
+                state.status = "Loading MV-DUSt3R+ weights..."
+                state.recon_frac = 0.05
+                from huggingface_hub import hf_hub_download
+                # Try local cache first
+                cached_mvd = _find_cached_model_path("Zhenggang/MV-DUSt3R")
+                if cached_mvd and os.path.exists(os.path.join(cached_mvd, "checkpoints", "MVDp_s2.pth")):
+                    weights_path = os.path.join(cached_mvd, "checkpoints", "MVDp_s2.pth")
+                    print(f"  Loaded MV-DUSt3R from cache: {weights_path}")
+                else:
+                    weights_path = hf_hub_download(
+                        repo_id="Zhenggang/MV-DUSt3R",
+                        filename="checkpoints/MVDp_s2.pth",
+                        cache_dir=os.path.join(MVDUST3R_DIR, 'checkpoints'))
+
+                state.status = "Loading MV-DUSt3R+ model..."
+                state.recon_frac = 0.1
+                inf = float('inf')
+                model = AsymmetricCroCo3DStereoMultiView(
+                    pos_embed='RoPE100', img_size=(224, 224), head_type='linear',
+                    output_mode='pts3d', depth_mode=('exp', -inf, inf),
+                    conf_mode=('exp', 1, 1e9), enc_embed_dim=1024, enc_depth=24,
+                    enc_num_heads=16, dec_embed_dim=768, dec_depth=12, dec_num_heads=12,
+                    GS=True, sh_degree=0, pts_head_config={'skip': True},
+                    m_ref_flag=True, n_ref=4)
+                model.to('cuda')
+                model_loaded = AsymmetricCroCo3DStereoMultiView.from_pretrained(weights_path).to('cuda')
+                model.load_state_dict(model_loaded.state_dict(), strict=True)
+                model.eval()
+                del model_loaded
+
+                state.status = "Loading images..."
+                state.recon_frac = 0.2
+                imgs = mvd_load_images(state.image_paths, size=224, verbose=True)
+                if len(imgs) == 1:
+                    imgs = [imgs[0], _copy.deepcopy(imgs[0])]
+                    imgs[1]['idx'] = 1
+                for img in imgs:
+                    img['true_shape'] = torch.from_numpy(img['true_shape']).long()
+
+                # Reorder views for better spatial coverage (from demo.py)
+                from copy import deepcopy
+                if len(imgs) < 12:
+                    if len(imgs) > 3:
+                        imgs[1], imgs[3] = deepcopy(imgs[3]), deepcopy(imgs[1])
+                    if len(imgs) > 6:
+                        imgs[2], imgs[6] = deepcopy(imgs[6]), deepcopy(imgs[2])
+                else:
+                    cid = len(imgs) // 4 + 1
+                    imgs[1], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[1])
+                    cid = (len(imgs) * 2) // 4 + 1
+                    imgs[2], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[2])
+                    cid = (len(imgs) * 3) // 4 + 1
+                    imgs[3], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[3])
+
+                state.status = "Running MV-DUSt3R+ inference..."
+                state.recon_frac = 0.35
+                output = inference_mv(imgs, model, 'cuda', verbose=True)
+
+                # Attach RGB from input images
+                output['pred1']['rgb'] = imgs[0]['img'].permute(0, 2, 3, 1)
+                for x, img in zip(output['pred2s'], imgs[1:]):
+                    x['rgb'] = img['img'].permute(0, 2, 3, 1)
+
+                state.status = "Recovering cameras..."
+                state.recon_frac = 0.6
+
+                # Extract points and confidence
+                _, h, w = output['pred1']['rgb'].shape[0:3]
+                rgbimg = [output['pred1']['rgb'][0]] + [x['rgb'][0] for x in output['pred2s']]
+                for i in range(len(rgbimg)):
+                    rgbimg[i] = (rgbimg[i] + 1) / 2  # [-1,1] -> [0,1]
+
+                pts3d_list = [output['pred1']['pts3d'][0]] + \
+                             [x['pts3d_in_other_view'][0] for x in output['pred2s']]
+                conf = torch.stack(
+                    [output['pred1']['conf'][0]] + [x['conf'][0] for x in output['pred2s']], 0)
+
+                # Estimate focal length from reference view
+                conf_first = conf[0].reshape(-1)
+                conf_sorted = conf_first.sort()[0]
+                conf_thres = conf_sorted[int(conf_first.shape[0] * 0.03)]
+                valid_first = (conf_first >= conf_thres).reshape(h, w)
+
+                focals_val = _estimate_focal(
+                    pts3d_list[0][None].cuda(), valid_first[None].cuda()).cpu().item()
+
+                intrinsics_mat = torch.eye(3)
+                intrinsics_mat[0, 0] = focals_val
+                intrinsics_mat[1, 1] = focals_val
+                intrinsics_mat[0, 2] = w / 2
+                intrinsics_mat[1, 2] = h / 2
+                intrinsics_mat = intrinsics_mat.cuda()
+
+                # Confidence threshold for masking
+                conf_all_sorted = conf.reshape(-1).sort()[0]
+                conf_thr = conf_all_sorted[int(conf_all_sorted.shape[0] * 0.03)]
+                msk = conf >= conf_thr
+
+                # Recover camera poses via PnP-RANSAC
+                y_coords, x_coords = torch.meshgrid(
+                    torch.arange(h), torch.arange(w), indexing='ij')
+                pixel_coords = torch.stack([x_coords, y_coords], dim=-1).float().cuda()
+
+                c2ws = []
+                for pr_pt, valid in zip(pts3d_list, msk):
+                    c2w_i = _pnp_ransac(
+                        pr_pt.cuda().flatten(0, 1)[None],
+                        pixel_coords.flatten(0, 1)[None],
+                        valid.cuda().flatten(0, 1)[None],
+                        intrinsics_mat[None])
+                    c2ws.append(c2w_i[0])
+                cams2world = torch.stack(c2ws, dim=0).cpu().numpy()
+
+                state.status = "Extracting point cloud..."
+                state.recon_frac = 0.75
+
+                pts3d_np = [to_numpy(p) for p in pts3d_list]
+                msk_np = to_numpy(msk)
+                rgbimg_np = [to_numpy(r) for r in rgbimg]
+
+                # Build point cloud
+                all_pts = []
+                all_colors = []
+                for i in range(len(rgbimg_np)):
+                    m = msk_np[i]
+                    all_pts.append(pts3d_np[i][m])
+                    all_colors.append((np.clip(rgbimg_np[i][m], 0, 1) * 255).astype(np.uint8))
+
+                if all_pts:
+                    points = np.concatenate(all_pts, axis=0)
+                    colors = np.concatenate(all_colors, axis=0)
+                    if len(points) > 200000:
+                        idx = np.random.choice(len(points), 200000, replace=False)
+                        points, colors = points[idx], colors[idx]
+                    scene_gl.set_points(points, colors)
+                    state.has_points = True; state.needs_recenter = True
+
+                state.status = "Building scene..."
+                state.recon_frac = 0.85
+
+                # Save data for scene building (done after module restore below)
+                conf_np = to_numpy(conf)
+                _mvd_result = dict(
+                    rgbimg_np=rgbimg_np, cams2world=cams2world, focals_val=focals_val,
+                    pts3d_np=pts3d_np, conf_np=list(conf_np), h=h, w=w,
+                    points=points)
+
+                del model, output
+                torch.cuda.empty_cache()
+
+            finally:
+                # Restore sys.path and purge ALL mvdust3r-loaded modules
+                sys.path = _saved_path
+                for k in list(sys.modules.keys()):
+                    if (k.startswith('dust3r') or k.startswith('models') or
+                        k.startswith('pytorch3d') or k.startswith('gsplat')):
+                        del sys.modules[k]
+                # Restore previously cached modules (mast3r's dust3r etc.)
+                for k, v in _cached_mods.items():
+                    sys.modules[k] = v
+
+            # Build VGGTScene AFTER module restore (so app.py imports mast3r's dust3r)
+            from app import VGGTScene
+            from PIL import Image as PILImage
+            from PIL.ImageOps import exif_transpose
+
+            r = _mvd_result
+            orig_sizes = []
+            for p in state.image_paths:
+                im = exif_transpose(PILImage.open(p)).convert('RGB')
+                orig_sizes.append(im.size)
+
+            extrinsic = np.zeros((len(r['cams2world']), 3, 4), dtype=np.float32)
+            for i in range(len(r['cams2world'])):
+                w2c = np.linalg.inv(r['cams2world'][i])
+                extrinsic[i] = w2c[:3, :]
+
+            K = np.eye(3, dtype=np.float32)
+            K[0, 0] = K[1, 1] = r['focals_val']
+            K[0, 2] = r['w'] / 2; K[1, 2] = r['h'] / 2
+            intrinsic_all = np.stack([K] * len(r['rgbimg_np']))
+
+            state.scene = VGGTScene(
+                r['rgbimg_np'], extrinsic, intrinsic_all,
+                r['pts3d_np'], r['conf_np'], orig_sizes)
+
+            cam_poses = [r['cams2world'][i] for i in range(len(r['cams2world']))]
+            if cam_poses and len(r['points']) > 0:
+                ext = np.linalg.norm(r['points'].max(axis=0) - r['points'].min(axis=0))
+                scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+            del _mvd_result
+
         else:
             # DUSt3R / MASt3R
             from dust3r.utils.image import load_images as dust3r_load_images
@@ -713,11 +1127,14 @@ def run_reconstruction(state, scene_gl):
                 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 
                 state.status = "Loading DUSt3R model..."
-                model = AsymmetricCroCo3DStereo.from_pretrained(
+                state.recon_frac = 0.1
+                model = _load_pretrained_cached(
+                    AsymmetricCroCo3DStereo,
                     "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt").to('cuda')
                 model.eval()
 
                 state.status = "Running DUSt3R inference..."
+                state.recon_frac = 0.25
                 imgs = dust3r_load_images(state.image_paths, size=512, verbose=True,
                                           patch_size=model.patch_size)
                 if len(imgs) == 1:
@@ -729,8 +1146,10 @@ def run_reconstruction(state, scene_gl):
 
                 mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
                 scene = global_aligner(output, device='cuda', mode=mode)
+                state.recon_frac = 0.5
                 if mode == GlobalAlignerMode.PointCloudOptimizer:
-                    state.status = "Aligning..."
+                    state.status = "Global alignment..."
+                    state.recon_frac = 0.55
                     scene.compute_global_alignment(init='mst', niter=state.niter1,
                                                    schedule='linear', lr=0.01)
                 state.scene = scene
@@ -741,11 +1160,14 @@ def run_reconstruction(state, scene_gl):
                 from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
 
                 state.status = "Loading MASt3R model..."
-                model = AsymmetricMASt3R.from_pretrained(
+                state.recon_frac = 0.1
+                model = _load_pretrained_cached(
+                    AsymmetricMASt3R,
                     "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric").to('cuda')
                 model.eval()
 
                 state.status = "Running MASt3R inference..."
+                state.recon_frac = 0.25
                 imgs = dust3r_load_images(state.image_paths, size=512, verbose=True,
                                           patch_size=model.patch_size)
                 paths = list(state.image_paths)
@@ -762,6 +1184,7 @@ def run_reconstruction(state, scene_gl):
                 opt = optim_levels[state.optim_level]
 
                 state.status = "Sparse global alignment..."
+                state.recon_frac = 0.5
                 scene = sparse_global_alignment(
                     paths, pairs, cache_dir, model,
                     lr1=0.07, niter1=state.niter1,
@@ -772,6 +1195,7 @@ def run_reconstruction(state, scene_gl):
 
             # Extract point cloud for display
             state.status = "Extracting point cloud..."
+            state.recon_frac = 0.75
             scene = state.scene
             rgbimg = scene.imgs
             pts3d_raw = to_numpy(scene.get_pts3d()) if not hasattr(scene, 'canonical_paths') else None
@@ -805,24 +1229,18 @@ def run_reconstruction(state, scene_gl):
                 colors = np.concatenate(all_colors, axis=0)
                 pt_view_ids = np.concatenate(all_view_ids, axis=0)
 
-                # Merge overlapping points (cross-view only)
-                if state.ai_merge_points and len(points) > 0:
-                    from depth_inject import merge_overlapping_points
-                    points, colors = merge_overlapping_points(
-                        points, colors, view_ids=pt_view_ids)
-
                 if len(points) > 200000:
                     idx = np.random.choice(len(points), 200000, replace=False)
                     points, colors = points[idx], colors[idx]
 
                 scene_gl.set_points(points, colors)
-                state.has_points = True
+                state.has_points = True; state.needs_recenter = True
 
             # Show camera frustums
             try:
                 cam_poses = []
                 if state.scene is not None:
-                    c2w_all = state.scene.get_im_poses().cpu().numpy()
+                    c2w_all = state.scene.get_im_poses().detach().cpu().numpy()
                     for i in range(len(c2w_all)):
                         cam_poses.append(c2w_all[i])
                 if cam_poses:
@@ -834,29 +1252,54 @@ def run_reconstruction(state, scene_gl):
             del model
             torch.cuda.empty_cache()
 
-        # Auto-center camera on point cloud
-        if state.has_points:
-            try:
-                center = points.mean(axis=0)
-                extent = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
-                camera.target = center.astype(np.float32)
-                camera.distance = float(extent * 1.5)
-            except Exception:
-                pass
+        # Recentering handled by main loop via needs_recenter flag
 
-        # Auto-fix orientation: dust3r often outputs upside-down
-        # Heuristic: if most cameras are below the point cloud center, flip
-        if state.has_points and backend != 'vggt':
+        # Auto-align scene: compute average camera up vector → align to world Y
+        if state.has_points and state.scene is not None:
             try:
-                cam_y_values = np.array([c2w_all[i][1, 3] for i in range(len(c2w_all))])
-                pts_center_y = points[:, 1].mean()
-                # If cameras are below center, scene is likely upside down
-                if cam_y_values.mean() < pts_center_y:
+                c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
+                # In OpenCV convention, camera Y points DOWN in the image,
+                # so the scene "up" is -Y of the camera (negate column 1)
+                avg_up = np.zeros(3, dtype=np.float64)
+                for i in range(len(c2w_poses)):
+                    avg_up -= c2w_poses[i][:3, 1]  # negate: cam Y is down
+                avg_up /= max(np.linalg.norm(avg_up), 1e-8)
+
+                # Compute rotation from avg_up to world Y=[0,1,0]
+                target_up = np.array([0.0, 1.0, 0.0])
+                dot = np.clip(np.dot(avg_up, target_up), -1.0, 1.0)
+                if abs(dot) < 0.999:
+                    axis = np.cross(avg_up, target_up)
+                    axis /= max(np.linalg.norm(axis), 1e-8)
+                    angle = np.arccos(dot)
+                    # Convert axis-angle to euler XYZ (approximate for scene_rot)
+                    # Use Rodrigues to get rotation matrix, then extract euler angles
+                    K_mat = np.array([[0, -axis[2], axis[1]],
+                                      [axis[2], 0, -axis[0]],
+                                      [-axis[1], axis[0], 0]])
+                    R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
+                    # Extract Euler XYZ from R_align
+                    sy = np.sqrt(R_align[0, 0] ** 2 + R_align[1, 0] ** 2)
+                    if sy > 1e-6:
+                        rx = np.arctan2(R_align[2, 1], R_align[2, 2])
+                        ry = np.arctan2(-R_align[2, 0], sy)
+                        rz = np.arctan2(R_align[1, 0], R_align[0, 0])
+                    else:
+                        rx = np.arctan2(-R_align[1, 2], R_align[1, 1])
+                        ry = np.arctan2(-R_align[2, 0], sy)
+                        rz = 0
+                    state.scene_rot_x = float(np.degrees(rx))
+                    state.scene_rot_y = float(np.degrees(ry))
+                    state.scene_rot_z = float(np.degrees(rz))
+                    print(f"  Auto-aligned scene (rot={state.scene_rot_x:.1f}, {state.scene_rot_y:.1f}, {state.scene_rot_z:.1f})")
+                elif dot < -0.5:
+                    # Nearly opposite — just flip
                     state.scene_rot_x = 180.0
-                    print("  Auto-flipped scene (detected upside-down)")
-            except Exception:
-                pass
+                    print("  Auto-flipped scene (upside-down)")
+            except Exception as e:
+                print(f"  Auto-align failed: {e}")
 
+        state.recon_frac = 1.0
         state.status = "Reconstruction complete!"
         state.error_msg = ""
 
@@ -913,24 +1356,17 @@ def run_depth_injection(state, scene_gl):
         colors = np.concatenate(all_colors, axis=0)
         pt_view_ids = np.concatenate(all_view_ids, axis=0)
 
-        # Merge overlapping points (cross-view only)
-        if state.ai_merge_points and len(points) > 0:
-            state.status = "Merging overlapping points..."
-            from depth_inject import merge_overlapping_points
-            points, colors = merge_overlapping_points(
-                points, colors, view_ids=pt_view_ids)
-
         if len(points) > 200000:
             idx = np.random.choice(len(points), 200000, replace=False)
             points, colors = points[idx], colors[idx]
 
         scene_gl.set_points(points, colors)
-        state.has_points = True
+        state.has_points = True; state.needs_recenter = True
         state.draw_mode = 0
 
         # Show cameras (with potentially updated poses)
         try:
-            c2w_all = to_numpy(state.scene.get_im_poses().cpu())
+            c2w_all = to_numpy(state.scene.get_im_poses().detach().cpu())
             cam_poses = [c2w_all[i] for i in range(len(imgs))]
             ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
             scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
@@ -949,105 +1385,63 @@ def run_depth_injection(state, scene_gl):
     state.reconstructing = False
 
 
-def _run_merge_points(state, scene_gl):
-    """Merge overlapping points as a standalone operation."""
-    state.refine_progress = "Merging overlapping points..."
-    try:
-        from depth_inject import merge_overlapping_points
-        from dust3r.utils.device import to_numpy
+def _extract_scene_data(state):
+    """Extract pts3d and confidence from any backend into normalized numpy lists."""
 
-        # Get current point cloud from scene
-        scene = state.scene
-        imgs = scene.imgs
-        pts3d = to_numpy(scene.get_pts3d())
+    from dust3r.utils.device import to_numpy
+    scene = state.scene
+    imgs = scene.imgs
 
-        all_pts = []
-        all_colors = []
-        all_view_ids = []
-        for i in range(len(imgs)):
-            flat = pts3d[i].reshape(-1, 3)
-            all_pts.append(flat)
-            all_colors.append((imgs[i].reshape(-1, 3) * 255).clip(0, 255).astype(np.uint8))
-            all_view_ids.append(np.full(len(flat), i, dtype=np.int32))
+    if hasattr(scene, '_is_vggt'):
+        pts3d_list = [np.array(p) for p in scene._pts3d]
+        confs_list = [np.array(c) for c in scene._depth_conf]
+    elif hasattr(scene, 'canonical_paths'):
+        pts3d_raw, _, confs_raw = scene.get_dense_pts3d(clean_depth=True)
+        pts3d_list = [to_numpy(pts3d_raw[i]).reshape(imgs[i].shape[0], imgs[i].shape[1], 3)
+                      for i in range(len(imgs))]
+        confs_list = [to_numpy(confs_raw[i]) for i in range(len(imgs))]
+    else:
+        if hasattr(scene, 'im_conf'):
+            confs_list = [to_numpy(c) for c in scene.im_conf]
+        else:
+            confs_list = [np.ones(imgs[i].shape[:2], dtype=np.float32) * 10 for i in range(len(imgs))]
+        if hasattr(scene, 'clean_pointcloud'):
+            scene = scene.clean_pointcloud()
+        pts3d_list = [to_numpy(p) for p in scene.get_pts3d()]
 
-        points = np.concatenate(all_pts, axis=0)
-        colors = np.concatenate(all_colors, axis=0)
-        pt_view_ids = np.concatenate(all_view_ids, axis=0)
+    state.pts3d_list = pts3d_list
+    state.confs_list = confs_list
+    return pts3d_list, confs_list
 
-        # Auto radius with multiplier
-        from scipy.spatial import cKDTree
-        sample = points[np.random.choice(len(points), min(10000, len(points)), replace=False)]
-        tree = cKDTree(sample)
-        dists, _ = tree.query(sample, k=2)
-        radius = float(np.median(dists[:, 1])) * state.merge_radius_mult
-
-        points, colors = merge_overlapping_points(
-            points, colors, merge_radius=radius, view_ids=pt_view_ids)
-
-        if len(points) > 200000:
-            idx = np.random.choice(len(points), 200000, replace=False)
-            points, colors = points[idx], colors[idx]
-
-        scene_gl.set_points(points, colors)
-        state.status = f"Merged to {len(points):,d} points (radius={radius:.6f})"
-    except Exception as e:
-        state.error_msg = str(e)
-        state.status = f"Merge failed: {e}"
-        import traceback
-        traceback.print_exc()
-
-    state.refining = False
-    state.refine_progress = ""
 
 
 def run_dense_mesh(state, scene_gl):
-    """Generate dense mesh from reconstruction via TSDF fusion."""
+    """Generate dense mesh by triangulating depth maps."""
     state.refine_progress = "Generating dense mesh..."
     try:
-        from dust3r.utils.device import to_numpy
-
         scene = state.scene
         if scene is None:
             state.status = "No reconstruction available"
             state.refining = False
             return
 
+        # Always grid-triangulate from depth maps (preserves connectivity, no holes)
         imgs = scene.imgs
-
-        # Extract dense pts3d based on scene type
-        import torch as _torch
-
+        pts3d_list, confs_list = _extract_scene_data(state)
         mesh_min_conf = state.min_conf
-        if hasattr(scene, '_is_vggt'):
-            # VGGT scene
-            pts3d_list = scene._pts3d
-            confs_list = scene._depth_conf
-        elif hasattr(scene, 'canonical_paths'):
-            # MASt3R SparseGA
-            pts3d_raw, _, confs_raw = scene.get_dense_pts3d(clean_depth=True)
-            pts3d_list = [to_numpy(pts3d_raw[i]).reshape(imgs[i].shape[0], imgs[i].shape[1], 3)
-                          for i in range(len(imgs))]
-            confs_list = [to_numpy(confs_raw[i]) for i in range(len(imgs))]
-        else:
-            # DUSt3R — use actual confidence from scene
-            if hasattr(scene, 'im_conf'):
-                confs_list = to_numpy([c for c in scene.im_conf])
-                # DUSt3R conf values are typically 1-20, threshold relative
+
+        # For DUSt3R, auto-threshold relative to median confidence
+        if not hasattr(scene, '_is_vggt') and not hasattr(scene, 'canonical_paths'):
+            if any(c is not None for c in confs_list):
                 mesh_min_conf = float(np.median(np.concatenate([c.ravel() for c in confs_list]))) * 0.5
-            else:
-                confs_list = [np.ones(imgs[i].shape[:2], dtype=np.float32) * 10 for i in range(len(imgs))]
-                mesh_min_conf = 0.5
-            if hasattr(scene, 'clean_pointcloud'):
-                scene = scene.clean_pointcloud()
-            pts3d_list = to_numpy(scene.get_pts3d())
 
         from mesh_export import create_dense_mesh
-        state.refine_progress = "Creating mesh..."
+        state.refine_progress = "Triangulating depth maps..."
 
         # Get camera poses for normal orientation
         cam_poses = None
         try:
-            c2w = scene.get_im_poses().cpu().numpy()
+            c2w = scene.get_im_poses().detach().cpu().numpy()
             cam_poses = [c2w[i] for i in range(len(imgs))]
         except Exception:
             pass
@@ -1056,24 +1450,13 @@ def run_dense_mesh(state, scene_gl):
         print(f"  pts3d shapes: {[p.shape for p in pts3d_list]}")
         print(f"  conf ranges: {[(c.min(), c.max()) for c in confs_list]}")
 
+        mesh_mode = state.mesh_modes[state.mesh_mode_idx]
         verts, faces, colors = create_dense_mesh(
             imgs, pts3d_list, confs_list,
             cam2world_list=cam_poses, min_conf=mesh_min_conf,
-            poisson_depth=state.poisson_depth,
-            normal_radius=state.normal_radius / 100.0,
-            trim_percentile=state.trim_percentile)
+            mode=mesh_mode, hole_cap_size=state.hole_cap_size)
 
         if len(faces) > 0:
-            # Decimate to target face count if needed
-            target = state.target_faces
-            if len(faces) > target * 1.2:
-                state.refine_progress = f"Decimating {len(faces):,d} -> {target:,d} faces..."
-                try:
-                    from refine_mesh import decimate_mesh
-                    verts, faces, colors = decimate_mesh(verts, faces, colors, target)
-                except Exception as e:
-                    print(f"  Decimation failed: {e}")
-
             state.mesh_data = (verts, faces, colors)
             scene_gl.set_mesh(verts, faces, colors)
             state.has_mesh = True
@@ -1089,6 +1472,48 @@ def run_dense_mesh(state, scene_gl):
 
     state.refining = False
     state.refine_progress = ""
+
+
+def run_decimate(state, scene_gl):
+    """Decimate existing mesh to target face count using Open3D quadric decimation."""
+    state.refine_progress = "Decimating mesh..."
+    try:
+        import open3d as o3d
+        verts, faces, colors = state.mesh_data
+        target = state.target_faces
+        n_before = len(faces)
+
+        if n_before <= target:
+            state.status = f"Mesh already has {n_before:,d} faces (<= target {target:,d})"
+            state.refining = False
+            return
+
+        state.refine_progress = f"Decimating {n_before:,d} -> {target:,d} faces..."
+        print(f"  Decimating {n_before:,d} -> {target:,d} faces...")
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+        mesh.vertex_colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+
+        mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target)
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_vertices()
+
+        verts_out = np.asarray(mesh.vertices, dtype=np.float32)
+        faces_out = np.asarray(mesh.triangles, dtype=np.int32)
+        colors_out = (np.asarray(mesh.vertex_colors) * 255).clip(0, 255).astype(np.uint8)
+
+        state.mesh_data = (verts_out, faces_out, colors_out)
+        scene_gl.set_mesh(verts_out, faces_out, colors_out)
+        state.status = f"Decimated: {n_before:,d} -> {len(faces_out):,d} faces"
+        print(f"  Done: {len(faces_out):,d} faces")
+    except Exception as e:
+        state.status = f"Decimation failed: {e}"
+        print(f"  Decimation error: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        state.refining = False
 
 
 def run_refinement(state, scene_gl, debug_imgs=None):
@@ -1495,7 +1920,7 @@ def run_enhanced_mesh(state, scene_gl, debug_imgs=None):
             scene_gl.set_points(points[idx], colors[idx])
         else:
             scene_gl.set_points(points, colors)
-        state.has_points = True
+        state.has_points = True; state.needs_recenter = True
         state.draw_mode = 0  # points view
 
         # Build mesh with Poisson + oriented normals
@@ -1570,17 +1995,17 @@ def _recolor_from_cameras(verts, faces, views):
 
 
 def run_texture(state, scene_gl):
-    """Generate UV-mapped textured mesh."""
+    """Generate UV-mapped textured mesh using PyMeshLab."""
     state.refine_progress = "Generating texture..."
     try:
         import tempfile
         from colmap_export import export_scene_to_colmap
         from refine_mesh import load_cameras
-        from texture_map import create_textured_mesh
 
-        # Export COLMAP to get camera data
         tmpdir = tempfile.mkdtemp()
         export_dir = os.path.join(tmpdir, 'colmap')
+
+        state.refine_progress = "Exporting cameras..."
         export_scene_to_colmap(
             scene=state.scene, image_paths=state.image_paths,
             output_dir=export_dir, min_conf_thr=state.min_conf)
@@ -1588,30 +2013,29 @@ def run_texture(state, scene_gl):
         views = load_cameras(export_dir)
         verts, faces, colors = state.mesh_data
 
-        # Decimate for texture speed if too dense
-        target = state.target_faces
-        if len(faces) > target * 1.2:
-            state.refine_progress = f"Decimating {len(faces):,d} -> {target:,d} faces..."
-            from refine_mesh import decimate_mesh
-            verts, faces, colors = decimate_mesh(verts, faces, colors, target)
-
         output_dir = os.path.join(tmpdir, 'textured')
+        os.makedirs(output_dir, exist_ok=True)
+
         state.refine_progress = f"UV unwrapping + projecting {len(faces):,d} faces..."
-        obj_path = create_textured_mesh(verts, faces, colors, views, output_dir)
+        from texture_map import create_textured_mesh
+        obj_path, uvs, uv_faces, texture_img = create_textured_mesh(
+            verts, faces, colors, views, output_dir, return_data=True)
 
-        # Re-color vertices from the projected texture for viewport display
-        state.refine_progress = "Updating vertex colors from texture..."
-        new_colors = _recolor_from_cameras(verts, faces, views)
-        if new_colors is not None:
-            colors = new_colors
-
-        state.mesh_data = (verts, faces, colors)
-        scene_gl.set_mesh(verts, faces, colors)
+        # Upload texture + UVs to viewport for live textured rendering
+        state.refine_progress = "Uploading texture to viewport..."
+        if texture_img is not None and uvs is not None:
+            scene_gl.set_texture(texture_img, uvs, uv_faces, verts, faces, colors)
+        else:
+            # Fallback: update vertex colors
+            new_colors = _recolor_from_cameras(verts, faces, views)
+            if new_colors is not None:
+                colors = new_colors
+            state.mesh_data = (verts, faces, colors)
+            scene_gl.set_mesh(verts, faces, colors)
 
         state.status = f"Textured mesh saved to {output_dir} ({len(faces):,d} faces)"
         state.refine_progress = ""
 
-        # Open the folder so user can find it
         import subprocess
         subprocess.Popen(['explorer', output_dir.replace('/', '\\')])
 
@@ -1623,6 +2047,149 @@ def run_texture(state, scene_gl):
 
     state.refining = False
     state.refine_progress = ""
+
+
+def _sample_vertex_colors_from_obj(obj_path):
+    """Load a textured OBJ, sample the texture at each vertex's UV, return vertex colors."""
+    try:
+        import trimesh
+        mesh = trimesh.load(obj_path, process=False)
+        if not hasattr(mesh, 'visual') or not hasattr(mesh.visual, 'material'):
+            return None
+        # Try to get per-vertex colors from the textured mesh
+        # trimesh can interpolate texture to vertex colors
+        vc = mesh.visual.to_color()
+        if hasattr(vc, 'vertex_colors') and vc.vertex_colors is not None:
+            colors = np.asarray(vc.vertex_colors[:, :3], dtype=np.uint8)
+            if len(colors) > 0 and colors.sum() > 0:
+                print(f"  Sampled {len(colors):,d} vertex colors from texture")
+                return colors
+    except Exception as e:
+        print(f"  Could not sample from OBJ texture: {e}")
+    return None
+
+
+def _texture_pymeshlab(verts, faces, colors, views, output_dir, state):
+    """Use PyMeshLab for multi-view texture projection with color correction."""
+    import pymeshlab
+    import trimesh
+    from scipy.spatial.transform import Rotation
+
+    state.refine_progress = "PyMeshLab: preparing mesh..."
+    print(f"  PyMeshLab texturing: {len(verts):,d} verts, {len(faces):,d} faces, {len(views)} cameras")
+
+    # Save mesh as PLY for PyMeshLab
+    mesh_path = os.path.join(output_dir, 'input_mesh.ply')
+    tm = trimesh.Trimesh(vertices=verts, faces=faces,
+                         vertex_colors=np.column_stack([colors, np.full(len(colors), 255, dtype=np.uint8)]))
+    tm.export(mesh_path)
+
+    ms = pymeshlab.MeshSet()
+    ms.load_new_mesh(mesh_path)
+
+    # Load camera images as rasters with proper projection matrices
+    state.refine_progress = "PyMeshLab: loading cameras..."
+    images_dir = os.path.join(output_dir, 'images')
+    os.makedirs(images_dir, exist_ok=True)
+
+    from PIL import Image as PILImage
+    for ci, view in enumerate(views):
+        # Save image
+        img_uint8 = (np.clip(view['pixels'], 0, 1) * 255).astype(np.uint8)
+        img_path = os.path.join(images_dir, f'cam_{ci:04d}.png')
+        PILImage.fromarray(img_uint8).save(img_path)
+
+        # Load as raster in PyMeshLab
+        ms.load_new_raster(img_path)
+
+        # Set camera parameters
+        W, H = view['W'], view['H']
+        K = view['K']
+        w2c = view['w2c']
+        c2w = np.linalg.inv(w2c)
+
+        # PyMeshLab shot: needs rotation matrix, translation, focal, principal point
+        R = w2c[:3, :3]
+        t = w2c[:3, 3]
+
+        # Create the shot
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+
+        # PyMeshLab uses a specific camera model
+        # Set intrinsics via the raster's shot
+        shot = ms.current_raster().shot()
+
+        # Set extrinsics: rotation + translation
+        # PyMeshLab rotation is stored as a 4x4 matrix
+        rot_matrix = pymeshlab.Matrix44f()
+        for r_i in range(3):
+            for r_j in range(3):
+                rot_matrix[r_i, r_j] = float(R[r_i, r_j])
+        rot_matrix[0, 3] = float(t[0])
+        rot_matrix[1, 3] = float(t[1])
+        rot_matrix[2, 3] = float(t[2])
+        rot_matrix[3, 3] = 1.0
+
+        shot.set_extr_from_matrix(rot_matrix)
+
+        # Set intrinsics
+        intr = shot.intrinsics()
+        intr.set_focal_mm(float(fx))
+        intr.set_pixel_size_mm(pymeshlab.Point2f(1.0, 1.0))
+        intr.set_center_px(pymeshlab.Point2f(float(cx), float(cy)))
+        intr.set_viewport_px(pymeshlab.Point2i(int(W), int(H)))
+        shot.set_intrinsics(intr)
+
+        ms.current_raster().set_shot(shot)
+
+    # Switch back to mesh (index 0)
+    ms.set_current_mesh(0)
+
+    # Project raster colors to vertex colors
+    state.refine_progress = "PyMeshLab: projecting textures..."
+    print("  Projecting raster colors...")
+
+    try:
+        ms.project_active_rasters_color_to_current_mesh(
+            deptheta=0.5,
+            onselectedraster=False,
+            usedepth=True,
+            useangle=True,
+            useborders=True,
+            usesil=True
+        )
+    except Exception as e:
+        print(f"  project_active_rasters failed: {e}")
+        # Try simpler version
+        ms.project_active_rasters_color_to_current_mesh()
+
+    # Try parameterization + texturing from rasters
+    state.refine_progress = "PyMeshLab: generating texture atlas..."
+    tex_name = "texture"
+    tex_size = 4096
+
+    try:
+        ms.parameterization_and_texturing_from_registered_rasters(
+            textname=tex_name,
+            texsize=tex_size,
+            colorcorrection=True,
+            usedistanceweight=True,
+            useangle=True,
+            useborders=True,
+        )
+        obj_path = os.path.join(output_dir, 'mesh.obj')
+        ms.save_current_mesh(obj_path)
+        print(f"  PyMeshLab texture saved: {obj_path}")
+        return obj_path
+
+    except Exception as e:
+        print(f"  parameterization_and_texturing failed: {e}")
+        # Fall back: save with vertex colors at least
+        obj_path = os.path.join(output_dir, 'mesh.obj')
+        ms.save_current_mesh(obj_path)
+        print(f"  Saved with vertex colors: {obj_path}")
+        return obj_path
 
 
 def main():
@@ -1655,7 +2222,9 @@ def main():
     last_mouse = [0.0, 0.0]
 
     def mouse_button_callback(window, button, action, mods):
-        # Let imgui handle it first
+        # Ignore input when window is not focused
+        if not glfw.get_window_attrib(window, glfw.FOCUSED):
+            return
         if imgui.get_io().want_capture_mouse:
             return
         if action == glfw.PRESS:
@@ -1664,6 +2233,8 @@ def main():
             mouse_down[button] = False
 
     def scroll_callback(window, xoffset, yoffset):
+        if not glfw.get_window_attrib(window, glfw.FOCUSED):
+            return
         if imgui.get_io().want_capture_mouse:
             return
         camera.zoom(yoffset)
@@ -1679,6 +2250,10 @@ def main():
         mx, my = glfw.get_cursor_pos(window)
         dx, dy = mx - last_mouse[0], my - last_mouse[1]
         last_mouse[0], last_mouse[1] = mx, my
+
+        # Clear mouse state when window loses focus (prevents stuck drag)
+        if not glfw.get_window_attrib(window, glfw.FOCUSED):
+            mouse_down[0] = mouse_down[1] = mouse_down[2] = False
 
         if not imgui.get_io().want_capture_mouse:
             if mouse_down[0]:  # Left = orbit
@@ -1743,7 +2318,7 @@ def main():
         # ── Backend ──
         imgui.text("Reconstruction Backend")
         _, state.backend_idx = imgui.combo("##backend",
-            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT"])
+            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+"])
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
@@ -1754,7 +2329,36 @@ def main():
             _, state.niter1 = imgui.input_int("Coarse Iters", state.niter1, 50, 100)
             _, state.niter2 = imgui.input_int("Refine Iters", state.niter2, 50, 100)
 
-        _, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
+        changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
+
+        # Live-update point cloud when confidence threshold changes
+        if changed_conf and state.scene is not None and state.has_points and not state.reconstructing:
+            try:
+                pts3d_list, confs_list = _extract_scene_data(state)
+                all_pts, all_cols = [], []
+                for i in range(len(state.scene.imgs)):
+                    p = pts3d_list[i]
+                    c = confs_list[i]
+                    img = state.scene.imgs[i]
+                    if p.ndim == 3:
+                        H, W = p.shape[:2]
+                        mask = c.reshape(H, W) > state.min_conf if c is not None else np.ones((H, W), dtype=bool)
+                        all_pts.append(p[mask])
+                        all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                    else:
+                        mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p), dtype=bool)
+                        all_pts.append(p[mask])
+                        all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+                if all_pts:
+                    points = np.concatenate(all_pts, axis=0)
+                    colors = np.concatenate(all_cols, axis=0)
+                    if len(points) > 200000:
+                        idx = np.random.choice(len(points), 200000, replace=False)
+                        points, colors = points[idx], colors[idx]
+                    scene_gl.set_points(points, colors)
+                    state.status = f"{len(points):,d} points (conf > {state.min_conf:.1f})"
+            except Exception:
+                pass
 
         # Reconstruct button
         if state.image_paths and not state.reconstructing:
@@ -1764,8 +2368,8 @@ def main():
                 state.recon_thread.start()
 
         if state.reconstructing:
-            imgui.text("Reconstructing...")
-            imgui.progress_bar(-1.0 * time.time() % 1.0)  # indeterminate
+            imgui.text(state.status)
+            imgui.progress_bar(state.recon_frac)
 
         # ── AI Depth Enhancement ──
         if state.scene is not None and state.has_points and not state.reconstructing and not state.refining:
@@ -1826,28 +2430,12 @@ def main():
 
         imgui.separator()
 
-        # ── Point Cloud Tools ──
-        imgui.text("Point Cloud")
-        _, state.ai_merge_points = imgui.checkbox("Merge overlapping", state.ai_merge_points)
-        if state.ai_merge_points:
-            imgui.same_line()
-            _, state.merge_radius_mult = imgui.slider_float(
-                "##radius", state.merge_radius_mult, 0.5, 5.0, format="%.1fx")
-        if state.has_points and not state.refining:
-            if imgui.button("Merge Points Now", width=-1):
-                state.refining = True
-                state.refine_thread = threading.Thread(
-                    target=_run_merge_points, args=(state, scene_gl), daemon=True)
-                state.refine_thread.start()
-        imgui.separator()
-
         # ── Dense Mesh ──
         imgui.text("Dense Mesh")
+        _, state.mesh_mode_idx = imgui.combo("Method", state.mesh_mode_idx, state.mesh_mode_labels)
+        _, state.hole_cap_size = imgui.slider_int("Hole Cap Size", state.hole_cap_size, 0, 500)
         _, state.target_faces = imgui.input_int("Target Faces", state.target_faces, 10000, 50000)
         state.target_faces = max(1000, state.target_faces)
-        _, state.poisson_depth = imgui.slider_int("Poisson Depth", state.poisson_depth, 5, 11)
-        _, state.normal_radius = imgui.slider_float("Normal Radius %%", state.normal_radius, 0.5, 10.0, format="%.1f%%")
-        _, state.trim_percentile = imgui.slider_float("Trim %%", state.trim_percentile, 0, 20, format="%.0f%%")
         if state.has_points and not state.refining:
             if imgui.button("Generate Dense Mesh (from reconstruction)", width=-1):
                 state.refining = True
@@ -1861,21 +2449,12 @@ def main():
                         target=run_enhanced_mesh, args=(state, scene_gl, debug_imgs), daemon=True)
                     state.refine_thread.start()
 
-        imgui.separator()
-
-        # ── Refine ──
-        imgui.text("Mesh Refinement")
-        _, state.refine_iters = imgui.input_int("Iterations##ref", state.refine_iters, 50, 100)
-        _, state.compare_mode = imgui.combo("Compare##cmp",
-            state.compare_mode, ["Edges", "High Freq", "Color", "Both", "Normals (AI)"])
-        _, state.refine_depth_reg = imgui.slider_float("Depth Reg", state.refine_depth_reg, 0, 1)
-        _, state.refine_smooth_reg = imgui.slider_float("Smooth Reg", state.refine_smooth_reg, 0, 0.1)
-
+        # Decimate button (post-processing, like RealityCapture)
         if state.has_mesh and not state.refining:
-            if imgui.button("Refine Mesh", width=-1):
+            if imgui.button("Decimate Mesh", width=-1):
                 state.refining = True
                 state.refine_thread = threading.Thread(
-                    target=run_refinement, args=(state, scene_gl, debug_imgs), daemon=True)
+                    target=run_decimate, args=(state, scene_gl), daemon=True)
                 state.refine_thread.start()
 
         if state.refining:
@@ -1930,6 +2509,26 @@ def main():
 
         # Upload any pending data from background threads
         scene_gl.flush_pending()
+
+        # Auto-recenter camera on scene when data changes
+        if state.needs_recenter:
+            state.needs_recenter = False
+            try:
+                # Get bounds from whatever data we have
+                pts = getattr(scene_gl, '_mesh_verts', None)
+                if pts is None and scene_gl.point_count > 0:
+                    # Can't easily read back point data, use scene from state
+                    if state.scene is not None:
+                        from dust3r.utils.device import to_numpy
+                        all_p = to_numpy(state.scene.get_pts3d())
+                        pts = np.concatenate([p.reshape(-1, 3) for p in all_p], axis=0)
+                if pts is not None and len(pts) > 0:
+                    center = pts.mean(axis=0)
+                    extent = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
+                    camera.target = center.astype(np.float32)
+                    camera.distance = float(extent * 1.5)
+            except Exception:
+                pass
 
         if vp_w > 0 and vp_h > 0:
             aspect = vp_w / vp_h

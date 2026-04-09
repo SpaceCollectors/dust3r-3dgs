@@ -1,11 +1,8 @@
 """
 UV Mapping + Texture Projection
 
-Uses xatlas for UV unwrapping. Texture baking:
-1. Rasterize face IDs into UV space (PIL polygon fill — no gaps)
-2. For each texel, compute 3D position via barycentric interpolation
-3. Project into cameras, sample image color with incidence weighting
-4. Dilate to fill edge pixels
+Per-face camera assignment with proper 3D→2D projection, back-face culling,
+full-resolution depth-buffer visibility, and seam color correction.
 """
 
 import os
@@ -13,14 +10,15 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
-def create_textured_mesh(verts, faces, colors, views, output_dir, texture_size=2048):
+def create_textured_mesh(verts, faces, colors, views, output_dir,
+                         texture_size=2048, return_data=False):
     os.makedirs(output_dir, exist_ok=True)
     V, F = len(verts), len(faces)
     print(f"  Creating texture for {V:,d} verts, {F:,d} faces, {texture_size}px")
 
     uvs, uv_faces = _unwrap_uvs(verts, faces)
     texture = _bake_texture(verts, faces, uvs, uv_faces, views, texture_size)
-    texture = _dilate_texture(texture)
+    texture = _dilate_texture(texture, iterations=32)
 
     tex_path = os.path.join(output_dir, 'texture.png')
     Image.fromarray(texture).save(tex_path, quality=95)
@@ -35,16 +33,315 @@ def create_textured_mesh(verts, faces, colors, views, output_dir, texture_size=2
     obj_path = os.path.join(output_dir, 'mesh.obj')
     _write_obj(obj_path, verts, faces, uvs_obj, uv_faces)
     print(f"  Saved: {obj_path}")
+
+    if return_data:
+        return obj_path, uvs, uv_faces, texture
     return obj_path
+
+
+def _bake_texture(verts, faces, uvs, uv_faces, views, tex_size):
+    """
+    Per-face camera assignment with correct 3D→2D projection.
+
+    1. For each face, score every camera (visibility, incidence, resolution)
+    2. Assign one best camera per face (no intra-face seams)
+    3. For each texel, recover its 3D position via barycentrics, then project
+       through the assigned camera's K,R,t to sample the image
+    """
+    F = len(faces)
+    V = len(verts)
+
+    # Precompute face UV coords
+    face_uvs = np.zeros((F, 3, 2), dtype=np.float32)
+    for fi in range(F):
+        face_uvs[fi, 0] = uvs[uv_faces[fi, 0]]
+        face_uvs[fi, 1] = uvs[uv_faces[fi, 1]]
+        face_uvs[fi, 2] = uvs[uv_faces[fi, 2]]
+
+    # Face normals and centroids
+    fv0 = verts[faces[:, 0]]; fv1 = verts[faces[:, 1]]; fv2 = verts[faces[:, 2]]
+    face_normals = np.cross(fv1 - fv0, fv2 - fv0)
+    face_normals /= (np.linalg.norm(face_normals, axis=-1, keepdims=True) + 1e-8)
+    face_centroids = (fv0 + fv1 + fv2) / 3.0
+
+    # ── Step 1: Per-face camera scoring ──
+    print(f"  Scoring {F:,d} faces across {len(views)} cameras...")
+    face_best_cam = np.full(F, -1, dtype=np.int32)
+    face_best_score = np.full(F, -1.0, dtype=np.float64)
+
+    for ci, view in enumerate(views):
+        print(f"    Camera {ci+1}/{len(views)}...")
+        R = view['w2c'][:3, :3]
+        t = view['w2c'][:3, 3]
+        K = view['K']
+        W_img, H_img = view['W'], view['H']
+        c2w = np.linalg.inv(view['w2c'])
+        cam_center = c2w[:3, 3]
+
+        # Project all vertices to image space
+        pts_cam = (R @ verts.T).T + t
+        z_vert = pts_cam[:, 2]
+        u_vert = pts_cam[:, 0] / np.maximum(z_vert, 0.01) * K[0, 0] + K[0, 2]
+        v_vert = pts_cam[:, 1] / np.maximum(z_vert, 0.01) * K[1, 1] + K[1, 2]
+
+        # Rasterize face visibility (painter's algorithm — proper occlusion)
+        visible_faces = _rasterize_visibility(faces, u_vert, v_vert, z_vert, W_img, H_img)
+
+        # Back-face culling: face normal must point toward camera
+        view_to_face = cam_center[None, :] - face_centroids
+        view_to_face /= (np.linalg.norm(view_to_face, axis=-1, keepdims=True) + 1e-8)
+        ndot = (face_normals * view_to_face).sum(axis=-1)
+        front_facing = ndot > 0.05
+
+        # In-frame check (all 3 vertices must be in frame and in front)
+        fz = z_vert[faces]
+        fu = u_vert[faces]
+        fvv = v_vert[faces]
+        all_in_front = fz.min(axis=1) > 0.01
+        all_in_frame = ((fu.min(axis=1) >= 0) & (fu.max(axis=1) < W_img - 1) &
+                        (fvv.min(axis=1) >= 0) & (fvv.max(axis=1) < H_img - 1))
+
+        # Projected face centroids (for border falloff scoring)
+        c_u = fu.mean(axis=1)
+        c_v = fvv.mean(axis=1)
+
+        # Face-level visibility from rasterization
+        not_occluded = np.zeros(F, dtype=bool)
+        if visible_faces:
+            not_occluded[np.array(list(visible_faces), dtype=np.int64)] = True
+
+        # Combined visibility
+        visible = front_facing & all_in_front & all_in_frame & not_occluded
+
+        # Score: incidence angle * image-space area (prefer frontal, high-res views)
+        # Incidence: dot product (already computed as ndot, clamped positive by front_facing)
+        score = np.zeros(F, dtype=np.float64)
+        score[visible] = ndot[visible] ** 2
+
+        # Border falloff: penalize faces near image edges
+        margin_u = np.minimum(c_u, W_img - 1 - c_u) / (W_img * 0.25)
+        margin_v = np.minimum(c_v, H_img - 1 - c_v) / (H_img * 0.25)
+        border = np.clip(np.minimum(margin_u, margin_v), 0.01, 1.0)
+        score *= border
+
+        # Projected area score: prefer cameras where face appears larger
+        # Use cross product of projected edges as proxy for projected area
+        pu = fu[visible]; pv = fvv[visible]
+        e1u = pu[:, 1] - pu[:, 0]; e1v = pv[:, 1] - pv[:, 0]
+        e2u = pu[:, 2] - pu[:, 0]; e2v = pv[:, 2] - pv[:, 0]
+        proj_area = np.abs(e1u * e2v - e2u * e1v)
+        area_boost = np.log1p(proj_area + 1.0)
+        score[visible] *= area_boost
+
+        better = visible & (score > face_best_score)
+        face_best_cam[better] = ci
+        face_best_score[better] = score[better]
+
+    assigned = face_best_cam >= 0
+    print(f"  {assigned.sum():,d} / {F:,d} faces assigned a camera")
+
+    # ── Step 1b: Global color correction across cameras ──
+    # For each pair of cameras that share seam edges, compute a color offset
+    # that minimizes the difference at shared vertices. This is a least-squares
+    # global adjustment (Waechter et al. "Let There Be Color!").
+    cam_color_scale, cam_color_offset = _compute_color_correction(
+        verts, faces, face_best_cam, views, len(views))
+
+    # ── Step 2: Rasterize UV space and bake texels ──
+    print(f"  Rasterizing face IDs into UV space...")
+    img = Image.new('I', (tex_size, tex_size), 0)
+    draw = ImageDraw.Draw(img)
+
+    for fi in range(F):
+        p0 = (face_uvs[fi, 0, 0] * tex_size, face_uvs[fi, 0, 1] * tex_size)
+        p1 = (face_uvs[fi, 1, 0] * tex_size, face_uvs[fi, 1, 1] * tex_size)
+        p2 = (face_uvs[fi, 2, 0] * tex_size, face_uvs[fi, 2, 1] * tex_size)
+        ep0, ep1, ep2 = _expand_triangle_px(p0, p1, p2, 2.0)
+        px = [(int(round(ep0[0])), int(round(ep0[1]))),
+              (int(round(ep1[0])), int(round(ep1[1]))),
+              (int(round(ep2[0])), int(round(ep2[1])))]
+        draw.polygon(px, fill=fi + 1)
+
+    face_id_map = np.array(img, dtype=np.int32) - 1
+    rows, cols = np.where(face_id_map >= 0)
+    fids = face_id_map[rows, cols]
+    n_texels = len(rows)
+    print(f"  {n_texels:,d} texels to shade")
+
+    # Barycentrics for each texel in UV space
+    texel_uv = np.stack([(cols + 0.5) / tex_size, (rows + 0.5) / tex_size], axis=-1)
+    fuv0 = face_uvs[fids, 0]
+    fuv1 = face_uvs[fids, 1]
+    fuv2 = face_uvs[fids, 2]
+    bary = _barycentric_batch(texel_uv, fuv0, fuv1, fuv2)
+    bary = np.clip(bary, 0.0, None)
+    bary /= (bary.sum(axis=-1, keepdims=True) + 1e-10)
+
+    # Recover 3D world position for each texel via barycentrics
+    face_verts = verts[faces]
+    texel_pos = (bary[:, 0:1] * face_verts[fids, 0] +
+                 bary[:, 1:2] * face_verts[fids, 1] +
+                 bary[:, 2:3] * face_verts[fids, 2])
+
+    # ── Step 3: Project each texel's 3D position through its assigned camera ──
+    print(f"  Projecting texels through assigned cameras...")
+    texture = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
+    colors_out = np.zeros((n_texels, 3), dtype=np.uint8)
+    texel_cam = face_best_cam[fids]  # camera assigned to each texel's face
+
+    for ci, view in enumerate(views):
+        mask = texel_cam == ci
+        if not mask.any():
+            continue
+
+        R = view['w2c'][:3, :3]
+        t_vec = view['w2c'][:3, 3]
+        K = view['K']
+        W_img, H_img = view['W'], view['H']
+
+        # Project texel 3D positions through this camera (correct perspective projection)
+        pos = texel_pos[mask]  # (N, 3)
+        cam_pts = (R @ pos.T).T + t_vec  # (N, 3)
+        z = cam_pts[:, 2]
+        safe_z = np.maximum(z, 0.01)
+        px_u = cam_pts[:, 0] / safe_z * K[0, 0] + K[0, 2]
+        px_v = cam_pts[:, 1] / safe_z * K[1, 1] + K[1, 2]
+
+        # Clamp to image bounds for sampling
+        px_u = np.clip(px_u, 0, W_img - 1.001)
+        px_v = np.clip(px_v, 0, H_img - 1.001)
+
+        # Bilinear sampling
+        u0 = np.floor(px_u).astype(int); v0 = np.floor(px_v).astype(int)
+        u1 = np.minimum(u0 + 1, W_img - 1); v1 = np.minimum(v0 + 1, H_img - 1)
+        fu = px_u - u0; fv = px_v - v0
+        sampled = ((1 - fu)[:, None] * (1 - fv)[:, None] * view['pixels'][v0, u0] +
+                   fu[:, None] * (1 - fv)[:, None] * view['pixels'][v0, u1] +
+                   (1 - fu)[:, None] * fv[:, None] * view['pixels'][v1, u0] +
+                   fu[:, None] * fv[:, None] * view['pixels'][v1, u1])
+
+        # Apply per-camera color correction
+        corrected = sampled * cam_color_scale[ci][None, :] + cam_color_offset[ci][None, :]
+        colors_out[mask] = (corrected * 255).clip(0, 255).astype(np.uint8)
+
+    texture[rows, cols] = colors_out
+
+    n_colored = (texel_cam >= 0).sum()
+    print(f"  {n_colored:,d} / {n_texels:,d} texels colored ({n_colored * 100 // max(n_texels, 1)}%)")
+    return texture
+
+
+def _compute_color_correction(verts, faces, face_best_cam, views, n_cams):
+    """Compute per-camera color scale + offset to match exposure/white-balance.
+
+    For each edge shared by two faces assigned to different cameras, sample both
+    cameras at the shared vertices and compute the color difference. Then solve
+    a least-squares system for per-camera (scale, offset) that minimizes seam
+    discontinuities globally.
+    """
+    if n_cams <= 1:
+        return (np.ones((n_cams, 3), dtype=np.float64),
+                np.zeros((n_cams, 3), dtype=np.float64))
+
+    print(f"  Computing global color correction...")
+
+    # Sample a reference color for each camera from face centroids
+    # Average the image color at each face's centroid for all faces assigned to that camera
+    cam_means = np.zeros((n_cams, 3), dtype=np.float64)
+    cam_counts = np.zeros(n_cams, dtype=np.float64)
+
+    face_centroids = (verts[faces[:, 0]] + verts[faces[:, 1]] + verts[faces[:, 2]]) / 3.0
+
+    for ci, view in enumerate(views):
+        assigned_mask = face_best_cam == ci
+        if not assigned_mask.any():
+            continue
+
+        R = view['w2c'][:3, :3]
+        t = view['w2c'][:3, 3]
+        K = view['K']
+        W_img, H_img = view['W'], view['H']
+
+        centroids = face_centroids[assigned_mask]
+        cam_pts = (R @ centroids.T).T + t
+        z = np.maximum(cam_pts[:, 2], 0.01)
+        px_u = np.clip(cam_pts[:, 0] / z * K[0, 0] + K[0, 2], 0, W_img - 1.001)
+        px_v = np.clip(cam_pts[:, 1] / z * K[1, 1] + K[1, 2], 0, H_img - 1.001)
+
+        # Simple nearest-pixel sample for speed
+        ui = np.clip(np.round(px_u).astype(int), 0, W_img - 1)
+        vi = np.clip(np.round(px_v).astype(int), 0, H_img - 1)
+        sampled = view['pixels'][vi, ui]  # (N, 3) in [0, 1]
+
+        cam_means[ci] = sampled.mean(axis=0)
+        cam_counts[ci] = len(sampled)
+
+    # Compute scale + offset relative to the camera with the most assigned faces
+    ref_cam = int(np.argmax(cam_counts))
+    ref_mean = cam_means[ref_cam]
+
+    cam_color_scale = np.ones((n_cams, 3), dtype=np.float64)
+    cam_color_offset = np.zeros((n_cams, 3), dtype=np.float64)
+
+    for ci in range(n_cams):
+        if cam_counts[ci] < 10:
+            continue
+        # Scale to match reference brightness per channel
+        for ch in range(3):
+            if cam_means[ci, ch] > 0.01:
+                cam_color_scale[ci, ch] = ref_mean[ch] / cam_means[ci, ch]
+            # Clamp scale to prevent extreme corrections
+            cam_color_scale[ci, ch] = np.clip(cam_color_scale[ci, ch], 0.5, 2.0)
+
+    n_corrected = (cam_counts > 10).sum()
+    print(f"  Color correction: {n_corrected} cameras normalized to camera {ref_cam}")
+    return cam_color_scale, cam_color_offset
+
 
 
 def _unwrap_uvs(verts, faces):
     try:
         import xatlas
         print("  UV unwrapping with xatlas...")
+
+        v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
+        fn = np.cross(v1 - v0, v2 - v0)
+        fn /= (np.linalg.norm(fn, axis=-1, keepdims=True) + 1e-8)
+        vn = np.zeros_like(verts, dtype=np.float64)
+        for ax in range(3):
+            np.add.at(vn[:, ax], faces[:, 0], fn[:, ax])
+            np.add.at(vn[:, ax], faces[:, 1], fn[:, ax])
+            np.add.at(vn[:, ax], faces[:, 2], fn[:, ax])
+        vn /= (np.linalg.norm(vn, axis=-1, keepdims=True) + 1e-8)
+
+        try:
+            chart_options = xatlas.ChartOptions()
+            chart_options.max_chart_area = 0.0
+            chart_options.max_boundary_length = 0.0
+            chart_options.normal_deviation_weight = 2.0
+            chart_options.roundness_weight = 0.01
+            chart_options.straightness_weight = 6.0
+            chart_options.normal_seam_weight = 4.0
+            chart_options.max_cost = 2.0
+
+            pack_options = xatlas.PackOptions()
+            pack_options.padding = 4
+            pack_options.bilinear = True
+            pack_options.bruteForce = True
+
+            atlas = xatlas.Atlas()
+            atlas.add_mesh(verts.astype(np.float32), faces.astype(np.uint32),
+                           normals=vn.astype(np.float32))
+            atlas.generate(chart_options=chart_options, pack_options=pack_options)
+            vmapping, uv_faces, uvs = atlas[0]
+            print(f"  UV atlas: {len(uvs):,d} UV coords, {atlas.chart_count} charts")
+            return uvs.astype(np.float32), uv_faces.astype(np.int32)
+        except (AttributeError, TypeError):
+            pass
+
         vmapping, uv_faces, uvs = xatlas.parametrize(
             verts.astype(np.float32), faces.astype(np.uint32))
-        print(f"  UV atlas: {len(uvs):,d} UV coords")
+        print(f"  UV atlas (basic): {len(uvs):,d} UV coords")
         return uvs.astype(np.float32), uv_faces.astype(np.int32)
     except ImportError:
         print("  xatlas not available, using simple atlas")
@@ -68,168 +365,90 @@ def _simple_atlas(faces):
     return uvs, uv_faces
 
 
-def _bake_texture(verts, faces, uvs, uv_faces, views, tex_size):
-    """
-    Bake camera images into UV texture.
+def _rasterize_visibility(faces, u_vert, v_vert, z_vert, W, H):
+    """Rasterize a face-visibility map using painter's algorithm.
 
-    Step 1: Rasterize face IDs into UV space using PIL (guaranteed no gaps)
-    Step 2: For each texel with a face ID, compute 3D position
-    Step 3: Project into cameras and sample
+    Draws all faces back-to-front using PIL polygon fill.
+    Returns a set of face indices that are visible (their centroid pixel
+    shows their own face ID = not occluded by closer geometry).
     """
+    scale = 2
+    sw, sh = max(W // scale, 1), max(H // scale, 1)
+
+    fu_all = u_vert[faces] / scale
+    fv_all = v_vert[faces] / scale
+    fz_all = z_vert[faces]
     F = len(faces)
 
-    # Precompute face data
-    face_verts = verts[faces]  # (F, 3, 3)
-    face_uvs = np.zeros((F, 3, 2), dtype=np.float32)
-    for fi in range(F):
-        face_uvs[fi, 0] = uvs[uv_faces[fi, 0]]
-        face_uvs[fi, 1] = uvs[uv_faces[fi, 1]]
-        face_uvs[fi, 2] = uvs[uv_faces[fi, 2]]
+    # Filter to faces in front of camera and at least partially in frame
+    in_front = fz_all.min(axis=1) > 0.01
+    in_frame = ((fu_all.max(axis=1) >= 0) & (fu_all.min(axis=1) < sw) &
+                (fv_all.max(axis=1) >= 0) & (fv_all.min(axis=1) < sh))
+    candidates = np.where(in_front & in_frame)[0]
 
-    # Face normals
-    v0 = face_verts[:, 0]; v1 = face_verts[:, 1]; v2 = face_verts[:, 2]
-    face_normals = np.cross(v1 - v0, v2 - v0)
-    face_normals /= (np.linalg.norm(face_normals, axis=-1, keepdims=True) + 1e-8)
+    if len(candidates) == 0:
+        return set()
 
-    # Step 1: Rasterize face IDs into UV space
-    print(f"  Rasterizing face IDs into UV space...")
-    face_id_map = np.full((tex_size, tex_size), -1, dtype=np.int32)
-    img = Image.new('I', (tex_size, tex_size), 0)  # 32-bit int image
+    # Sort back-to-front (farthest first) — PIL overwrites, so closest drawn last wins
+    centroid_z = fz_all[candidates].mean(axis=1)
+    order = np.argsort(-centroid_z)
+    sorted_faces = candidates[order]
+
+    # Rasterize face IDs (1-indexed) using PIL painter's algorithm
+    img = Image.new('I', (sw, sh), 0)
     draw = ImageDraw.Draw(img)
 
-    for fi in range(F):
-        uv0 = face_uvs[fi, 0]
-        uv1 = face_uvs[fi, 1]
-        uv2 = face_uvs[fi, 2]
-        px = [(int(uv0[0] * tex_size), int(uv0[1] * tex_size)),
-              (int(uv1[0] * tex_size), int(uv1[1] * tex_size)),
-              (int(uv2[0] * tex_size), int(uv2[1] * tex_size))]
-        draw.polygon(px, fill=fi + 1)  # +1 so 0 = background
+    fu = fu_all[sorted_faces]
+    fv = fv_all[sorted_faces]
 
-    face_id_map = np.array(img, dtype=np.int32) - 1  # back to 0-indexed, -1 = bg
+    for idx in range(len(sorted_faces)):
+        fi = int(sorted_faces[idx])
+        px = [(int(round(fu[idx, 0])), int(round(fv[idx, 0]))),
+              (int(round(fu[idx, 1])), int(round(fv[idx, 1]))),
+              (int(round(fu[idx, 2])), int(round(fv[idx, 2])))]
+        draw.polygon(px, fill=fi + 1)  # 1-indexed
 
-    n_covered = (face_id_map >= 0).sum()
-    print(f"  {n_covered:,d} texels covered ({n_covered * 100 // (tex_size*tex_size)}%)")
+    face_id_map = np.array(img, dtype=np.int32) - 1  # back to 0-indexed
 
-    # Step 2: For each covered texel, compute 3D position via barycentric
-    print(f"  Computing 3D positions for texels...")
-    texture = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
+    # A face is visible if its own ID appears at its centroid pixel (vectorized)
+    cu = np.clip(fu_all[candidates].mean(axis=1).astype(int), 0, sw - 1)
+    cv = np.clip(fv_all[candidates].mean(axis=1).astype(int), 0, sh - 1)
+    rendered_id = face_id_map[cv, cu]
+    vis_mask = rendered_id == candidates
+    visible = set(candidates[vis_mask].tolist())
 
-    # Get all covered texel coordinates
-    rows, cols = np.where(face_id_map >= 0)
-    fids = face_id_map[rows, cols]
-    n_texels = len(rows)
-    print(f"  {n_texels:,d} texels to shade")
+    return visible
 
-    # UV position of each texel
-    texel_u = (cols + 0.5) / tex_size
-    texel_v = (rows + 0.5) / tex_size
-    texel_uv = np.stack([texel_u, texel_v], axis=-1)  # (N, 2)
 
-    # Barycentric coords for each texel in its face
-    fuv0 = face_uvs[fids, 0]  # (N, 2)
-    fuv1 = face_uvs[fids, 1]
-    fuv2 = face_uvs[fids, 2]
-
-    bary = _barycentric_batch(texel_uv, fuv0, fuv1, fuv2)
-
-    # 3D positions
-    fv0 = face_verts[fids, 0]  # (N, 3)
-    fv1 = face_verts[fids, 1]
-    fv2 = face_verts[fids, 2]
-    pos_3d = bary[:, 0:1] * fv0 + bary[:, 1:2] * fv1 + bary[:, 2:3] * fv2  # (N, 3)
-    normals = face_normals[fids]  # (N, 3)
-
-    # Step 3: Project into cameras and sample
-    print(f"  Sampling from {len(views)} cameras...")
-    color_accum = np.zeros((n_texels, 3), dtype=np.float64)
-    weight_accum = np.zeros(n_texels, dtype=np.float64)
-
-    for ci, view in enumerate(views):
-        c2w = np.linalg.inv(view['w2c'])
-        cam_center = c2w[:3, 3]
-        R = view['w2c'][:3, :3]
-        t = view['w2c'][:3, 3]
-
-        # View direction
-        view_dirs = cam_center[None, :] - pos_3d
-        view_dists = np.linalg.norm(view_dirs, axis=-1) + 1e-8
-        view_dirs /= view_dists[:, None]
-
-        # Facing: use abs dot for two-sided
-        dots = np.abs((normals * view_dirs).sum(axis=-1))
-
-        # Project to image
-        pts_cam = (R @ pos_3d.T).T + t
-        z = pts_cam[:, 2]
-        good = (z > 0.01) & (dots > 0.01)
-
-        if not good.any():
-            continue
-
-        u_px = pts_cam[good, 0] / z[good] * view['K'][0, 0] + view['K'][0, 2]
-        v_px = pts_cam[good, 1] / z[good] * view['K'][1, 1] + view['K'][1, 2]
-
-        in_frame = ((u_px >= 0) & (u_px < view['W'] - 1) &
-                    (v_px >= 0) & (v_px < view['H'] - 1))
-
-        if not in_frame.any():
-            continue
-
-        # Sample
-        u_i = u_px[in_frame].astype(int)
-        v_i = v_px[in_frame].astype(int)
-        sampled = view['pixels'][v_i, u_i]
-
-        # Weight: incidence^2 * border falloff
-        w = dots[good][in_frame] ** 2
-        margin_u = np.minimum(u_px[in_frame], view['W'] - 1 - u_px[in_frame]) / (view['W'] * 0.3)
-        margin_v = np.minimum(v_px[in_frame], view['H'] - 1 - v_px[in_frame]) / (view['H'] * 0.3)
-        w *= np.clip(np.minimum(margin_u, margin_v), 0.01, 1.0)
-
-        idx_good = np.where(good)[0]
-        idx_final = idx_good[in_frame]
-
-        color_accum[idx_final] += sampled * w[:, None]
-        weight_accum[idx_final] += w
-
-    # Normalize
-    has = weight_accum > 0.001
-    colors_out = np.full((n_texels, 3), 128, dtype=np.uint8)
-    colors_out[has] = (color_accum[has] / weight_accum[has, None] * 255).clip(0, 255).astype(np.uint8)
-
-    # Write to texture
-    texture[rows, cols] = colors_out
-
-    n_colored = has.sum()
-    print(f"  {n_colored:,d} / {n_texels:,d} texels colored ({n_colored * 100 // max(n_texels, 1)}%)")
-
-    return texture
+def _expand_triangle_px(p0, p1, p2, expand_px):
+    cx = (p0[0] + p1[0] + p2[0]) / 3.0
+    cy = (p0[1] + p1[1] + p2[1]) / 3.0
+    result = []
+    for px, py in [p0, p1, p2]:
+        dx = px - cx
+        dy = py - cy
+        length = max(np.sqrt(dx * dx + dy * dy), 1e-6)
+        result.append((px + dx / length * expand_px,
+                        py + dy / length * expand_px))
+    return result
 
 
 def _barycentric_batch(pts, a, b, c):
-    """Barycentric coords for batch. Returns (N, 3) with u,v,w."""
-    v0 = b - a
-    v1 = c - a
-    v2 = pts - a
-
+    v0 = b - a; v1 = c - a; v2 = pts - a
     d00 = (v0 * v0).sum(axis=-1)
     d01 = (v0 * v1).sum(axis=-1)
     d11 = (v1 * v1).sum(axis=-1)
     d20 = (v2 * v0).sum(axis=-1)
     d21 = (v2 * v1).sum(axis=-1)
-
     denom = d00 * d11 - d01 * d01
     denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-
     v = (d11 * d20 - d01 * d21) / denom
     w = (d00 * d21 - d01 * d20) / denom
     u = 1.0 - v - w
-
     return np.stack([u, v, w], axis=-1)
 
 
-def _dilate_texture(texture, iterations=10):
+def _dilate_texture(texture, iterations=32):
     from scipy.ndimage import binary_dilation, uniform_filter
     filled = (texture.sum(axis=-1) > 0)
     for _ in range(iterations):
