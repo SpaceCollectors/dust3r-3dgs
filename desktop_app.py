@@ -985,6 +985,21 @@ imgs = load_images({repr(state.image_paths)}, size=512, verbose=True)
 if len(imgs) == 1:
     imgs = [imgs[0], copy.deepcopy(imgs[0])]
 
+# Force landscape — Pow3R patch_embed requires W >= H
+for img_dict in imgs:
+    ts = img_dict['true_shape']
+    if hasattr(ts, 'shape') and ts.ndim == 2:
+        H, W = int(ts[0, 0]), int(ts[0, 1])
+    else:
+        H, W = int(ts[0]), int(ts[1])
+    if H > W:
+        # Rotate image tensor 90 degrees
+        img_dict['img'] = img_dict['img'].rot90(1, [2, 3])
+        if hasattr(ts, 'shape') and ts.ndim == 2:
+            img_dict['true_shape'] = np.array([[W, H]])
+        else:
+            img_dict['true_shape'] = np.array([W, H])
+
 # Inference
 pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
 output = inference(pairs, model, 'cuda', batch_size=1)
