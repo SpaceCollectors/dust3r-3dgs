@@ -1002,19 +1002,32 @@ def run_reconstruction(state, scene_gl):
                 state.recon_frac = 0.2
                 imgs = pow3r_load_images(state.image_paths, size=512, verbose=True)
 
-                # Inject known cameras if available
-                if state.cached_cameras is not None:
-                    print("  Injecting known cameras into Pow3R views...")
-                    for i, img_dict in enumerate(imgs):
-                        if i < len(state.cached_cameras) and state.cached_cameras[i] is not None:
-                            c2w, K, W_cam, H_cam = state.cached_cameras[i]
-                            # Scale K to match Pow3R's image size
-                            H_p, W_p = img_dict['true_shape'][0] if hasattr(img_dict['true_shape'], '__len__') else (384, 512)
-                            K_scaled = K.copy().astype(np.float32)
-                            K_scaled[0, :] *= W_p / W_cam
-                            K_scaled[1, :] *= H_p / H_cam
-                            img_dict['camera_intrinsics'] = K_scaled
-                            img_dict['camera_pose'] = c2w.astype(np.float32)
+                # Pow3R sliding window requires camera_intrinsics in every view
+                for i, img_dict in enumerate(imgs):
+                    # Get image dimensions from true_shape
+                    ts = img_dict['true_shape']
+                    if isinstance(ts, torch.Tensor):
+                        H_p, W_p = int(ts[0].item()), int(ts[1].item())
+                    elif hasattr(ts, '__len__') and len(ts) >= 2:
+                        H_p, W_p = int(ts[0]), int(ts[1])
+                    else:
+                        H_p, W_p = 384, 512
+
+                    if state.cached_cameras is not None and i < len(state.cached_cameras) and state.cached_cameras[i] is not None:
+                        # Use known cameras
+                        c2w, K, W_cam, H_cam = state.cached_cameras[i]
+                        K_scaled = K.copy().astype(np.float32)
+                        K_scaled[0, :] *= W_p / W_cam
+                        K_scaled[1, :] *= H_p / H_cam
+                        img_dict['camera_intrinsics'] = K_scaled
+                        img_dict['camera_pose'] = c2w.astype(np.float32)
+                    else:
+                        # Default intrinsics (approximate 60° FOV)
+                        focal = max(W_p, H_p) * 0.85
+                        K_default = np.array([[focal, 0, W_p/2],
+                                              [0, focal, H_p/2],
+                                              [0, 0, 1]], dtype=np.float32)
+                        img_dict['camera_intrinsics'] = K_default
 
                 # Run pairwise on all consecutive pairs
                 state.status = "Running Pow3R inference..."
