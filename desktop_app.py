@@ -740,10 +740,7 @@ class AppState:
         # Backend
         self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap, 4=pow3r
         self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap', 'pow3r']
-        self.camera_source_idx = 0  # 0=same, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT
-        self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
-        self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
-        self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
+        self.cached_cameras = None  # reference cameras from first reconstruction (for alignment)
         self.stack_backends = False  # run multiple backends and merge points
         self.stack_dust3r = True
         self.stack_mast3r = False
@@ -933,16 +930,6 @@ def run_reconstruction(state, scene_gl):
                 w2c_44[:3, :] = extrinsic[i]
                 cam_poses.append(np.linalg.inv(w2c_44))
 
-            # Align to cached cameras if available
-            if state.cached_cameras is not None and len(state.cached_cameras) == len(cam_poses):
-                print("  Aligning VGGT to cached cameras...")
-                pts3d_all, cam_poses = _align_to_cached_cameras(pts3d_all, cam_poses, state.cached_cameras)
-                # Rebuild extrinsics from aligned poses
-                for i in range(len(cam_poses)):
-                    extrinsic[i] = np.linalg.inv(cam_poses[i])[:3, :].astype(np.float32)
-                # Use cached intrinsics
-                intrinsic = np.stack([c[1].astype(np.float32) for c in state.cached_cameras])
-
             state.scene = VGGTScene(imgs_list, extrinsic, intrinsic,
                                     pts3d_all, conf_all, orig_sizes)
             if cam_poses:
@@ -1064,15 +1051,6 @@ print('SUCCESS')
                     orig_sizes.append(im.size)
 
                 # Align to cached cameras if available
-                cam_poses_pow3r = [c2w_all[i] for i in range(len(c2w_all))]
-                if state.cached_cameras is not None and len(state.cached_cameras) == len(cam_poses_pow3r):
-                    print("  Aligning Pow3R to cached cameras...")
-                    pts3d, cam_poses_pow3r = _align_to_cached_cameras(pts3d, cam_poses_pow3r, state.cached_cameras)
-                    # Rebuild extrinsics + intrinsics from cached cameras
-                    for i in range(len(cam_poses_pow3r)):
-                        extrinsic[i] = np.linalg.inv(cam_poses_pow3r[i])[:3, :].astype(np.float32)
-                    intrinsic_all = [c[1].astype(np.float32) for c in state.cached_cameras]
-
                 state.scene = VGGTScene(imgs_np, extrinsic, np.stack(intrinsic_all),
                                         pts3d, confs, orig_sizes)
 
@@ -1231,22 +1209,6 @@ print('SUCCESS')
 
         else:
             # DUSt3R / MASt3R
-
-            # Hybrid: run separate camera estimation if camera source differs from backend
-            cam_source = state.camera_sources[state.camera_source_idx]
-            if cam_source != 'same' and cam_source != backend and state.cached_cameras is None:
-                state.status = f"Estimating cameras with {cam_source.upper()}..."
-                state.recon_frac = 0.05
-                try:
-                    state.cached_cameras = _estimate_cameras(state, cam_source)
-                    if state.cached_cameras:
-                        print(f"  Camera source ({cam_source}): {len(state.cached_cameras)} cameras")
-                    else:
-                        print(f"  Camera estimation failed, will use {backend} cameras")
-                except Exception as e:
-                    print(f"  Camera estimation failed: {e}")
-                    import traceback; traceback.print_exc()
-
             from dust3r.utils.image import load_images as dust3r_load_images
             from dust3r.utils.device import to_numpy
 
@@ -1277,21 +1239,7 @@ print('SUCCESS')
                 mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
                 scene = global_aligner(output, device='cuda', mode=mode)
                 state.recon_frac = 0.5
-
-                # Hybrid: use external cameras if available
-                print(f"  Cached cameras: {len(state.cached_cameras) if state.cached_cameras else 'None'}, imgs: {len(imgs)}, mode: {mode}")
-                if state.cached_cameras is not None and len(state.cached_cameras) == len(imgs) and mode == GlobalAlignerMode.PointCloudOptimizer:
-                    state.status = "Setting external cameras (fixed poses)..."
-                    import torch as _torch
-                    known_poses = [_torch.tensor(c[0], dtype=_torch.float32) for c in state.cached_cameras]
-                    known_focals = [c[1][0, 0] for c in state.cached_cameras]
-                    scene.preset_pose(_torch.stack(known_poses))
-                    scene.preset_focal(_torch.tensor(known_focals))
-                    state.status = "Optimizing depth with fixed cameras..."
-                    state.recon_frac = 0.55
-                    scene.compute_global_alignment(init='known_poses', niter=state.niter1,
-                                                   schedule='linear', lr=0.01)
-                elif mode == GlobalAlignerMode.PointCloudOptimizer:
+                if mode == GlobalAlignerMode.PointCloudOptimizer:
                     state.status = "Global alignment..."
                     state.recon_frac = 0.55
                     scene.compute_global_alignment(init='mst', niter=state.niter1,
@@ -1398,7 +1346,51 @@ print('SUCCESS')
 
         # Recentering handled by main loop via needs_recenter flag
 
-        # Auto-align disabled — use Flip Up button instead (more reliable)
+        # Align to reference frame: if this is the first reconstruction, cache cameras.
+        # If subsequent reconstruction, align to the cached cameras via Procrustes.
+        if state.has_points and state.scene is not None:
+            try:
+                c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
+                pts3d_list, confs_list = _extract_scene_data(state)
+
+                cam_list = []
+                focals = state.scene.get_focals().detach().cpu().numpy()
+                for i in range(len(c2w_poses)):
+                    f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
+                    H, W = pts3d_list[i].shape[:2] if pts3d_list[i].ndim == 3 else (384, 512)
+                    K = np.array([[f, 0, W/2], [0, f, H/2], [0, 0, 1]], dtype=np.float32)
+                    cam_list.append((c2w_poses[i].astype(np.float32), K, W, H))
+
+                if state.cached_cameras is not None and len(state.cached_cameras) == len(cam_list):
+                    # Align this reconstruction to the reference frame
+                    print("  Aligning to reference cameras via Procrustes...")
+                    cam_c2w = [c2w_poses[i] for i in range(len(c2w_poses))]
+                    pts3d_aligned, new_c2w = _align_to_cached_cameras(
+                        list(pts3d_list), cam_c2w, state.cached_cameras)
+                    # Update scene data with aligned points
+                    state.pts3d_list = pts3d_aligned
+                    state.confs_list = list(confs_list)
+                    # Update display
+                    all_pts = [p.reshape(-1, 3) for p in pts3d_aligned]
+                    all_cols = [(state.scene.imgs[i].reshape(-1, 3) * 255).astype(np.uint8)
+                                for i in range(len(state.scene.imgs))]
+                    points = np.concatenate(all_pts, axis=0)
+                    colors = np.concatenate(all_cols, axis=0)
+                    if len(points) > 200000:
+                        idx = np.random.choice(len(points), 200000, replace=False)
+                        points, colors = points[idx], colors[idx]
+                    scene_gl.set_points(points, colors)
+                    scene_gl.set_cameras(new_c2w, scale=float(np.linalg.norm(
+                        points.max(0) - points.min(0))) * 0.05)
+                else:
+                    # First reconstruction — save as reference
+                    state.cached_cameras = cam_list
+                    print(f"  Cached {len(cam_list)} reference cameras")
+            except Exception as e:
+                print(f"  Camera caching/alignment failed: {e}")
+                import traceback; traceback.print_exc()
+
+        # Old auto-align disabled
         if False and state.has_points and state.scene is not None:
             try:
                 c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
@@ -1555,27 +1547,11 @@ def run_depth_injection(state, scene_gl):
 
 
 def _run_stacked_reconstruction(state, scene_gl):
-    """Run multiple backends and merge their point clouds."""
+    """Run multiple backends and merge their point clouds.
+    First backend establishes the reference frame, others align to it via Procrustes."""
     import torch
 
-    # First: get cameras (from camera source or first backend)
-    cam_source = state.camera_sources[state.camera_source_idx]
-    if cam_source != 'same' and state.cached_cameras is None:
-        state.status = f"Estimating cameras with {cam_source.upper()}..."
-        try:
-            state.cached_cameras = _estimate_cameras(state, cam_source)
-        except Exception as e:
-            print(f"  Camera estimation failed: {e}")
-
-    # If no external cameras, use DUSt3R as first backend to get cameras
-    if state.cached_cameras is None:
-        state.status = "Running DUSt3R for cameras..."
-        try:
-            state.cached_cameras = _estimate_cameras(state, 'dust3r')
-        except Exception as e:
-            print(f"  DUSt3R camera estimation failed: {e}")
-
-    # Run each backend that can produce dense points
+    # Run each selected backend
     stack_backends = []
     if state.stack_dust3r: stack_backends.append('dust3r')
     if state.stack_mast3r: stack_backends.append('mast3r')
@@ -1783,115 +1759,6 @@ def _run_smooth_preview(state, scene_gl):
     finally:
         state.refining = False
         state.refine_progress = ""
-
-
-def _estimate_cameras(state, source):
-    """Run a backend just for camera estimation. Returns list of (c2w, K, W, H) or None."""
-    n_imgs = len(state.image_paths)
-
-    if source == 'colmap':
-        import pycolmap
-        import tempfile, shutil
-        workdir = Path(tempfile.mkdtemp(prefix="colmap_cams_"))
-        image_dir = workdir / "images"; image_dir.mkdir()
-        for p in state.image_paths:
-            shutil.copy2(p, str(image_dir / Path(p).name))
-
-        state.refine_progress = "COLMAP: features..."
-        pycolmap.extract_features(workdir / "db.db", image_dir)
-        state.refine_progress = "COLMAP: matching..."
-        pycolmap.match_exhaustive(workdir / "db.db")
-        state.refine_progress = "COLMAP: mapping..."
-        sparse_dir = workdir / "sparse"; sparse_dir.mkdir()
-        maps = pycolmap.incremental_mapping(workdir / "db.db", image_dir, sparse_dir)
-
-        if not maps:
-            shutil.rmtree(workdir, ignore_errors=True)
-            return None
-
-        rec = maps[0]
-        name_to_idx = {Path(p).name: i for i, p in enumerate(state.image_paths)}
-        cams = [None] * n_imgs
-        for img_id, image in rec.images.items():
-            if not image.has_pose or image.name not in name_to_idx:
-                continue
-            idx = name_to_idx[image.name]
-            cam = rec.cameras[image.camera_id]
-            K = cam.calibration_matrix().astype(np.float32)
-            w2c = np.eye(4, dtype=np.float32)
-            w2c[:3, :] = image.cam_from_world.matrix()
-            cams[idx] = (np.linalg.inv(w2c).astype(np.float32), K, cam.width, cam.height)
-
-        shutil.rmtree(workdir, ignore_errors=True)
-        return cams if all(c is not None for c in cams) else None
-
-    elif source in ('dust3r', 'mast3r', 'vggt'):
-        # Run the selected backend, extract just the cameras, discard the rest
-        # For now, we run a quick low-iter reconstruction
-        import torch, copy
-        if source == 'dust3r':
-            from dust3r.model import AsymmetricCroCo3DStereo
-            from dust3r.utils.image import load_images as dust3r_load_images
-            from dust3r.inference import inference as dust3r_inference
-            from dust3r.image_pairs import make_pairs
-            from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-
-            state.refine_progress = f"Loading {source} for cameras..."
-            model = _load_pretrained_cached(
-                AsymmetricCroCo3DStereo,
-                "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt").to('cuda')
-            model.eval()
-            imgs = dust3r_load_images(state.image_paths, size=512, verbose=False,
-                                      patch_size=model.patch_size)
-            if len(imgs) == 1:
-                imgs = [imgs[0], copy.deepcopy(imgs[0])]; imgs[1]['idx'] = 1
-            pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
-            output = dust3r_inference(pairs, model, 'cuda', batch_size=1)
-            mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
-            scene = global_aligner(output, device='cuda', mode=mode)
-            if mode == GlobalAlignerMode.PointCloudOptimizer:
-                state.refine_progress = f"{source}: aligning cameras..."
-                scene.compute_global_alignment(init='mst', niter=100, schedule='linear', lr=0.01)
-
-            c2w_all = scene.get_im_poses().detach().cpu().numpy()
-            focals = scene.get_focals().detach().cpu().numpy()
-            cams = []
-            for i in range(len(c2w_all)):
-                H, W = imgs[i]['true_shape'][0].tolist() if hasattr(imgs[i]['true_shape'], 'tolist') else imgs[i]['true_shape']
-                K = np.eye(3, dtype=np.float32)
-                K[0, 0] = K[1, 1] = float(focals[i])
-                K[0, 2] = W / 2; K[1, 2] = H / 2
-                cams.append((c2w_all[i].astype(np.float32), K, int(W), int(H)))
-            del model; torch.cuda.empty_cache()
-            return cams
-
-        elif source == 'vggt':
-            from vggt.models.vggt import VGGT
-            from vggt.utils.load_fn import load_and_preprocess_images
-
-            state.refine_progress = "Loading VGGT for cameras..."
-            model = _load_pretrained_cached(VGGT, "facebook/VGGT-1B").to('cuda')
-            model.eval()
-            images = load_and_preprocess_images(state.image_paths).to('cuda')
-            with torch.no_grad():
-                preds = model(images)
-            extrinsic = preds["extrinsic"].cpu().numpy()[0]
-
-            cams = []
-            for i in range(len(state.image_paths)):
-                from PIL import Image as PILImage
-                img = PILImage.open(state.image_paths[i])
-                W, H = img.size
-                w2c = np.eye(4, dtype=np.float32)
-                w2c[:3, :] = extrinsic[i]
-                c2w = np.linalg.inv(w2c).astype(np.float32)
-                intrinsic = preds["intrinsic"].cpu().numpy()[0, i]
-                K = intrinsic.astype(np.float32)
-                cams.append((c2w, K, W, H))
-            del model; torch.cuda.empty_cache()
-            return cams
-
-    return None
 
 
 def run_upscale_points(state, scene_gl):
@@ -3348,12 +3215,7 @@ def main():
 
         # ── Backend ──
         imgui.text("Reconstruction")
-        _, state.camera_source_idx = imgui.combo("Cameras",
-            state.camera_source_idx, state.camera_source_labels)
-        if state.cached_cameras is not None:
-            imgui.same_line()
-            imgui.text_colored(f"({len(state.cached_cameras)} cached)", 0.5, 1.0, 0.5)
-        _, state.backend_idx = imgui.combo("Point Cloud",
+        _, state.backend_idx = imgui.combo("Backend",
             state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "COLMAP", "Pow3R"])
         _, state.stack_backends = imgui.checkbox("Stack backends", state.stack_backends)
         if state.stack_backends:
