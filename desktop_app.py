@@ -958,24 +958,6 @@ def run_reconstruction(state, scene_gl):
                 del sys.modules[k]
 
             try:
-                # Patch CroCo Block.forward BEFORE any imports that use it
-                # Pow3R passes rays/depth kwargs to all encoder blocks but only
-                # block 0 is modified to handle them. Standard blocks must ignore them.
-                # Must patch both import paths (croco.models.blocks AND models.blocks)
-                for _mod_path in ['croco.models.blocks', 'models.blocks']:
-                    try:
-                        _mod = __import__(_mod_path, fromlist=['Block'])
-                        _orig_fwd = _mod.Block.forward
-                        if 'kw' not in _orig_fwd.__code__.co_varnames:
-                            def _make_patch(orig):
-                                def _patched(self, x, xpos, **kw):
-                                    return orig(self, x, xpos)
-                                return _patched
-                            _mod.Block.forward = _make_patch(_orig_fwd)
-                            print(f"  Patched {_mod_path}.Block.forward")
-                    except Exception:
-                        pass
-
                 from dust3r.utils.image import load_images as pow3r_load_images
                 from dust3r.utils.device import to_numpy
                 from pow3r.model.model import Pow3R  # needed for eval(ckpt['definition'])
@@ -999,6 +981,20 @@ def run_reconstruction(state, scene_gl):
                 print(f"  Creating Pow3R model from checkpoint...")
                 model = eval(ckpt['definition'])
                 model.load_state_dict(ckpt['weights'])
+
+                # Patch encoder blocks that weren't modified by Pow3R's inject system
+                # Block 0 is already BlockInject (handles rays/depth), others need **kw
+                import types
+                for i, blk in enumerate(model.enc_blocks):
+                    orig_fwd = blk.forward
+                    if 'kw' not in orig_fwd.__code__.co_varnames:
+                        def _make_wrapper(orig):
+                            def _wrapped(self, x, xpos, **kw):
+                                return orig(x, xpos)
+                            return _wrapped
+                        blk.forward = types.MethodType(_make_wrapper(orig_fwd), blk)
+                        print(f"  Patched enc_block[{i}].forward")
+
                 model = model.to('cuda').eval()
 
                 state.status = "Loading images for Pow3R..."
