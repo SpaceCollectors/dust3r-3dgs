@@ -1900,13 +1900,29 @@ def run_upscale_points(state, scene_gl):
                 mono_x = np.clip((cols * scale_x).astype(int), 0, W_full - 1)
                 mono_z = mono_depth[mono_y, mono_x]
 
-                # Fit scale + offset: existing_z ≈ a * mono_z + b
+                # DepthAnything outputs inverse depth (larger=closer)
+                # Try both direct and inverse, pick the one that correlates better
                 valid = (existing_z > 0.01) & (mono_z > 0.01)
                 if valid.sum() > 10:
-                    A = np.column_stack([mono_z[valid], np.ones(valid.sum())])
-                    result_fit = np.linalg.lstsq(A, existing_z[valid], rcond=None)
+                    ez = existing_z[valid]
+                    mz = mono_z[valid]
+                    inv_mz = 1.0 / np.maximum(mz, 1e-6)
+
+                    # Correlation: positive = same direction, negative = inverted
+                    corr_direct = np.corrcoef(ez, mz)[0, 1]
+                    corr_inv = np.corrcoef(ez, inv_mz)[0, 1]
+
+                    if corr_inv > corr_direct:
+                        # Mono depth is inverted — use 1/mono
+                        print(f"    Depth is inverted (corr direct={corr_direct:.2f}, inv={corr_inv:.2f})")
+                        mono_depth = 1.0 / np.maximum(mono_depth, 1e-6)
+                        mz = inv_mz
+
+                    # Fit: existing_z ≈ a * mono + b
+                    A = np.column_stack([mz, np.ones(valid.sum())])
+                    result_fit = np.linalg.lstsq(A, ez, rcond=None)
                     a, b = result_fit[0]
-                    a = max(a, 0.001)  # depth must be positive-scaling
+                    print(f"    Depth fit: a={a:.4f}, b={b:.4f}")
                 else:
                     a, b = 1.0, 0.0
             else:
