@@ -831,7 +831,7 @@ def run_reconstruction(state, scene_gl):
     # Clear cached scene data so _extract_scene_data re-extracts
     state.pts3d_list = None
     state.confs_list = None
-    state.cached_cameras = None
+    # Keep cached_cameras — needed for Procrustes alignment across reconstructions
 
     try:
         backend = state.backends[state.backend_idx]
@@ -1350,6 +1350,7 @@ print('SUCCESS')
         # If subsequent reconstruction, align to the cached cameras via Procrustes.
         if state.has_points and state.scene is not None:
             try:
+                print(f"  Alignment check: has_points={state.has_points}, scene={type(state.scene).__name__}, cached={state.cached_cameras is not None}")
                 c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
                 pts3d_list, confs_list = _extract_scene_data(state)
 
