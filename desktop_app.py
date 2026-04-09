@@ -1235,14 +1235,69 @@ def run_reconstruction(state, scene_gl):
             K[0, 2] = r['w'] / 2; K[1, 2] = r['h'] / 2
             intrinsic_all = np.stack([K] * len(r['rgbimg_np']))
 
+            # If external cameras are cached, align MV-DUSt3R to that frame
+            if state.cached_cameras is not None and len(state.cached_cameras) == len(r['cams2world']):
+                print("  Aligning MV-DUSt3R output to external cameras...")
+                # Get camera centers from both systems
+                mvd_centers = np.array([r['cams2world'][i][:3, 3] for i in range(len(r['cams2world']))])
+                ext_centers = np.array([c[0][:3, 3] for c in state.cached_cameras])
+
+                # Procrustes: find scale, rotation, translation to align mvd → ext
+                mvd_mean = mvd_centers.mean(axis=0)
+                ext_mean = ext_centers.mean(axis=0)
+                mvd_c = mvd_centers - mvd_mean
+                ext_c = ext_centers - ext_mean
+                scale = np.linalg.norm(ext_c) / max(np.linalg.norm(mvd_c), 1e-8)
+                H_mat = mvd_c.T @ ext_c
+                U, _, Vt = np.linalg.svd(H_mat)
+                R_align = (Vt.T @ U.T).astype(np.float32)
+                if np.linalg.det(R_align) < 0:
+                    Vt[-1] *= -1
+                    R_align = (Vt.T @ U.T).astype(np.float32)
+                t_align = ext_mean - scale * (R_align @ mvd_mean)
+
+                # Transform all 3D points
+                for i in range(len(r['pts3d_np'])):
+                    pts = r['pts3d_np'][i].reshape(-1, 3)
+                    pts = scale * (pts @ R_align.T) + t_align
+                    r['pts3d_np'][i] = pts.reshape(r['pts3d_np'][i].shape).astype(np.float32)
+
+                # Use external cameras instead of MV-DUSt3R's
+                extrinsic = np.zeros((len(state.cached_cameras), 3, 4), dtype=np.float32)
+                intrinsic_all_list = []
+                for i, (c2w, K_ext, W_ext, H_ext) in enumerate(state.cached_cameras):
+                    w2c = np.linalg.inv(c2w)
+                    extrinsic[i] = w2c[:3, :].astype(np.float32)
+                    intrinsic_all_list.append(K_ext)
+                intrinsic_all = np.stack(intrinsic_all_list)
+
+                # Update display points
+                all_pts = [p.reshape(-1, 3) for p in r['pts3d_np']]
+                r['points'] = np.concatenate(all_pts, axis=0).astype(np.float32)
+                print(f"  Aligned (scale={scale:.4f})")
+
             state.scene = VGGTScene(
                 r['rgbimg_np'], extrinsic, intrinsic_all,
                 r['pts3d_np'], r['conf_np'], orig_sizes)
 
-            cam_poses = [r['cams2world'][i] for i in range(len(r['cams2world']))]
+            cam_poses = []
+            for i in range(len(extrinsic)):
+                w2c = np.eye(4); w2c[:3, :] = extrinsic[i]
+                cam_poses.append(np.linalg.inv(w2c))
             if cam_poses and len(r['points']) > 0:
                 ext = np.linalg.norm(r['points'].max(axis=0) - r['points'].min(axis=0))
                 scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+
+            # Update display with aligned points
+            points = r['points']
+            colors = np.concatenate([(np.clip(img, 0, 1).reshape(-1, 3) * 255).astype(np.uint8)
+                                     for img in r['rgbimg_np']], axis=0)
+            if len(points) > 200000:
+                idx = np.random.choice(len(points), 200000, replace=False)
+                points, colors = points[idx], colors[idx]
+            scene_gl.set_points(points, colors)
+            state.has_points = True; state.needs_recenter = True
+
             del _mvd_result
 
         elif backend == 'colmap':
