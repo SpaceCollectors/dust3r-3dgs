@@ -3683,14 +3683,23 @@ def main():
         if state.needs_recenter:
             state.needs_recenter = False
             try:
-                # Get bounds from whatever data we have
-                pts = getattr(scene_gl, '_mesh_verts', None)
-                if pts is None and scene_gl.point_count > 0:
-                    # Can't easily read back point data, use scene from state
-                    if state.scene is not None:
+                # Use cached pts3d_list if available (works for all backends)
+                pts = None
+                if state.pts3d_list is not None:
+                    all_p = [p.reshape(-1, 3) for p in state.pts3d_list if p is not None]
+                    if all_p:
+                        pts = np.concatenate(all_p, axis=0)
+                # Fallback to mesh verts
+                if pts is None:
+                    pts = getattr(scene_gl, '_mesh_verts', None)
+                # Fallback to scene
+                if pts is None and state.scene is not None:
+                    try:
                         from dust3r.utils.device import to_numpy
                         all_p = to_numpy(state.scene.get_pts3d())
                         pts = np.concatenate([p.reshape(-1, 3) for p in all_p], axis=0)
+                    except Exception:
+                        pass
                 if pts is not None and len(pts) > 0:
                     center = pts.mean(axis=0)
                     extent = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
