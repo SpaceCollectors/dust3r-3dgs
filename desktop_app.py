@@ -744,8 +744,6 @@ class AppState:
         self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
         self.camera_source_labels = ['Same as Backend', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
         self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
-        self.tile_upscale = False   # tiled depth for higher resolution
-        self.tile_grid = 2          # NxN tiles per image (2=4 tiles, 3=9 tiles)
 
         # Reconstruction
         self.scene = None
@@ -1829,132 +1827,157 @@ def _estimate_cameras(state, source):
     return None
 
 
-def run_tile_upscale(state, scene_gl):
-    """Upscale point cloud by running DUSt3R on image tile pairs.
+def run_upscale_points(state, scene_gl):
+    """Upscale point cloud using monocular depth at full image resolution.
 
-    For each pair of adjacent images, crops both into NxN tiles,
-    runs DUSt3R on each tile pair with fixed cameras to get dense depth.
-    Tile points are transformed to world space using the known camera poses
-    and crop offsets.
+    Uses DepthAnything V2 to estimate dense depth per image, aligns it
+    to the existing reconstruction's depth, then back-projects at full
+    image resolution using the known cameras. This gives as many 3D points
+    as there are pixels in the original images.
     """
-    state.refine_progress = "Loading DUSt3R for tile upscale..."
+    state.refine_progress = "Upscaling with mono depth..."
     try:
-        from dust3r.model import AsymmetricCroCo3DStereo
-        from dust3r.utils.image import load_images as dust3r_load_images
-        from dust3r.inference import inference as dust3r_inference
-        from dust3r.image_pairs import make_pairs
-        from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-        from dust3r.utils.device import to_numpy
-        from PIL import Image as PILImage
         import torch
-        import tempfile, shutil
-
-        model = _load_pretrained_cached(
-            AsymmetricCroCo3DStereo,
-            "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt").to('cuda')
-        model.eval()
+        from PIL import Image as PILImage
 
         scene = state.scene
-        N = state.tile_grid
-        overlap = 0.25
+        if scene is None:
+            state.status = "No reconstruction to upscale"
+            state.refining = False
+            return
+
+        # Get existing scene data for depth alignment
+        pts3d_list, confs_list = _extract_scene_data(state)
+        c2w_all = scene.get_im_poses().detach().cpu().numpy()
         n_imgs = len(state.image_paths)
 
-        all_extra_pts = []
-        all_extra_cols = []
-        total_tiles = 0
+        # Load mono depth model
+        state.refine_progress = "Loading depth model..."
+        try:
+            pipe = torch.hub.load('huggingface/pytorch-transformers', 'pipeline',
+                                   'depth-estimation', model='depth-anything/Depth-Anything-V2-Small-hf',
+                                   device='cuda')
+        except Exception:
+            # Fallback: use transformers directly
+            from transformers import pipeline as hf_pipeline
+            pipe = hf_pipeline('depth-estimation', model='depth-anything/Depth-Anything-V2-Small-hf',
+                              device='cuda')
 
-        for img_idx in range(n_imgs):
-            pair_idx = (img_idx + 1) % n_imgs
+        all_dense_pts = []
+        all_dense_cols = []
 
-            for ty in range(N):
-                for tx in range(N):
-                    total_tiles += 1
-                    state.refine_progress = f"Tile {total_tiles} (img {img_idx+1}, {ty},{tx})..."
+        for i in range(n_imgs):
+            state.refine_progress = f"Depth {i+1}/{n_imgs}..."
+            img_pil = PILImage.open(state.image_paths[i]).convert('RGB')
+            W_full, H_full = img_pil.size
 
-                    tmpdir = tempfile.mkdtemp()
-                    try:
-                        # Crop both images at the same tile position
-                        tile_paths = []
-                        for idx in [img_idx, pair_idx]:
-                            img_pil = PILImage.open(state.image_paths[idx]).convert('RGB')
-                            W_full, H_full = img_pil.size
-                            tile_w = int(W_full / (N - (N-1) * overlap))
-                            tile_h = int(H_full / (N - (N-1) * overlap))
-                            step_x = int(tile_w * (1 - overlap))
-                            step_y = int(tile_h * (1 - overlap))
-                            x0 = min(tx * step_x, W_full - tile_w)
-                            y0 = min(ty * step_y, H_full - tile_h)
-                            tile_pil = img_pil.crop((x0, y0, x0 + tile_w, y0 + tile_h))
-                            tp = os.path.join(tmpdir, f"tile_{idx}_{ty}_{tx}.jpg")
-                            tile_pil.save(tp)
-                            tile_paths.append(tp)
+            # Get mono depth at full resolution
+            result = pipe(img_pil)
+            mono_depth = np.array(result['depth']).astype(np.float32)
+            if mono_depth.shape != (H_full, W_full):
+                mono_depth = np.array(PILImage.fromarray(mono_depth).resize((W_full, H_full), PILImage.BILINEAR))
 
-                        # Run DUSt3R on the tile pair
-                        tile_imgs = dust3r_load_images(tile_paths, size=512,
-                                                        verbose=False, patch_size=model.patch_size)
-                        tile_pairs = make_pairs(tile_imgs, scene_graph='complete',
-                                               prefilter=None, symmetrize=True)
-                        tile_output = dust3r_inference(tile_pairs, model, 'cuda', batch_size=1)
-                        tile_scene = global_aligner(tile_output, device='cuda',
-                                                    mode=GlobalAlignerMode.PairViewer)
+            # Align mono depth to existing reconstruction depth
+            # Use the existing pts3d for this view to find scale + offset
+            existing_pts = pts3d_list[i] if i < len(pts3d_list) else None
+            if existing_pts is not None and existing_pts.ndim == 3:
+                H_r, W_r = existing_pts.shape[:2]
+                conf = confs_list[i] if i < len(confs_list) else None
+                mask = conf.reshape(H_r, W_r) > state.min_conf if conf is not None else np.ones((H_r, W_r), dtype=bool)
 
-                        # Get tile points (in relative pair frame)
-                        tile_pts3d = to_numpy(tile_scene.get_pts3d())
-                        for vi in range(len(tile_pts3d)):
-                            pts = tile_pts3d[vi].reshape(-1, 3)
-                            cols = (np.clip(tile_scene.imgs[vi].reshape(-1, 3), 0, 1) * 255).astype(np.uint8)
-                            # Filter obvious outliers (points too far from median)
-                            med = np.median(pts, axis=0)
-                            dist = np.linalg.norm(pts - med, axis=1)
-                            mask = dist < np.percentile(dist, 95)
-                            all_extra_pts.append(pts[mask])
-                            all_extra_cols.append(cols[mask])
+                # Project existing 3D points to get their depth in camera space
+                w2c = np.linalg.inv(c2w_all[i])
+                R, t = w2c[:3, :3], w2c[:3, 3]
+                pts_cam = (R @ existing_pts[mask].astype(np.float64).T).T + t
+                existing_z = pts_cam[:, 2]
 
-                    except Exception as e:
-                        print(f"    Tile ({ty},{tx}) failed: {e}")
-                    finally:
-                        shutil.rmtree(tmpdir, ignore_errors=True)
+                # Sample mono depth at corresponding pixel positions
+                rows, cols = np.where(mask)
+                # Scale pixel coords from reconstruction res to full res
+                scale_y = H_full / H_r
+                scale_x = W_full / W_r
+                mono_y = np.clip((rows * scale_y).astype(int), 0, H_full - 1)
+                mono_x = np.clip((cols * scale_x).astype(int), 0, W_full - 1)
+                mono_z = mono_depth[mono_y, mono_x]
 
-        del model
+                # Fit scale + offset: existing_z ≈ a * mono_z + b
+                valid = (existing_z > 0.01) & (mono_z > 0.01)
+                if valid.sum() > 10:
+                    A = np.column_stack([mono_z[valid], np.ones(valid.sum())])
+                    result_fit = np.linalg.lstsq(A, existing_z[valid], rcond=None)
+                    a, b = result_fit[0]
+                    a = max(a, 0.001)  # depth must be positive-scaling
+                else:
+                    a, b = 1.0, 0.0
+            else:
+                a, b = 1.0, 0.0
+
+            # Apply alignment
+            aligned_depth = mono_depth * a + b
+            aligned_depth = np.maximum(aligned_depth, 0.01)
+
+            # Back-project full-res pixels to 3D using known camera
+            # Estimate K at full resolution from existing scene
+            try:
+                focals = scene.get_focals().detach().cpu().numpy()
+                fx = fy = float(focals[i]) * (W_full / (existing_pts.shape[1] if existing_pts is not None and existing_pts.ndim == 3 else W_full))
+            except Exception:
+                fx = fy = W_full  # fallback
+            cx, cy = W_full / 2.0, H_full / 2.0
+            c2w = c2w_all[i]
+
+            # Create pixel grid
+            us, vs = np.meshgrid(np.arange(W_full), np.arange(H_full))
+            us = us.astype(np.float32).ravel()
+            vs = vs.astype(np.float32).ravel()
+            z = aligned_depth.ravel()
+
+            # Camera-space 3D
+            x_cam = (us - cx) * z / fx
+            y_cam = (vs - cy) * z / fy
+            pts_cam = np.stack([x_cam, y_cam, z], axis=-1)
+
+            # To world space
+            R_c2w = c2w[:3, :3]
+            t_c2w = c2w[:3, 3]
+            pts_world = (R_c2w @ pts_cam.T).T + t_c2w
+
+            # Colors from full-res image
+            img_np = np.array(img_pil).reshape(-1, 3)
+
+            # Filter: remove sky/invalid (very far or very close)
+            med_z = np.median(z[z > 0.1])
+            valid_mask = (z > 0.01) & (z < med_z * 5)
+            pts_world = pts_world[valid_mask].astype(np.float32)
+            img_np = img_np[valid_mask]
+
+            all_dense_pts.append(pts_world)
+            all_dense_cols.append(img_np)
+            print(f"  Image {i+1}: {len(pts_world):,d} dense points (scale={a:.4f})")
+
+        del pipe
         torch.cuda.empty_cache()
 
-        if all_extra_pts:
-            extra_pts = np.concatenate(all_extra_pts, axis=0).astype(np.float32)
-            extra_cols = np.concatenate(all_extra_cols, axis=0)
-            print(f"  Tile upscale: {len(extra_pts):,d} points from {total_tiles} tiles")
+        if all_dense_pts:
+            dense_pts = np.concatenate(all_dense_pts, axis=0)
+            dense_cols = np.concatenate(all_dense_cols, axis=0)
+            print(f"  Total dense: {len(dense_pts):,d} points")
 
-            # Merge with existing points
-            pts3d_list, confs_list = _extract_scene_data(state)
-            state.pts3d_list = list(pts3d_list) + [extra_pts]
-            state.confs_list = list(confs_list) + [np.ones(len(extra_pts), dtype=np.float32) * 5.0]
+            # Store as additional scene data
+            state.pts3d_list = list(pts3d_list) + [dense_pts]
+            state.confs_list = list(confs_list) + [np.ones(len(dense_pts), dtype=np.float32) * 5.0]
 
-            # Update display
-            all_pts, all_cols = [], []
-            for i in range(len(state.pts3d_list)):
-                p = state.pts3d_list[i]
-                c = state.confs_list[i]
-                mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p.reshape(-1, 3)), dtype=bool)
-                flat = p[mask] if p.ndim == 3 else p.reshape(-1, 3)[mask.ravel()]
-                all_pts.append(flat)
-                if i < len(state.scene.imgs):
-                    img = state.scene.imgs[i]
-                    all_cols.append((np.clip(img[mask] if img.ndim == 3 and img.shape[:2] == p.shape[:2] else
-                                            img.reshape(-1, 3)[mask.ravel()], 0, 1) * 255).astype(np.uint8))
-                else:
-                    all_cols.append(extra_cols[:len(flat)])
-
-            pts = np.concatenate(all_pts, axis=0)
-            cols = np.concatenate(all_cols, axis=0)
-            if len(pts) > 300000:
-                idx = np.random.choice(len(pts), 300000, replace=False)
-                pts, cols = pts[idx], cols[idx]
-            scene_gl.set_points(pts, cols)
-            state.status = f"Upscaled: {len(extra_pts):,d} extra points from {total_tiles} tiles"
-        else:
-            state.status = "No tile points generated"
+            # Display
+            disp_pts, disp_cols = dense_pts, dense_cols
+            if len(disp_pts) > 300000:
+                idx = np.random.choice(len(disp_pts), 300000, replace=False)
+                disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
+            scene_gl.set_points(disp_pts, disp_cols)
+            state.has_points = True
+            state.status = f"Upscaled: {len(dense_pts):,d} dense points from {n_imgs} images"
 
     except Exception as e:
-        state.status = f"Tile upscale failed: {e}"
+        state.status = f"Upscale failed: {e}"
         import traceback; traceback.print_exc()
     finally:
         state.refining = False
@@ -3339,14 +3362,11 @@ def main():
         imgui.separator()
 
         # ── Upscale ──
-        if state.has_points and not state.refining:
-            _, state.tile_grid = imgui.slider_int("Tile Grid", state.tile_grid, 2, 4)
-            imgui.same_line()
-            imgui.text(f"({state.tile_grid**2} tiles)")
-            if imgui.button("Upscale Points (DUSt3R tiles)", width=-1):
+        if state.has_points and state.scene is not None and not state.refining:
+            if imgui.button("Upscale Points (Mono Depth)", width=-1):
                 state.refining = True
                 state.refine_thread = threading.Thread(
-                    target=run_tile_upscale, args=(state, scene_gl), daemon=True)
+                    target=run_upscale_points, args=(state, scene_gl), daemon=True)
                 state.refine_thread.start()
 
         imgui.separator()
