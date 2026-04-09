@@ -740,9 +740,9 @@ class AppState:
         # Backend
         self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=mvdust3r, 4=colmap
         self.backends = ['dust3r', 'mast3r', 'vggt', 'mvdust3r', 'colmap']
-        self.camera_source_idx = 0  # 0=same as backend, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT
+        self.camera_source_idx = 0  # 0=same as point cloud, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT
         self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
-        self.camera_source_labels = ['Same as Backend', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
+        self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
         self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
 
         # Reconstruction
@@ -3287,15 +3287,14 @@ def main():
         imgui.separator()
 
         # ── Backend ──
-        imgui.text("Reconstruction Backend")
-        _, state.backend_idx = imgui.combo("##backend",
-            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+", "COLMAP"])
-
-        _, state.camera_source_idx = imgui.combo("Camera Source",
+        imgui.text("Reconstruction")
+        _, state.camera_source_idx = imgui.combo("Cameras",
             state.camera_source_idx, state.camera_source_labels)
         if state.cached_cameras is not None:
             imgui.same_line()
-            imgui.text_colored(f"({len(state.cached_cameras)} cams cached)", 0.5, 1.0, 0.5)
+            imgui.text_colored(f"({len(state.cached_cameras)} cached)", 0.5, 1.0, 0.5)
+        _, state.backend_idx = imgui.combo("Point Cloud",
+            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+", "COLMAP"])
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
