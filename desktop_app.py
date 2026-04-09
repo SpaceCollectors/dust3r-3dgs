@@ -825,6 +825,10 @@ def run_reconstruction(state, scene_gl):
     state.reconstructing = True
     state.recon_frac = 0.0
     state.status = "Loading model..."
+    # Clear cached scene data so _extract_scene_data re-extracts
+    state.pts3d_list = None
+    state.confs_list = None
+    state.cached_cameras = None
 
     try:
         backend = state.backends[state.backend_idx]
@@ -1645,7 +1649,10 @@ def run_depth_injection(state, scene_gl):
 
 
 def _extract_scene_data(state):
-    """Extract pts3d and confidence from any backend into normalized numpy lists."""
+    """Extract pts3d and confidence from any backend into normalized numpy lists.
+    Caches the result — only extracts once per reconstruction."""
+    if state.pts3d_list is not None and state.confs_list is not None:
+        return state.pts3d_list, state.confs_list
 
     from dust3r.utils.device import to_numpy
     scene = state.scene
@@ -3398,14 +3405,6 @@ def main():
         imgui.separator()
 
         imgui.separator()
-
-        # ── Upscale ──
-        if state.has_points and state.scene is not None and not state.refining:
-            if imgui.button("Upscale Points (Mono Depth)", width=-1):
-                state.refining = True
-                state.refine_thread = threading.Thread(
-                    target=run_upscale_points, args=(state, scene_gl), daemon=True)
-                state.refine_thread.start()
 
         imgui.separator()
 
