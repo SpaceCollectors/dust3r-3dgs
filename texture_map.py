@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 
 
 def create_textured_mesh(verts, faces, colors, views, output_dir,
-                         texture_size=2048, return_data=False):
+                         texture_size=4096, return_data=False):
     os.makedirs(output_dir, exist_ok=True)
     V, F = len(verts), len(faces)
     print(f"  Creating texture for {V:,d} verts, {F:,d} faces, {texture_size}px")
@@ -327,7 +327,8 @@ def _unwrap_uvs(verts, faces):
             pack_options = xatlas.PackOptions()
             pack_options.padding = 4
             pack_options.bilinear = True
-            pack_options.bruteForce = True
+            pack_options.bruteForce = False
+            pack_options.blockAlign = True
 
             atlas = xatlas.Atlas()
             atlas.add_mesh(verts.astype(np.float32), faces.astype(np.uint32),

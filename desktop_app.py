@@ -713,7 +713,10 @@ class AppState:
         self.mesh_mode_idx = 0     # 0=reprojected grid, 1=ball pivot
         self.mesh_modes = ['reprojected', 'ballpivot']
         self.mesh_mode_labels = ['Reprojected Grid', 'Ball Pivot']
-        self.hole_cap_size = 50    # max boundary edges to cap a hole (higher = close bigger holes)
+        self.hole_cap_size = 50    # max boundary edges to close (higher = close bigger holes)
+        self.smooth_radius = 2.0   # neighbor merge radius multiplier
+        self.smoothed_points = None   # (points, colors) after smoothing
+        self.original_points = None   # (points, colors) before smoothing, for undo
         self.ai_depth_mix = 0.7  # 0=pure dust3r, 1=full AI detail
         self.ai_highpass_radius = 10.0  # high-pass sigma in pixels
         self.ai_refine_poses = True  # re-optimize poses after depth injection
@@ -1415,6 +1418,60 @@ def _extract_scene_data(state):
 
 
 
+def _run_smooth_points(state, scene_gl):
+    """Smooth the point cloud by merging nearby points. Keeps original for undo."""
+    state.refine_progress = "Smoothing points..."
+    try:
+        from mesh_export import _smooth_cloud
+
+        pts3d_list, confs_list = _extract_scene_data(state)
+        imgs = state.scene.imgs
+
+        # Collect current points (confidence-filtered)
+        all_pts, all_cols = [], []
+        for i in range(len(imgs)):
+            p = pts3d_list[i]
+            c = confs_list[i]
+            img = imgs[i]
+            if p.ndim == 3:
+                H, W = p.shape[:2]
+                mask = c.reshape(H, W) > state.min_conf if c is not None else np.ones((H, W), dtype=bool)
+                all_pts.append(p[mask])
+                all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+            else:
+                mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p), dtype=bool)
+                all_pts.append(p[mask])
+                all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+
+        points = np.concatenate(all_pts, axis=0).astype(np.float32)
+        colors = np.concatenate(all_cols, axis=0)
+
+        # Save original for undo (only first time), always smooth from original
+        if state.original_points is None:
+            state.original_points = (points.copy(), colors.copy())
+        else:
+            points, colors = state.original_points
+
+        # Smooth from original cloud
+        smoothed_pts, smoothed_cols = _smooth_cloud(points, colors, radius_mult=state.smooth_radius)
+
+        # Store and display
+        state.smoothed_points = (smoothed_pts, smoothed_cols)
+
+        disp_pts, disp_cols = smoothed_pts, smoothed_cols
+        if len(disp_pts) > 200000:
+            idx = np.random.choice(len(disp_pts), 200000, replace=False)
+            disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
+        scene_gl.set_points(disp_pts, disp_cols)
+        state.status = f"Smoothed: {len(points):,d} -> {len(smoothed_pts):,d} points (radius={state.smooth_radius:.1f}x)"
+    except Exception as e:
+        state.status = f"Smooth failed: {e}"
+        import traceback; traceback.print_exc()
+    finally:
+        state.refining = False
+        state.refine_progress = ""
+
+
 def run_dense_mesh(state, scene_gl):
     """Generate dense mesh by triangulating depth maps."""
     state.refine_progress = "Generating dense mesh..."
@@ -1994,6 +2051,167 @@ def _recolor_from_cameras(verts, faces, views):
     return colors
 
 
+def run_recolor_mesh(state, scene_gl):
+    """Recolor mesh vertices by projecting each vertex into all cameras and averaging pixel colors."""
+    state.refine_progress = "Recoloring mesh from cameras..."
+    try:
+        from colmap_export import export_scene_to_colmap
+        from refine_mesh import load_cameras
+        import tempfile
+
+        if state.mesh_data is None:
+            state.status = "No mesh to recolor"
+            state.refining = False
+            return
+
+        verts, faces, colors = state.mesh_data
+
+        # Export cameras
+        tmpdir = tempfile.mkdtemp()
+        export_dir = os.path.join(tmpdir, 'colmap')
+        state.refine_progress = "Exporting cameras..."
+        export_scene_to_colmap(
+            scene=state.scene, image_paths=state.image_paths,
+            output_dir=export_dir, min_conf_thr=state.min_conf)
+        views = load_cameras(export_dir)
+
+        V = len(verts)
+        color_sum = np.zeros((V, 3), dtype=np.float64)
+        weight_sum = np.zeros(V, dtype=np.float64)
+
+        # Compute vertex normals for incidence weighting
+        v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
+        fn = np.cross(v1 - v0, v2 - v0)
+        fn /= (np.linalg.norm(fn, axis=-1, keepdims=True) + 1e-8)
+        vert_normals = np.zeros((V, 3), dtype=np.float64)
+        for ax in range(3):
+            np.add.at(vert_normals[:, ax], faces[:, 0], fn[:, ax])
+            np.add.at(vert_normals[:, ax], faces[:, 1], fn[:, ax])
+            np.add.at(vert_normals[:, ax], faces[:, 2], fn[:, ax])
+        vert_normals /= (np.linalg.norm(vert_normals, axis=-1, keepdims=True) + 1e-8)
+
+        # Global color correction: compute per-camera mean color for normalization
+        from texture_map import _rasterize_visibility
+        cam_means = []
+        cam_samples = []
+
+        for ci, view in enumerate(views):
+            state.refine_progress = f"Camera {ci+1}/{len(views)}..."
+            R = view['w2c'][:3, :3]
+            t_vec = view['w2c'][:3, 3]
+            K = view['K']
+            W_img, H_img = view['W'], view['H']
+            c2w = np.linalg.inv(view['w2c'])
+            cam_center = c2w[:3, 3]
+
+            # Project all vertices
+            pts_cam = (R @ verts.astype(np.float64).T).T + t_vec
+            z = pts_cam[:, 2]
+            valid = z > 0.01
+            px = np.full(V, -1.0); py = np.full(V, -1.0)
+            px[valid] = pts_cam[valid, 0] / z[valid] * K[0, 0] + K[0, 2]
+            py[valid] = pts_cam[valid, 1] / z[valid] * K[1, 1] + K[1, 2]
+
+            in_frame = valid & (px >= 0) & (px < W_img - 1) & (py >= 0) & (py < H_img - 1)
+            if not in_frame.any():
+                cam_means.append(np.array([0.5, 0.5, 0.5]))
+                cam_samples.append(0)
+                continue
+
+            # Occlusion test
+            u_vert = np.zeros(V); v_vert = np.zeros(V); z_vert = np.zeros(V)
+            u_vert[valid] = px[valid]; v_vert[valid] = py[valid]; z_vert[valid] = z[valid]
+            visible_faces = _rasterize_visibility(faces, u_vert, v_vert, z_vert, W_img, H_img)
+
+            vert_visible = np.zeros(V, dtype=bool)
+            if visible_faces:
+                vis_face_arr = np.array(list(visible_faces), dtype=np.int64)
+                vis_verts = np.unique(faces[vis_face_arr].ravel())
+                vert_visible[vis_verts] = True
+
+            in_frame &= vert_visible
+            if not in_frame.any():
+                cam_means.append(np.array([0.5, 0.5, 0.5]))
+                cam_samples.append(0)
+                continue
+
+            # Incidence angle weight: dot(normal, view_dir)
+            view_dirs = cam_center[None, :] - verts[in_frame]
+            view_dirs /= (np.linalg.norm(view_dirs, axis=-1, keepdims=True) + 1e-8)
+            ndot = (vert_normals[in_frame] * view_dirs).sum(axis=-1)
+            ndot = np.clip(ndot, 0, 1)  # back-facing = 0 weight
+
+            # Border falloff (smooth, using cosine)
+            u_f = px[in_frame]; v_f = py[in_frame]
+            norm_u = u_f / W_img  # 0 to 1
+            norm_v = v_f / H_img
+            border = np.minimum(
+                np.minimum(norm_u, 1 - norm_u),
+                np.minimum(norm_v, 1 - norm_v)
+            ) * 4.0  # 0 at edge, 1 at center quarter
+            border = np.clip(border, 0, 1)
+            # Smooth with cosine falloff
+            border = 0.5 - 0.5 * np.cos(border * np.pi)
+
+            # Combined weight: soft incidence * smooth border
+            # Use sqrt for gentler falloff — avoids sharp banding on curved surfaces
+            incidence = np.clip(ndot, 0.1, 1.0)  # floor at 0.1 so grazing views still contribute
+            w = incidence * border
+
+            # Bilinear sample
+            u0 = np.floor(u_f).astype(int); v0 = np.floor(v_f).astype(int)
+            u1 = np.minimum(u0 + 1, W_img - 1); v1 = np.minimum(v0 + 1, H_img - 1)
+            fu = u_f - u0; fv = v_f - v0
+            sampled = ((1 - fu)[:, None] * (1 - fv)[:, None] * view['pixels'][v0, u0] +
+                       fu[:, None] * (1 - fv)[:, None] * view['pixels'][v0, u1] +
+                       (1 - fu)[:, None] * fv[:, None] * view['pixels'][v1, u0] +
+                       fu[:, None] * fv[:, None] * view['pixels'][v1, u1])
+
+            cam_means.append(sampled.mean(axis=0) if len(sampled) > 0 else np.array([0.5, 0.5, 0.5]))
+            cam_samples.append((in_frame, sampled, w))
+
+        # Global color correction: normalize all cameras to the one with most samples
+        ref_idx = max(range(len(cam_samples)), key=lambda i: len(cam_samples[i][2]) if isinstance(cam_samples[i], tuple) else 0)
+        ref_mean = cam_means[ref_idx]
+        print(f"  Color reference: camera {ref_idx+1} (mean={ref_mean})")
+
+        for ci in range(len(views)):
+            if not isinstance(cam_samples[ci], tuple):
+                continue
+            in_frame, sampled, w = cam_samples[ci]
+            if len(w) == 0:
+                continue
+
+            # Per-channel scale to match reference camera
+            scale = np.ones(3, dtype=np.float64)
+            for ch in range(3):
+                if cam_means[ci][ch] > 0.01:
+                    scale[ch] = np.clip(ref_mean[ch] / cam_means[ci][ch], 0.7, 1.4)
+
+            corrected = sampled * scale[None, :]
+            color_sum[in_frame] += corrected * w[:, None]
+            weight_sum[in_frame] += w
+
+        # Average
+        has_color = weight_sum > 0.001
+        new_colors = colors.copy()
+        new_colors[has_color] = (color_sum[has_color] / weight_sum[has_color, None] * 255).clip(0, 255).astype(np.uint8)
+
+        n_colored = has_color.sum()
+        print(f"  Recolored {n_colored:,d} / {V:,d} vertices from {len(views)} cameras")
+
+        state.mesh_data = (verts, faces, new_colors)
+        scene_gl.set_mesh(verts, faces, new_colors)
+        state.status = f"Recolored {n_colored:,d} vertices from {len(views)} cameras"
+
+    except Exception as e:
+        state.status = f"Recolor failed: {e}"
+        import traceback; traceback.print_exc()
+    finally:
+        state.refining = False
+        state.refine_progress = ""
+
+
 def run_texture(state, scene_gl):
     """Generate UV-mapped textured mesh using PyMeshLab."""
     state.refine_progress = "Generating texture..."
@@ -2430,6 +2648,29 @@ def main():
 
         imgui.separator()
 
+        # ── Point Cloud Smoothing ──
+        if state.has_points and not state.refining:
+            imgui.text("Point Cloud")
+            _, state.smooth_radius = imgui.slider_float("Smooth Radius", state.smooth_radius, 0.5, 10.0, format="%.1fx")
+            if imgui.button("Smooth Points", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=_run_smooth_points, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
+            if state.original_points is not None:
+                imgui.same_line()
+                if imgui.button("Undo##smooth"):
+                    pts, cols = state.original_points
+                    state.smoothed_points = None
+                    state.original_points = None
+                    disp_pts, disp_cols = pts, cols
+                    if len(disp_pts) > 200000:
+                        idx = np.random.choice(len(disp_pts), 200000, replace=False)
+                        disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
+                    scene_gl.set_points(disp_pts, disp_cols)
+                    state.status = f"Restored original {len(pts):,d} points"
+            imgui.separator()
+
         # ── Dense Mesh ──
         imgui.text("Dense Mesh")
         _, state.mesh_mode_idx = imgui.combo("Method", state.mesh_mode_idx, state.mesh_mode_labels)
@@ -2449,7 +2690,13 @@ def main():
                         target=run_enhanced_mesh, args=(state, scene_gl, debug_imgs), daemon=True)
                     state.refine_thread.start()
 
-        # Decimate button (post-processing, like RealityCapture)
+        # Recolor + Decimate buttons (post-processing)
+        if state.has_mesh and state.scene is not None and not state.refining:
+            if imgui.button("Recolor from Cameras", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=run_recolor_mesh, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
         if state.has_mesh and not state.refining:
             if imgui.button("Decimate Mesh", width=-1):
                 state.refining = True

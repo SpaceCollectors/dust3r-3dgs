@@ -18,8 +18,8 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
     """Create mesh from multi-view point clouds.
 
     mode='reprojected': Voxel-merge all points, shared vertex grid triangulation.
-    mode='ballpivot':   Voxel-dedup, ball-pivot, hole capping.
-    hole_cap_size:      Max boundary edges to cap a hole (0=disable, higher=close bigger holes).
+    mode='ballpivot':   Voxel-dedup, ball-pivot.
+    hole_cap_size:      Max boundary edges to close (0=disable, via PyMeshLab).
     """
     if mode == 'reprojected' and cam2world_list is not None:
         v, f, c = _mesh_reprojected_grid(imgs, pts3d_list, confs_list,
@@ -28,9 +28,9 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
         v, f, c = _mesh_ball_pivot(imgs, pts3d_list, confs_list,
                                     cam2world_list, min_conf)
 
-    # Cap holes on either method
+    # Close holes using PyMeshLab
     if hole_cap_size > 0 and len(f) > 0:
-        v, f, c = _cap_holes(v, f, c, max_hole_edges=hole_cap_size)
+        v, f, c = _close_holes_pymeshlab(v, f, c, max_hole_size=hole_cap_size)
 
     return v, f, c
 
@@ -250,6 +250,32 @@ def _estimate_intrinsics(pts_orig, pts_cam, H, W):
     return np.array([fx, fy, cx, cy])
 
 
+def _smooth_cloud(verts, colors, radius_mult=1.5):
+    """Voxel downsample: uniform grid, average all points per cell.
+    Produces perfectly uniform point spacing."""
+    import open3d as o3d
+
+    n_before = len(verts)
+    print(f"  Voxel smoothing {n_before:,d} points...")
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(verts.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+
+    # Voxel size from median nearest-neighbor distance * multiplier
+    dists = np.asarray(pcd.compute_nearest_neighbor_distance())
+    median_dist = float(np.median(dists))
+    voxel_size = median_dist * radius_mult
+
+    pcd = pcd.voxel_down_sample(voxel_size)
+
+    out_v = np.asarray(pcd.points, dtype=np.float32)
+    out_c = (np.asarray(pcd.colors) * 255).clip(0, 255).astype(np.uint8)
+
+    print(f"  Voxel smooth: {n_before:,d} -> {len(out_v):,d} points (voxel={voxel_size:.6f})")
+    return out_v, out_c
+
+
 def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf):
     """Voxel-dedup all points, then ball-pivot into a single mesh."""
     import open3d as o3d
@@ -297,91 +323,58 @@ def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf):
     return out_v, out_f, out_c
 
 
-def _cap_holes(verts, faces, colors, max_hole_edges=60):
-    """Find boundary loops (holes) and fill with fan triangulation from centroid."""
-    V, F = len(verts), len(faces)
-    if F == 0:
+def _close_holes_pymeshlab(verts, faces, colors, max_hole_size=50):
+    """Close holes using PyMeshLab's battle-tested hole closing filter."""
+    try:
+        import pymeshlab
+    except ImportError:
+        print("  PyMeshLab not available, skipping hole closing")
         return verts, faces, colors
 
-    # Build all half-edges and find boundary edges (appear only once)
-    # A half-edge (a,b) from face winding. Boundary = half-edge with no twin (b,a).
-    half_edges = set()
-    for fi in range(F):
-        a, b, c = int(faces[fi, 0]), int(faces[fi, 1]), int(faces[fi, 2])
-        half_edges.add((a, b))
-        half_edges.add((b, c))
-        half_edges.add((c, a))
-
-    # Boundary half-edges: (a,b) exists but (b,a) does not
-    # The hole runs in the REVERSE direction of the face winding
-    # So the hole boundary goes b -> a for each boundary half-edge (a,b)
-    boundary_next = {}  # maps vertex -> next vertex along hole boundary
-    for (a, b) in half_edges:
-        if (b, a) not in half_edges:
-            # (a,b) is boundary. Hole direction is b->a.
-            # But we need: for each vertex on the hole, which is the NEXT vertex?
-            # The hole walks: ... -> b -> a -> ...
-            # So boundary_next[b] = a
-            if b not in boundary_next:
-                boundary_next[b] = a
-
-    n_boundary = len(boundary_next)
-    if n_boundary == 0:
-        print(f"  No boundary edges — mesh is watertight")
+    if len(faces) == 0:
         return verts, faces, colors
 
-    print(f"  {n_boundary} boundary edges found")
+    n_before = len(faces)
 
-    # Trace closed loops
-    visited = set()
-    loops = []
-    for start in boundary_next:
-        if start in visited:
-            continue
-        loop = []
-        cur = start
-        for _ in range(100000):  # safety limit
-            if cur in visited or cur not in boundary_next:
-                break
-            visited.add(cur)
-            loop.append(cur)
-            cur = boundary_next[cur]
-        if len(loop) >= 3 and cur == start:
-            loops.append(loop)
+    ms = pymeshlab.MeshSet()
+    m = pymeshlab.Mesh(
+        vertex_matrix=verts.astype(np.float64),
+        face_matrix=faces.astype(np.int32),
+        v_color_matrix=np.column_stack([
+            colors.astype(np.float64) / 255.0,
+            np.ones((len(colors), 1), dtype=np.float64)  # alpha
+        ])
+    )
+    ms.add_mesh(m)
 
-    print(f"  Found {len(loops)} boundary loops")
+    # Close holes up to max_hole_size edges
+    try:
+        ms.meshing_close_holes(maxholesize=max_hole_size)
+    except Exception as e:
+        print(f"  Hole closing failed: {e}")
+        return verts, faces, colors
 
-    # Fill holes
-    new_verts = list(verts)
-    new_colors = list(colors)
-    new_faces = list(faces)
-    n_capped = 0
+    mesh_out = ms.current_mesh()
+    out_v = mesh_out.vertex_matrix().astype(np.float32)
+    out_f = mesh_out.face_matrix().astype(np.int32)
 
-    for loop in loops:
-        if len(loop) > max_hole_edges:
-            continue
+    # Get colors back
+    if mesh_out.has_vertex_color():
+        vc = mesh_out.vertex_color_matrix()
+        out_c = (vc[:, :3] * 255).clip(0, 255).astype(np.uint8)
+    else:
+        # New vertices from hole filling won't have colors — use nearest neighbor
+        out_c = np.full((len(out_v), 3), 128, dtype=np.uint8)
+        n_orig = min(len(colors), len(out_v))
+        out_c[:n_orig] = colors[:n_orig]
 
-        lv = verts[loop]
+    n_closed = len(out_f) - n_before
+    if n_closed > 0:
+        print(f"  Closed holes: {n_before:,d} -> {len(out_f):,d} faces (+{n_closed:,d})")
+    else:
+        print(f"  No holes closed (none within {max_hole_size} edge limit)")
 
-        # Centroid vertex
-        centroid = lv.mean(axis=0).astype(np.float32)
-        centroid_col = colors[loop].mean(axis=0).clip(0, 255).astype(np.uint8)
-        ci = len(new_verts)
-        new_verts.append(centroid)
-        new_colors.append(centroid_col)
-
-        for j in range(len(loop)):
-            new_faces.append(np.array([ci, loop[j], loop[(j + 1) % len(loop)]], dtype=np.int32))
-        n_capped += 1
-
-    if n_capped > 0:
-        print(f"  Capped {n_capped} holes (skipped {len(loops) - n_capped} too large)")
-        return (np.array(new_verts, dtype=np.float32),
-                np.array(new_faces, dtype=np.int32),
-                np.array(new_colors, dtype=np.uint8))
-
-    print(f"  {len(loops)} loops found, none within {max_hole_edges} edge limit")
-    return verts, faces, colors
+    return out_v, out_f, out_c
 
 
 def tsdf_fusion(imgs, pts3d_list, confs_list, min_conf=2.0, **kwargs):
