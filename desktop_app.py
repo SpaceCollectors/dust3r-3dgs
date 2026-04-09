@@ -740,9 +740,9 @@ class AppState:
         # Backend
         self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=mvdust3r, 4=colmap
         self.backends = ['dust3r', 'mast3r', 'vggt', 'mvdust3r', 'colmap']
-        self.camera_source_idx = 0  # 0=same as point cloud, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT
-        self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
-        self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
+        self.camera_source_idx = 0  # 0=same, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT, 5=MV-DUSt3R+
+        self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt', 'mvdust3r']
+        self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT', 'MV-DUSt3R+']
         self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
         self.stack_backends = False  # run multiple backends and merge points
 
@@ -1970,6 +1970,45 @@ def _estimate_cameras(state, source):
                 cams.append((c2w, K, W, H))
             del model; torch.cuda.empty_cache()
             return cams
+
+        elif source == 'mvdust3r':
+            # MV-DUSt3R: run full reconstruction, extract cameras
+            import torch
+            state.refine_progress = "Running MV-DUSt3R for cameras..."
+
+            old_backend = state.backend_idx
+            old_stack = state.stack_backends
+            state.backend_idx = state.backends.index('mvdust3r')
+            state.stack_backends = False
+            old_pts = state.pts3d_list
+            old_confs = state.confs_list
+            state.pts3d_list = None
+            state.confs_list = None
+
+            try:
+                run_reconstruction(state, scene_gl)
+                if state.scene is not None:
+                    c2w_all = state.scene.get_im_poses().detach().cpu().numpy()
+                    cams = []
+                    for i in range(len(c2w_all)):
+                        c2w = c2w_all[i].astype(np.float32)
+                        if hasattr(state.scene, '_intrinsic'):
+                            K = np.array(state.scene._intrinsic[i], dtype=np.float32)
+                        else:
+                            focals = state.scene.get_focals().detach().cpu().numpy()
+                            f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
+                            K = np.array([[f, 0, 112], [0, f, 112], [0, 0, 1]], dtype=np.float32)
+                        W, H = int(K[0, 2] * 2), int(K[1, 2] * 2)
+                        cams.append((c2w, K, W, H))
+                    state.backend_idx = old_backend
+                    state.stack_backends = old_stack
+                    torch.cuda.empty_cache()
+                    return cams
+            except Exception as e:
+                print(f"  MV-DUSt3R camera estimation failed: {e}")
+                import traceback; traceback.print_exc()
+            state.backend_idx = old_backend
+            state.stack_backends = old_stack
 
     return None
 
