@@ -959,7 +959,7 @@ def run_reconstruction(state, scene_gl):
 
             # Write a temp script that runs Pow3R in a clean Python environment
             result_path = os.path.join(tempfile.gettempdir(), 'pow3r_result.pkl')
-            script = f'''
+            script = f'''# -*- coding: utf-8 -*-
 import sys, os, pickle, numpy as np, torch
 os.chdir({repr(SCRIPT_DIR)})
 sys.path.insert(0, {repr(POW3R_DIR)})
@@ -1023,7 +1023,7 @@ with open({repr(result_path)}, 'wb') as f:
 print('SUCCESS')
 '''
             script_path = os.path.join(tempfile.gettempdir(), 'pow3r_run.py')
-            with open(script_path, 'w') as f:
+            with open(script_path, 'w', encoding='utf-8') as f:
                 f.write(script)
 
             # Run in subprocess
