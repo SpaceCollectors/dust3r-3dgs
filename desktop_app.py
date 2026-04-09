@@ -1957,7 +1957,8 @@ def run_upscale_points(state, scene_gl):
             # Estimate K at full resolution from existing scene
             try:
                 focals = scene.get_focals().detach().cpu().numpy()
-                fx = fy = float(focals[i]) * (W_full / (existing_pts.shape[1] if existing_pts is not None and existing_pts.ndim == 3 else W_full))
+                f_val = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
+                fx = fy = f_val * (W_full / (existing_pts.shape[1] if existing_pts is not None and existing_pts.ndim == 3 else W_full))
             except Exception:
                 fx = fy = W_full  # fallback
             cx, cy = W_full / 2.0, H_full / 2.0
@@ -1990,7 +1991,7 @@ def run_upscale_points(state, scene_gl):
 
             all_dense_pts.append(pts_world)
             all_dense_cols.append(img_np)
-            print(f"  Image {i+1}: {len(pts_world):,d} dense points (scale={a:.4f})")
+            print(f"  Image {i+1}: {len(pts_world):,d} dense points")
 
         del pipe
         torch.cuda.empty_cache()
