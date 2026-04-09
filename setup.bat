@@ -149,7 +149,7 @@ pip install imgui[glfw] PyOpenGL glfw xatlas pymeshlab
 echo.
 
 echo Installing extra dependencies...
-pip install torchmetrics opencv-python open3d
+pip install torchmetrics opencv-python open3d pycolmap
 echo.
 
 :: Install submodule dependencies

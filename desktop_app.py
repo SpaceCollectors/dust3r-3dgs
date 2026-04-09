@@ -738,8 +738,8 @@ class AppState:
         self.image_dir = ""
 
         # Backend
-        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=mvdust3r
-        self.backends = ['dust3r', 'mast3r', 'vggt', 'mvdust3r']
+        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=mvdust3r, 4=colmap
+        self.backends = ['dust3r', 'mast3r', 'vggt', 'mvdust3r', 'colmap']
 
         # Reconstruction
         self.scene = None
@@ -1205,6 +1205,142 @@ def run_reconstruction(state, scene_gl):
                 ext = np.linalg.norm(r['points'].max(axis=0) - r['points'].min(axis=0))
                 scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
             del _mvd_result
+
+        else:
+        elif backend == 'colmap':
+            # COLMAP SfM — sparse reconstruction, accurate cameras
+            state.status = "Running COLMAP SfM..."
+            state.recon_frac = 0.1
+            import pycolmap
+            import tempfile, shutil
+            from PIL import Image as PILImage
+
+            workdir = Path(tempfile.mkdtemp(prefix="colmap_"))
+            image_dir = workdir / "images"
+            image_dir.mkdir()
+
+            # Copy/link images to flat directory
+            state.status = "Preparing images..."
+            for p in state.image_paths:
+                src = Path(p)
+                dst = image_dir / src.name
+                if not dst.exists():
+                    shutil.copy2(str(src), str(dst))
+
+            db_path = workdir / "database.db"
+            sparse_path = workdir / "sparse"
+            sparse_path.mkdir()
+
+            state.status = "COLMAP: extracting features..."
+            state.recon_frac = 0.2
+            pycolmap.extract_features(db_path, image_dir)
+
+            state.status = "COLMAP: matching features..."
+            state.recon_frac = 0.4
+            pycolmap.match_exhaustive(db_path)
+
+            state.status = "COLMAP: sparse reconstruction..."
+            state.recon_frac = 0.6
+            maps = pycolmap.incremental_mapping(db_path, image_dir, sparse_path)
+
+            if not maps:
+                state.status = "COLMAP reconstruction failed (no valid reconstruction)"
+                state.refining = False
+                state.reconstructing = False
+                return
+
+            rec = maps[0]
+            print(f"  COLMAP: {len(rec.images)} images, {len(rec.points3D)} points")
+
+            # Build scene data compatible with our pipeline
+            # Create a lightweight scene wrapper
+            from app import VGGTScene
+            import torch
+
+            imgs_np = []
+            pts3d_all = []
+            conf_all = []
+            extrinsics = []
+            intrinsics = []
+
+            # Map image names to our paths
+            name_to_path = {}
+            for p in state.image_paths:
+                name_to_path[Path(p).name] = p
+
+            registered_paths = []
+            for image_id, image in sorted(rec.images.items()):
+                if not image.has_pose:
+                    continue
+                name = image.name
+                if name not in name_to_path:
+                    continue
+
+                # Load image
+                img_pil = PILImage.open(name_to_path[name]).convert('RGB')
+                img_np = np.array(img_pil).astype(np.float32) / 255.0
+                H, W = img_np.shape[:2]
+
+                # Camera intrinsics
+                cam = rec.cameras[image.camera_id]
+                K = cam.calibration_matrix()  # 3x3
+
+                # Camera pose (w2c)
+                w2c_34 = image.cam_from_world.matrix()  # 3x4
+                w2c = np.eye(4, dtype=np.float32)
+                w2c[:3, :] = w2c_34
+
+                # COLMAP sparse points don't give per-pixel depth maps
+                # Create a "pseudo depth map" by projecting sparse points into each image
+                pts3d_img = np.zeros((H, W, 3), dtype=np.float32)
+                conf_img = np.zeros((H, W), dtype=np.float32)
+
+                R = w2c[:3, :3]; t_vec = w2c[:3, 3]
+                for pt3d in rec.points3D.values():
+                    # Project to this camera
+                    p_cam = R @ pt3d.xyz + t_vec
+                    if p_cam[2] <= 0:
+                        continue
+                    u = K[0, 0] * p_cam[0] / p_cam[2] + K[0, 2]
+                    v = K[1, 1] * p_cam[1] / p_cam[2] + K[1, 2]
+                    ui, vi = int(round(u)), int(round(v))
+                    if 0 <= ui < W and 0 <= vi < H:
+                        pts3d_img[vi, ui] = pt3d.xyz
+                        conf_img[vi, ui] = max(pt3d.track.length(), 1.0)
+
+                imgs_np.append(img_np)
+                pts3d_all.append(pts3d_img)
+                conf_all.append(conf_img)
+                extrinsics.append(w2c[:3, :])
+                intrinsics.append(K)
+                registered_paths.append(name_to_path[name])
+
+            if not imgs_np:
+                state.status = "COLMAP: no images registered"
+                state.reconstructing = False
+                return
+
+            state.image_paths = registered_paths
+            orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
+            state.scene = VGGTScene(
+                imgs_np, np.array(extrinsics), np.array(intrinsics),
+                pts3d_all, conf_all, orig_sizes)
+
+            # Also build direct point cloud for display
+            pts_xyz = np.array([p.xyz for p in rec.points3D.values()], dtype=np.float32)
+            pts_rgb = np.array([p.color for p in rec.points3D.values()], dtype=np.uint8)
+
+            scene_gl.set_points(pts_xyz, pts_rgb)
+            state.has_points = True
+            state.needs_recenter = True
+            state.status = f"COLMAP: {len(registered_paths)} cameras, {len(pts_xyz):,d} points"
+
+            # Set cameras for display
+            cam_poses = []
+            for ext in extrinsics:
+                w2c = np.eye(4); w2c[:3, :] = ext
+                cam_poses.append(np.linalg.inv(w2c))
+            scene_gl.set_cameras(cam_poses, scale=0.1)
 
         else:
             # DUSt3R / MASt3R
@@ -2807,7 +2943,7 @@ def main():
         # ── Backend ──
         imgui.text("Reconstruction Backend")
         _, state.backend_idx = imgui.combo("##backend",
-            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+"])
+            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+", "COLMAP"])
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
