@@ -110,6 +110,31 @@ echo.
 :: Activate venv
 call venv\Scripts\activate.bat
 
+:: ── Clone required repositories ──
+if not exist "mast3r\dust3r\dust3r" (
+    echo Cloning MASt3R (includes DUSt3R^)...
+    if exist "mast3r" rmdir /s /q mast3r
+    git clone --recursive https://github.com/naver/mast3r.git mast3r
+    if errorlevel 1 (
+        echo ERROR: Failed to clone MASt3R. Check your internet connection.
+        pause
+        exit /b 1
+    )
+)
+echo MASt3R: OK
+echo.
+
+if not exist "vggt\vggt\models" (
+    echo Cloning VGGT...
+    if exist "vggt" rmdir /s /q vggt
+    git clone https://github.com/facebookresearch/vggt.git vggt
+    if errorlevel 1 (
+        echo WARNING: Failed to clone VGGT. VGGT backend will not be available.
+    )
+)
+echo VGGT: OK
+echo.
+
 :: ── Install dependencies ──
 echo Installing PyTorch with CUDA support...
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
