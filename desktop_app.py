@@ -1367,8 +1367,8 @@ def run_reconstruction(state, scene_gl):
 
         # Recentering handled by main loop via needs_recenter flag
 
-        # Auto-align: detect up direction from cameras and point cloud
-        if state.has_points and state.scene is not None:
+        # Auto-align disabled — use Flip Up button instead (more reliable)
+        if False and state.has_points and state.scene is not None:
             try:
                 c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
 
@@ -3122,6 +3122,8 @@ def main():
         # ── Project ──
         if imgui.button("New Project"):
             # Reset everything
+            if hasattr(state, '_ever_centered'):
+                del state._ever_centered
             state.__init__()
             scene_gl.point_count = 0
             scene_gl.mesh_face_count = 0
@@ -3542,9 +3544,11 @@ def main():
         # Upload any pending data from background threads
         scene_gl.flush_pending()
 
-        # Auto-recenter camera on scene when data changes
-        if state.needs_recenter:
+        # Auto-recenter camera — only on first reconstruction or project load
+        # (not on subsequent reconstructions to preserve user's viewpoint)
+        if state.needs_recenter and not hasattr(state, '_ever_centered'):
             state.needs_recenter = False
+            state._ever_centered = True
             try:
                 # Use cached pts3d_list if available (works for all backends)
                 pts = None
