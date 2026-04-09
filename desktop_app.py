@@ -943,140 +943,136 @@ def run_reconstruction(state, scene_gl):
             torch.cuda.empty_cache()
 
         elif backend == 'pow3r':
-            # Pow3R — DUSt3R with optional camera/depth conditioning
-            import copy as _copy
+            # Pow3R — run in subprocess to avoid module conflicts with mast3r's dust3r
+            import subprocess, pickle, tempfile
             POW3R_DIR = os.path.join(SCRIPT_DIR, 'pow3r')
-            _saved_path = _copy.copy(sys.path)
-            sys.path.insert(0, POW3R_DIR)
-            sys.path.insert(0, os.path.join(POW3R_DIR, 'dust3r'))
-            sys.path.insert(0, os.path.join(POW3R_DIR, 'dust3r', 'croco'))
 
-            # Clear cached dust3r modules so pow3r's version loads
-            _cached_mods = {k: v for k, v in sys.modules.items()
-                           if k.startswith('dust3r') or k.startswith('croco')}
-            for k in _cached_mods:
-                del sys.modules[k]
-
-            try:
-                from dust3r.utils.image import load_images as pow3r_load_images
-                from dust3r.utils.device import to_numpy
-                from pow3r.model.model import Pow3R  # needed for eval(ckpt['definition'])
-
-                state.status = "Loading Pow3R model..."
-                state.recon_frac = 0.1
-
-                # Download checkpoint if not cached
+            # Download checkpoint if not cached
+            ckpt_dir = os.path.join(POW3R_DIR, 'checkpoints')
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, 'Pow3R_ViTLarge_BaseDecoder_512_linear.pth')
+            if not os.path.exists(ckpt_path):
+                state.status = "Downloading Pow3R weights..."
+                import urllib.request
                 ckpt_url = "https://download.europe.naverlabs.com/ComputerVision/Pow3R/Pow3R_ViTLarge_BaseDecoder_512_linear.pth"
-                ckpt_dir = os.path.join(POW3R_DIR, 'checkpoints')
-                os.makedirs(ckpt_dir, exist_ok=True)
-                ckpt_path = os.path.join(ckpt_dir, 'Pow3R_ViTLarge_BaseDecoder_512_linear.pth')
-                if not os.path.exists(ckpt_path):
-                    state.status = "Downloading Pow3R weights..."
-                    import urllib.request
-                    print(f"  Downloading {ckpt_url}...")
-                    urllib.request.urlretrieve(ckpt_url, ckpt_path)
+                urllib.request.urlretrieve(ckpt_url, ckpt_path)
 
-                # Load raw Pow3R model from checkpoint (skip sliding window wrapper)
-                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-                print(f"  Creating Pow3R model from checkpoint...")
-                model = eval(ckpt['definition'])
-                model.load_state_dict(ckpt['weights'])
+            state.status = "Running Pow3R (subprocess)..."
+            state.recon_frac = 0.3
 
-                # Patch encoder blocks that weren't modified by Pow3R's inject system
-                # Block 0 is already BlockInject (handles rays/depth), others need **kw
-                import types
-                for i, blk in enumerate(model.enc_blocks):
-                    orig_fwd = blk.forward
-                    if 'kw' not in orig_fwd.__code__.co_varnames:
-                        def _make_wrapper(orig):
-                            def _wrapped(self, x, xpos, **kw):
-                                return orig(x, xpos)
-                            return _wrapped
-                        blk.forward = types.MethodType(_make_wrapper(orig_fwd), blk)
-                        print(f"  Patched enc_block[{i}].forward")
+            # Write a temp script that runs Pow3R in a clean Python environment
+            result_path = os.path.join(tempfile.gettempdir(), 'pow3r_result.pkl')
+            script = f'''
+import sys, os, pickle, numpy as np, torch
+os.chdir({repr(SCRIPT_DIR)})
+sys.path.insert(0, {repr(POW3R_DIR)})
+sys.path.insert(0, os.path.join({repr(POW3R_DIR)}, 'dust3r'))
+sys.path.insert(0, os.path.join({repr(POW3R_DIR)}, 'dust3r', 'croco'))
 
-                model = model.to('cuda').eval()
+from dust3r.utils.image import load_images
+from dust3r.utils.device import to_numpy
+from dust3r.inference import inference
+from dust3r.image_pairs import make_pairs
+from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+from pow3r.model.model import Pow3R
+import copy
 
-                state.status = "Loading images for Pow3R..."
-                state.recon_frac = 0.2
-                imgs = pow3r_load_images(state.image_paths, size=512, verbose=True)
+# Load model
+ckpt = torch.load({repr(ckpt_path)}, map_location='cpu', weights_only=False)
+model = eval(ckpt['definition'])
+model.load_state_dict(ckpt['weights'])
+model = model.to('cuda').eval()
 
-                # Run pairwise — same as DUSt3R but using Pow3R model directly
-                state.status = "Running Pow3R inference..."
-                state.recon_frac = 0.4
-                from dust3r.utils.device import todevice
-                from dust3r.inference import inference as dust3r_inference
-                from dust3r.image_pairs import make_pairs
+# Load images
+imgs = load_images({repr(state.image_paths)}, size=512, verbose=True)
+if len(imgs) == 1:
+    imgs = [imgs[0], copy.deepcopy(imgs[0])]
 
-                if len(imgs) == 1:
-                    imgs = [imgs[0], _copy.deepcopy(imgs[0])]
+# Inference
+pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
+output = inference(pairs, model, 'cuda', batch_size=1)
 
-                pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
-                output = dust3r_inference(pairs, model, 'cuda', batch_size=1)
+# Global alignment
+mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+scene = global_aligner(output, device='cuda', mode=mode)
+if mode == GlobalAlignerMode.PointCloudOptimizer:
+    scene.compute_global_alignment(init='mst', niter={state.niter1}, schedule='linear', lr=0.01)
 
-                # Use DUSt3R's global aligner for multi-view alignment
-                from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-                mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
-                scene = global_aligner(output, device='cuda', mode=mode)
+# Extract results
+pts3d = [to_numpy(p) for p in scene.get_pts3d()]
+confs = [to_numpy(c) for c in scene.im_conf] if hasattr(scene, 'im_conf') else [np.ones(p.shape[:2]) for p in pts3d]
+c2w = scene.get_im_poses().detach().cpu().numpy()
+focals = scene.get_focals().detach().cpu().numpy()
+imgs_np = scene.imgs
 
-                # If we have cached cameras, use them as fixed poses
-                if state.cached_cameras is not None and len(state.cached_cameras) == len(imgs) and mode == GlobalAlignerMode.PointCloudOptimizer:
-                    state.status = "Setting known cameras..."
-                    known_poses = [torch.tensor(c[0], dtype=torch.float32) for c in state.cached_cameras]
-                    known_focals = [c[1][0, 0] for c in state.cached_cameras]
-                    scene.preset_pose(torch.stack(known_poses))
-                    scene.preset_focal(torch.tensor(known_focals))
-                    state.status = "Optimizing depth with fixed cameras..."
-                    scene.compute_global_alignment(init='known_poses', niter=state.niter1,
-                                                   schedule='linear', lr=0.01)
-                elif mode == GlobalAlignerMode.PointCloudOptimizer:
-                    state.status = "Pow3R global alignment..."
-                    scene.compute_global_alignment(init='mst', niter=state.niter1,
-                                                   schedule='linear', lr=0.01)
+result = dict(pts3d=pts3d, confs=confs, c2w=c2w, focals=focals, imgs=imgs_np)
+with open({repr(result_path)}, 'wb') as f:
+    pickle.dump(result, f)
+print('SUCCESS')
+'''
+            script_path = os.path.join(tempfile.gettempdir(), 'pow3r_run.py')
+            with open(script_path, 'w') as f:
+                f.write(script)
 
-                state.scene = scene
+            # Run in subprocess
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True, text=True, timeout=600)
+            print(proc.stdout)
+            if proc.stderr:
+                print(proc.stderr[-2000:])  # last 2000 chars of stderr
 
-                # Extract point cloud (same as DUSt3R path)
-                rgbimg = scene.imgs
-                pts3d_raw = to_numpy(scene.get_pts3d())
-                all_pts = []
-                all_colors = []
-                for i in range(len(rgbimg)):
-                    p = pts3d_raw[i]
-                    all_pts.append(p.reshape(-1, 3))
-                    all_colors.append((rgbimg[i].reshape(-1, 3) * 255).astype(np.uint8))
+            if proc.returncode != 0 or not os.path.exists(result_path):
+                state.status = f"Pow3R failed (exit code {proc.returncode})"
+            else:
+                # Load results
+                with open(result_path, 'rb') as f:
+                    result = pickle.load(f)
+                os.remove(result_path)
 
-                if all_pts:
-                    points = np.concatenate(all_pts, axis=0)
-                    colors = np.concatenate(all_colors, axis=0)
-                    if len(points) > 200000:
-                        idx = np.random.choice(len(points), 200000, replace=False)
-                        points, colors = points[idx], colors[idx]
-                    scene_gl.set_points(points, colors)
-                    state.has_points = True; state.needs_recenter = True
+                # Build scene from results
+                from app import VGGTScene
+                pts3d = result['pts3d']
+                confs = result['confs']
+                c2w_all = result['c2w']
+                imgs_np = result['imgs']
 
-                # Show cameras
-                try:
-                    c2w_all = scene.get_im_poses().detach().cpu().numpy()
-                    cam_poses = [c2w_all[i] for i in range(len(c2w_all))]
-                    if cam_poses and len(points) > 0:
-                        ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
-                        scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
-                except Exception:
-                    pass
+                extrinsic = np.zeros((len(c2w_all), 3, 4), dtype=np.float32)
+                intrinsic_all = []
+                for i in range(len(c2w_all)):
+                    w2c = np.linalg.inv(c2w_all[i])
+                    extrinsic[i] = w2c[:3, :].astype(np.float32)
+                    f = float(result['focals'][i])
+                    H, W = pts3d[i].shape[:2]
+                    K = np.array([[f, 0, W/2], [0, f, H/2], [0, 0, 1]], dtype=np.float32)
+                    intrinsic_all.append(K)
 
-                state.status = f"Pow3R: {len(points):,d} points from {len(imgs)} images"
+                from PIL import Image as PILImage
+                orig_sizes = []
+                for p in state.image_paths:
+                    im = PILImage.open(p).convert('RGB')
+                    orig_sizes.append(im.size)
 
-                del model, ckpt
-                torch.cuda.empty_cache()
+                state.scene = VGGTScene(imgs_np, extrinsic, np.stack(intrinsic_all),
+                                        pts3d, confs, orig_sizes)
 
-            finally:
-                sys.path = _saved_path
-                for k in list(sys.modules.keys()):
-                    if k.startswith('dust3r') or k.startswith('croco') or k.startswith('pow3r'):
-                        del sys.modules[k]
-                for k, v in _cached_mods.items():
-                    sys.modules[k] = v
+                # Display
+                all_pts = [p.reshape(-1, 3) for p in pts3d]
+                all_cols = [(img.reshape(-1, 3) * 255).astype(np.uint8) for img in imgs_np]
+                points = np.concatenate(all_pts, axis=0)
+                colors = np.concatenate(all_cols, axis=0)
+                if len(points) > 200000:
+                    idx = np.random.choice(len(points), 200000, replace=False)
+                    points, colors = points[idx], colors[idx]
+                scene_gl.set_points(points, colors)
+                state.has_points = True; state.needs_recenter = True
+
+                cam_poses = [c2w_all[i] for i in range(len(c2w_all))]
+                if cam_poses:
+                    ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+                    scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+
+                state.status = f"Pow3R: {len(points):,d} points from {len(imgs_np)} images"
 
         elif backend == 'colmap':
             # COLMAP SfM — sparse reconstruction, accurate cameras
