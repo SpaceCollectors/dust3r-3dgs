@@ -958,17 +958,27 @@ def run_reconstruction(state, scene_gl):
                 del sys.modules[k]
 
             try:
+                # Patch CroCo Block.forward BEFORE any imports that use it
+                # Pow3R passes rays/depth kwargs to all encoder blocks but only
+                # block 0 is modified to handle them. Standard blocks must ignore them.
+                # Must patch both import paths (croco.models.blocks AND models.blocks)
+                for _mod_path in ['croco.models.blocks', 'models.blocks']:
+                    try:
+                        _mod = __import__(_mod_path, fromlist=['Block'])
+                        _orig_fwd = _mod.Block.forward
+                        if 'kw' not in _orig_fwd.__code__.co_varnames:
+                            def _make_patch(orig):
+                                def _patched(self, x, xpos, **kw):
+                                    return orig(self, x, xpos)
+                                return _patched
+                            _mod.Block.forward = _make_patch(_orig_fwd)
+                            print(f"  Patched {_mod_path}.Block.forward")
+                    except Exception:
+                        pass
+
                 from dust3r.utils.image import load_images as pow3r_load_images
                 from dust3r.utils.device import to_numpy
                 from pow3r.model.model import Pow3R  # needed for eval(ckpt['definition'])
-
-                # Patch CroCo Block.forward to accept **kw (Pow3R passes rays/depth)
-                from croco.models.blocks import Block as _CroCoBlock
-                _orig_block_fwd = _CroCoBlock.forward
-                if 'kw' not in _orig_block_fwd.__code__.co_varnames:
-                    def _patched_block_fwd(self, x, xpos, **kw):
-                        return _orig_block_fwd(self, x, xpos)
-                    _CroCoBlock.forward = _patched_block_fwd
 
                 state.status = "Loading Pow3R model..."
                 state.recon_frac = 0.1
