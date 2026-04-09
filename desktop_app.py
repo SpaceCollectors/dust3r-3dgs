@@ -744,6 +744,7 @@ class AppState:
         self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
         self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
         self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
+        self.stack_backends = False  # run multiple backends and merge points
 
         # Reconstruction
         self.scene = None
@@ -833,6 +834,11 @@ def run_reconstruction(state, scene_gl):
 
     try:
         backend = state.backends[state.backend_idx]
+
+        # Stack mode: run multiple backends and merge their point clouds
+        if state.stack_backends:
+            _run_stacked_reconstruction(state, scene_gl)
+            return
 
         if backend == 'vggt':
             from vggt.models.vggt import VGGT
@@ -1647,6 +1653,113 @@ def run_depth_injection(state, scene_gl):
         traceback.print_exc()
 
     state.reconstructing = False
+
+
+def _run_stacked_reconstruction(state, scene_gl):
+    """Run multiple backends and merge their point clouds."""
+    import torch
+
+    # First: get cameras (from camera source or first backend)
+    cam_source = state.camera_sources[state.camera_source_idx]
+    if cam_source != 'same' and state.cached_cameras is None:
+        state.status = f"Estimating cameras with {cam_source.upper()}..."
+        try:
+            state.cached_cameras = _estimate_cameras(state, cam_source)
+        except Exception as e:
+            print(f"  Camera estimation failed: {e}")
+
+    # If no external cameras, use DUSt3R as first backend to get cameras
+    if state.cached_cameras is None:
+        state.status = "Running DUSt3R for cameras..."
+        try:
+            state.cached_cameras = _estimate_cameras(state, 'dust3r')
+        except Exception as e:
+            print(f"  DUSt3R camera estimation failed: {e}")
+
+    # Run each backend that can produce dense points
+    stack_backends = ['dust3r', 'vggt']  # MASt3R could be added but needs different handling
+    all_pts3d = []
+    all_confs = []
+    first_scene = None
+
+    for bi, bname in enumerate(stack_backends):
+        state.status = f"Stack: running {bname.upper()} ({bi+1}/{len(stack_backends)})..."
+        state.recon_frac = bi / len(stack_backends)
+        print(f"\n  === Stack: {bname} ===")
+
+        try:
+            # Temporarily set backend and run reconstruction
+            old_backend_idx = state.backend_idx
+            old_stack = state.stack_backends
+            state.backend_idx = state.backends.index(bname)
+            state.stack_backends = False  # prevent recursion
+            state.pts3d_list = None  # clear cache for fresh extraction
+            state.confs_list = None
+
+            run_reconstruction(state, scene_gl)
+
+            # Extract the points from this run
+            pts3d_list, confs_list = _extract_scene_data(state)
+            all_pts3d.extend(pts3d_list)
+            all_confs.extend(confs_list)
+
+            if first_scene is None:
+                first_scene = state.scene
+
+            state.backend_idx = old_backend_idx
+            state.stack_backends = old_stack
+            state.pts3d_list = None
+            state.confs_list = None
+
+        except Exception as e:
+            print(f"  {bname} failed: {e}")
+            import traceback; traceback.print_exc()
+            state.backend_idx = old_backend_idx
+            state.stack_backends = old_stack
+
+        torch.cuda.empty_cache()
+
+    if not all_pts3d:
+        state.status = "All backends failed"
+        state.reconstructing = False
+        return
+
+    # Merge all point clouds
+    state.scene = first_scene
+    state.pts3d_list = all_pts3d
+    state.confs_list = all_confs
+
+    # Display merged cloud
+    all_pts, all_cols = [], []
+    imgs = state.scene.imgs
+    for i in range(len(all_pts3d)):
+        p = all_pts3d[i]
+        c = all_confs[i]
+        if p.ndim == 3:
+            mask = c.reshape(p.shape[:2]) > state.min_conf if c is not None else np.ones(p.shape[:2], dtype=bool)
+            all_pts.append(p[mask])
+            if i < len(imgs):
+                all_cols.append((np.clip(imgs[i][mask], 0, 1) * 255).astype(np.uint8))
+            else:
+                all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+        else:
+            mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p), dtype=bool)
+            all_pts.append(p.reshape(-1, 3)[mask.ravel()] if p.ndim > 1 else p[mask])
+            all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+
+    if all_pts:
+        points = np.concatenate(all_pts, axis=0)
+        colors = np.concatenate(all_cols, axis=0)
+        if len(points) > 300000:
+            idx = np.random.choice(len(points), 300000, replace=False)
+            points, colors = points[idx], colors[idx]
+        scene_gl.set_points(points, colors)
+        state.has_points = True
+        state.needs_recenter = True
+
+    state.status = f"Stacked: {len(all_pts3d)} views from {len(stack_backends)} backends, {sum(len(p.reshape(-1,3)) for p in all_pts3d):,d} total points"
+    state.reconstructing = False
+    state.recon_frac = 1.0
 
 
 def _extract_scene_data(state):
@@ -3295,6 +3408,9 @@ def main():
             imgui.text_colored(f"({len(state.cached_cameras)} cached)", 0.5, 1.0, 0.5)
         _, state.backend_idx = imgui.combo("Point Cloud",
             state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+", "COLMAP"])
+        _, state.stack_backends = imgui.checkbox("Stack all backends", state.stack_backends)
+        if state.stack_backends:
+            imgui.text_colored("  Will run DUSt3R + MASt3R + VGGT and merge", 0.5, 1.0, 0.5)
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
