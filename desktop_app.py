@@ -738,17 +738,16 @@ class AppState:
         self.image_dir = ""
 
         # Backend
-        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=mvdust3r, 4=colmap
-        self.backends = ['dust3r', 'mast3r', 'vggt', 'mvdust3r', 'colmap']
-        self.camera_source_idx = 0  # 0=same, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT, 5=MV-DUSt3R+
-        self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt', 'mvdust3r']
-        self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT', 'MV-DUSt3R+']
+        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap
+        self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap']
+        self.camera_source_idx = 0  # 0=same, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT
+        self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
+        self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
         self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
         self.stack_backends = False  # run multiple backends and merge points
         self.stack_dust3r = True
         self.stack_mast3r = False
         self.stack_vggt = True
-        self.stack_mvdust3r = False
 
         # Reconstruction
         self.scene = None
@@ -942,363 +941,8 @@ def run_reconstruction(state, scene_gl):
             del model, predictions
             torch.cuda.empty_cache()
 
-        elif backend == 'mvdust3r':
-            # MV-DUSt3R+ — single-pass multi-view reconstruction
-            # Temporarily swap sys.path to use mvdust3r's own dust3r fork
-            import copy as _copy
-            _saved_path = _copy.copy(sys.path)
-            # Remove mast3r/dust3r paths, insert mvdust3r first
-            sys.path = [p for p in sys.path if 'mast3r' not in p.replace('\\', '/')]
-            sys.path.insert(0, MVDUST3R_DIR)
-            sys.path.insert(0, os.path.join(MVDUST3R_DIR, 'croco'))
-            # Clear cached dust3r modules so mvdust3r's version loads
-            _cached_mods = {k: v for k, v in sys.modules.items()
-                           if k.startswith('dust3r') or k.startswith('models')}
-            for k in _cached_mods:
-                del sys.modules[k]
-
-            try:
-                # Shim pytorch3d and gsplat so mvdust3r imports work without them
-                import types as _types
-
-                class _StubModule(_types.ModuleType):
-                    def __getattr__(self, name):
-                        return None
-
-                for _mod_name in ['pytorch3d', 'pytorch3d.ops', 'pytorch3d.transforms',
-                                  'pytorch3d.structures', 'pytorch3d.renderer',
-                                  'gsplat', 'gsplat.rendering']:
-                    if _mod_name not in sys.modules:
-                        sys.modules[_mod_name] = _StubModule(_mod_name)
-
-                from dust3r.model import AsymmetricCroCo3DStereoMultiView
-                from dust3r.inference import inference_mv
-                from dust3r.utils.image import load_images as mvd_load_images
-                from dust3r.utils.device import to_numpy
-                import cv2
-
-                def _estimate_focal(pts3d, valid_mask):
-                    """Estimate focal length from 3D points (no pytorch3d needed)."""
-                    B, H, W, _ = pts3d.shape
-                    pp = torch.tensor([[W/2, H/2]], dtype=torch.float32, device=pts3d.device)
-                    pixels = torch.stack(torch.meshgrid(torch.arange(W, device=pts3d.device),
-                                torch.arange(H, device=pts3d.device), indexing='xy'), dim=-1
-                              ).float().reshape(1, -1, 2) - pp.view(-1, 1, 2)
-                    pts_flat = pts3d.flatten(1, 2)
-                    vm_flat = valid_mask.flatten(1, 2)
-                    pixels = pixels[vm_flat].unsqueeze(0)
-                    pts_flat = pts_flat[vm_flat].unsqueeze(0)
-                    xy_over_z = (pts_flat[..., :2] / pts_flat[..., 2:3]).nan_to_num(posinf=0, neginf=0)
-                    dot_xy_px = (xy_over_z * pixels).sum(dim=-1)
-                    dot_xy_xy = xy_over_z.square().sum(dim=-1)
-                    focal = dot_xy_px.mean(dim=1) / dot_xy_xy.mean(dim=1)
-                    for _ in range(10):
-                        dis = (pixels - focal.view(-1, 1, 1) * xy_over_z).norm(dim=-1)
-                        w = dis.clip(min=1e-8).reciprocal()
-                        focal = (w * dot_xy_px).mean(dim=1) / (w * dot_xy_xy).mean(dim=1)
-                    return focal
-
-                def _pnp_ransac(pointclouds, img_points, masks, intrinsics):
-                    """PnP-RANSAC camera calibration (no pytorch3d needed)."""
-                    bs = pointclouds.shape[0]
-                    camera_matrix = intrinsics.cpu().numpy()
-                    dist_coeffs = np.zeros((5, 1))
-                    c2ws = []
-                    for i in range(bs):
-                        obj_pts = pointclouds[i][masks[i]].cpu().numpy()
-                        img_pts = img_points[i][masks[i]].cpu().numpy()
-                        ok, rvec, tvec, _ = cv2.solvePnPRansac(obj_pts, img_pts, camera_matrix[i], dist_coeffs)
-                        if ok:
-                            R, _ = cv2.Rodrigues(rvec)
-                            w2c = np.eye(4, dtype=np.float32)
-                            w2c[:3, :3] = R; w2c[:3, 3] = tvec.ravel()
-                            c2ws.append(torch.from_numpy(np.linalg.inv(w2c)))
-                        else:
-                            c2ws.append(torch.eye(4))
-                    return torch.stack(c2ws).to(pointclouds.device)
-
-                state.status = "Loading MV-DUSt3R+ weights..."
-                state.recon_frac = 0.05
-                from huggingface_hub import hf_hub_download, try_to_load_from_cache
-                # Try local cache first — search all known cache locations
-                weights_path = None
-                try:
-                    # Check HF cache
-                    cached = try_to_load_from_cache("Zhenggang/MV-DUSt3R", "checkpoints/MVDp_s2.pth")
-                    if cached and os.path.exists(cached):
-                        weights_path = cached
-                        print(f"  MV-DUSt3R from HF cache: {weights_path}")
-                except Exception:
-                    pass
-                if not weights_path:
-                    # Check local mvdust3r/checkpoints
-                    for search_dir in [MVDUST3R_DIR, os.path.join(MVDUST3R_DIR, 'checkpoints')]:
-                        for root, dirs, files in os.walk(search_dir):
-                            if 'MVDp_s2.pth' in files:
-                                weights_path = os.path.join(root, 'MVDp_s2.pth')
-                                print(f"  MV-DUSt3R from local: {weights_path}")
-                                break
-                        if weights_path:
-                            break
-                if not weights_path:
-                    print("  Downloading MV-DUSt3R weights...")
-                    weights_path = hf_hub_download(
-                        repo_id="Zhenggang/MV-DUSt3R",
-                        filename="checkpoints/MVDp_s2.pth",
-                        cache_dir=os.path.join(MVDUST3R_DIR, 'checkpoints'))
-
-                state.status = "Loading MV-DUSt3R+ model..."
-                state.recon_frac = 0.1
-                inf = float('inf')
-                model = AsymmetricCroCo3DStereoMultiView(
-                    pos_embed='RoPE100', img_size=(224, 224), head_type='linear',
-                    output_mode='pts3d', depth_mode=('exp', -inf, inf),
-                    conf_mode=('exp', 1, 1e9), enc_embed_dim=1024, enc_depth=24,
-                    enc_num_heads=16, dec_embed_dim=768, dec_depth=12, dec_num_heads=12,
-                    GS=True, sh_degree=0, pts_head_config={'skip': True},
-                    m_ref_flag=True, n_ref=4)
-                model.to('cuda')
-                model_loaded = AsymmetricCroCo3DStereoMultiView.from_pretrained(weights_path).to('cuda')
-                model.load_state_dict(model_loaded.state_dict(), strict=True)
-                model.eval()
-                del model_loaded
-
-                state.status = "Loading images..."
-                state.recon_frac = 0.2
-                imgs = mvd_load_images(state.image_paths, size=224, verbose=True)
-                if len(imgs) == 1:
-                    imgs = [imgs[0], _copy.deepcopy(imgs[0])]
-                    imgs[1]['idx'] = 1
-                for img in imgs:
-                    img['true_shape'] = torch.from_numpy(img['true_shape']).long()
-
-                # Reorder views for better spatial coverage (from demo.py)
-                # Track permutation so we can un-shuffle the output
-                from copy import deepcopy
-                n_mv = len(imgs)
-                reorder = list(range(n_mv))  # reorder[new_pos] = original_idx
-                if n_mv < 12:
-                    if n_mv > 3:
-                        imgs[1], imgs[3] = deepcopy(imgs[3]), deepcopy(imgs[1])
-                        reorder[1], reorder[3] = reorder[3], reorder[1]
-                    if n_mv > 6:
-                        imgs[2], imgs[6] = deepcopy(imgs[6]), deepcopy(imgs[2])
-                        reorder[2], reorder[6] = reorder[6], reorder[2]
-                else:
-                    cid = n_mv // 4 + 1
-                    imgs[1], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[1])
-                    reorder[1], reorder[cid] = reorder[cid], reorder[1]
-                    cid = (n_mv * 2) // 4 + 1
-                    imgs[2], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[2])
-                    reorder[2], reorder[cid] = reorder[cid], reorder[2]
-                    cid = (n_mv * 3) // 4 + 1
-                    imgs[3], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[3])
-                    reorder[3], reorder[cid] = reorder[cid], reorder[3]
-                # Build inverse: unshuffle[original_idx] = position_in_output
-                unshuffle = [0] * n_mv
-                for new_pos, orig_idx in enumerate(reorder):
-                    unshuffle[orig_idx] = new_pos
-
-                state.status = "Running MV-DUSt3R+ inference..."
-                state.recon_frac = 0.35
-                output = inference_mv(imgs, model, 'cuda', verbose=True)
-
-                # Attach RGB from input images
-                output['pred1']['rgb'] = imgs[0]['img'].permute(0, 2, 3, 1)
-                for x, img in zip(output['pred2s'], imgs[1:]):
-                    x['rgb'] = img['img'].permute(0, 2, 3, 1)
-
-                state.status = "Recovering cameras..."
-                state.recon_frac = 0.6
-
-                # Extract points and confidence
-                _, h, w = output['pred1']['rgb'].shape[0:3]
-                rgbimg = [output['pred1']['rgb'][0]] + [x['rgb'][0] for x in output['pred2s']]
-                for i in range(len(rgbimg)):
-                    rgbimg[i] = (rgbimg[i] + 1) / 2  # [-1,1] -> [0,1]
-
-                pts3d_list = [output['pred1']['pts3d'][0]] + \
-                             [x['pts3d_in_other_view'][0] for x in output['pred2s']]
-                conf = torch.stack(
-                    [output['pred1']['conf'][0]] + [x['conf'][0] for x in output['pred2s']], 0)
-
-                # Estimate focal length from reference view
-                conf_first = conf[0].reshape(-1)
-                conf_sorted = conf_first.sort()[0]
-                conf_thres = conf_sorted[int(conf_first.shape[0] * 0.03)]
-                valid_first = (conf_first >= conf_thres).reshape(h, w)
-
-                focals_val = _estimate_focal(
-                    pts3d_list[0][None].cuda(), valid_first[None].cuda()).cpu().item()
-
-                intrinsics_mat = torch.eye(3)
-                intrinsics_mat[0, 0] = focals_val
-                intrinsics_mat[1, 1] = focals_val
-                intrinsics_mat[0, 2] = w / 2
-                intrinsics_mat[1, 2] = h / 2
-                intrinsics_mat = intrinsics_mat.cuda()
-
-                # Confidence threshold for masking
-                conf_all_sorted = conf.reshape(-1).sort()[0]
-                conf_thr = conf_all_sorted[int(conf_all_sorted.shape[0] * 0.03)]
-                msk = conf >= conf_thr
-
-                # Recover camera poses via PnP-RANSAC
-                y_coords, x_coords = torch.meshgrid(
-                    torch.arange(h), torch.arange(w), indexing='ij')
-                pixel_coords = torch.stack([x_coords, y_coords], dim=-1).float().cuda()
-
-                c2ws = []
-                for pr_pt, valid in zip(pts3d_list, msk):
-                    c2w_i = _pnp_ransac(
-                        pr_pt.cuda().flatten(0, 1)[None],
-                        pixel_coords.flatten(0, 1)[None],
-                        valid.cuda().flatten(0, 1)[None],
-                        intrinsics_mat[None])
-                    c2ws.append(c2w_i[0])
-                cams2world = torch.stack(c2ws, dim=0).cpu().numpy()
-
-                state.status = "Extracting point cloud..."
-                state.recon_frac = 0.75
-
-                pts3d_np_raw = [to_numpy(p) for p in pts3d_list]
-                msk_np_raw = to_numpy(msk)
-                rgbimg_np_raw = [to_numpy(r) for r in rgbimg]
-
-                # Un-shuffle to match original image_paths order
-                pts3d_np = [pts3d_np_raw[unshuffle[i]] for i in range(n_mv)]
-                msk_np = np.stack([msk_np_raw[unshuffle[i]] for i in range(n_mv)])
-                rgbimg_np = [rgbimg_np_raw[unshuffle[i]] for i in range(n_mv)]
-                cams2world = np.stack([cams2world[unshuffle[i]] for i in range(n_mv)])
-
-                # Build point cloud
-                all_pts = []
-                all_colors = []
-                for i in range(len(rgbimg_np)):
-                    m = msk_np[i]
-                    all_pts.append(pts3d_np[i][m])
-                    all_colors.append((np.clip(rgbimg_np[i][m], 0, 1) * 255).astype(np.uint8))
-
-                if all_pts:
-                    points = np.concatenate(all_pts, axis=0)
-                    colors = np.concatenate(all_colors, axis=0)
-                    if len(points) > 200000:
-                        idx = np.random.choice(len(points), 200000, replace=False)
-                        points, colors = points[idx], colors[idx]
-                    scene_gl.set_points(points, colors)
-                    state.has_points = True; state.needs_recenter = True
-
-                state.status = "Building scene..."
-                state.recon_frac = 0.85
-
-                # Save data for scene building (done after module restore below)
-                # conf_np also needs un-shuffling
-                conf_np_raw = to_numpy(conf)
-                conf_np = [conf_np_raw[unshuffle[i]] for i in range(n_mv)]
-                _mvd_result = dict(
-                    rgbimg_np=rgbimg_np, cams2world=cams2world, focals_val=focals_val,
-                    pts3d_np=pts3d_np, conf_np=conf_np, h=h, w=w,
-                    points=points)
-
-                del model, output
-                torch.cuda.empty_cache()
-
-            finally:
-                # Restore sys.path and purge ALL mvdust3r-loaded modules
-                sys.path = _saved_path
-                for k in list(sys.modules.keys()):
-                    if (k.startswith('dust3r') or k.startswith('models') or
-                        k.startswith('pytorch3d') or k.startswith('gsplat')):
-                        del sys.modules[k]
-                # Restore previously cached modules (mast3r's dust3r etc.)
-                for k, v in _cached_mods.items():
-                    sys.modules[k] = v
-
-            # Build VGGTScene AFTER module restore (so app.py imports mast3r's dust3r)
-            from app import VGGTScene
-            from PIL import Image as PILImage
-            from PIL.ImageOps import exif_transpose
-
-            r = _mvd_result
-            orig_sizes = []
-            for p in state.image_paths:
-                im = exif_transpose(PILImage.open(p)).convert('RGB')
-                orig_sizes.append(im.size)
-
-            extrinsic = np.zeros((len(r['cams2world']), 3, 4), dtype=np.float32)
-            for i in range(len(r['cams2world'])):
-                w2c = np.linalg.inv(r['cams2world'][i])
-                extrinsic[i] = w2c[:3, :]
-
-            K = np.eye(3, dtype=np.float32)
-            K[0, 0] = K[1, 1] = r['focals_val']
-            K[0, 2] = r['w'] / 2; K[1, 2] = r['h'] / 2
-            intrinsic_all = np.stack([K] * len(r['rgbimg_np']))
-
-            # If external cameras are cached, align MV-DUSt3R to that frame
-            if state.cached_cameras is not None and len(state.cached_cameras) == len(r['cams2world']):
-                print("  Aligning MV-DUSt3R output to external cameras...")
-                # Get camera centers from both systems
-                mvd_centers = np.array([r['cams2world'][i][:3, 3] for i in range(len(r['cams2world']))])
-                ext_centers = np.array([c[0][:3, 3] for c in state.cached_cameras])
-
-                # Procrustes: find scale, rotation, translation to align mvd → ext
-                mvd_mean = mvd_centers.mean(axis=0)
-                ext_mean = ext_centers.mean(axis=0)
-                mvd_c = mvd_centers - mvd_mean
-                ext_c = ext_centers - ext_mean
-                scale = np.linalg.norm(ext_c) / max(np.linalg.norm(mvd_c), 1e-8)
-                H_mat = mvd_c.T @ ext_c
-                U, _, Vt = np.linalg.svd(H_mat)
-                R_align = (Vt.T @ U.T).astype(np.float32)
-                if np.linalg.det(R_align) < 0:
-                    Vt[-1] *= -1
-                    R_align = (Vt.T @ U.T).astype(np.float32)
-                t_align = ext_mean - scale * (R_align @ mvd_mean)
-
-                # Transform all 3D points
-                for i in range(len(r['pts3d_np'])):
-                    pts = r['pts3d_np'][i].reshape(-1, 3)
-                    pts = scale * (pts @ R_align.T) + t_align
-                    r['pts3d_np'][i] = pts.reshape(r['pts3d_np'][i].shape).astype(np.float32)
-
-                # Use external cameras instead of MV-DUSt3R's
-                extrinsic = np.zeros((len(state.cached_cameras), 3, 4), dtype=np.float32)
-                intrinsic_all_list = []
-                for i, (c2w, K_ext, W_ext, H_ext) in enumerate(state.cached_cameras):
-                    w2c = np.linalg.inv(c2w)
-                    extrinsic[i] = w2c[:3, :].astype(np.float32)
-                    intrinsic_all_list.append(K_ext)
-                intrinsic_all = np.stack(intrinsic_all_list)
-
-                # Update display points
-                all_pts = [p.reshape(-1, 3) for p in r['pts3d_np']]
-                r['points'] = np.concatenate(all_pts, axis=0).astype(np.float32)
-                print(f"  Aligned (scale={scale:.4f})")
-
-            state.scene = VGGTScene(
-                r['rgbimg_np'], extrinsic, intrinsic_all,
-                r['pts3d_np'], r['conf_np'], orig_sizes)
-
-            cam_poses = []
-            for i in range(len(extrinsic)):
-                w2c = np.eye(4); w2c[:3, :] = extrinsic[i]
-                cam_poses.append(np.linalg.inv(w2c))
-            if cam_poses and len(r['points']) > 0:
-                ext = np.linalg.norm(r['points'].max(axis=0) - r['points'].min(axis=0))
-                scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
-
-            # Update display with aligned points
-            points = r['points']
-            colors = np.concatenate([(np.clip(img, 0, 1).reshape(-1, 3) * 255).astype(np.uint8)
-                                     for img in r['rgbimg_np']], axis=0)
-            if len(points) > 200000:
-                idx = np.random.choice(len(points), 200000, replace=False)
-                points, colors = points[idx], colors[idx]
-            scene_gl.set_points(points, colors)
-            state.has_points = True; state.needs_recenter = True
-
-            del _mvd_result
+        elif backend == '_removed_mvdust3r_placeholder':
+            pass  # MV-DUSt3R removed — results were unreliable at 224px
 
         elif backend == 'colmap':
             # COLMAP SfM — sparse reconstruction, accurate cameras
@@ -1785,7 +1429,6 @@ def _run_stacked_reconstruction(state, scene_gl):
     if state.stack_dust3r: stack_backends.append('dust3r')
     if state.stack_mast3r: stack_backends.append('mast3r')
     if state.stack_vggt: stack_backends.append('vggt')
-    if state.stack_mvdust3r: stack_backends.append('mvdust3r')
     if not stack_backends:
         state.status = "No backends selected for stacking"
         state.reconstructing = False
@@ -2057,45 +1700,6 @@ def _estimate_cameras(state, source):
                 cams.append((c2w, K, W, H))
             del model; torch.cuda.empty_cache()
             return cams
-
-        elif source == 'mvdust3r':
-            # MV-DUSt3R: run full reconstruction, extract cameras
-            import torch
-            state.refine_progress = "Running MV-DUSt3R for cameras..."
-
-            old_backend = state.backend_idx
-            old_stack = state.stack_backends
-            state.backend_idx = state.backends.index('mvdust3r')
-            state.stack_backends = False
-            old_pts = state.pts3d_list
-            old_confs = state.confs_list
-            state.pts3d_list = None
-            state.confs_list = None
-
-            try:
-                run_reconstruction(state, scene_gl)
-                if state.scene is not None:
-                    c2w_all = state.scene.get_im_poses().detach().cpu().numpy()
-                    cams = []
-                    for i in range(len(c2w_all)):
-                        c2w = c2w_all[i].astype(np.float32)
-                        if hasattr(state.scene, '_intrinsic'):
-                            K = np.array(state.scene._intrinsic[i], dtype=np.float32)
-                        else:
-                            focals = state.scene.get_focals().detach().cpu().numpy()
-                            f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
-                            K = np.array([[f, 0, 112], [0, f, 112], [0, 0, 1]], dtype=np.float32)
-                        W, H = int(K[0, 2] * 2), int(K[1, 2] * 2)
-                        cams.append((c2w, K, W, H))
-                    state.backend_idx = old_backend
-                    state.stack_backends = old_stack
-                    torch.cuda.empty_cache()
-                    return cams
-            except Exception as e:
-                print(f"  MV-DUSt3R camera estimation failed: {e}")
-                import traceback; traceback.print_exc()
-            state.backend_idx = old_backend
-            state.stack_backends = old_stack
 
     return None
 
@@ -3558,7 +3162,7 @@ def main():
             imgui.same_line()
             imgui.text_colored(f"({len(state.cached_cameras)} cached)", 0.5, 1.0, 0.5)
         _, state.backend_idx = imgui.combo("Point Cloud",
-            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+", "COLMAP"])
+            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "COLMAP"])
         _, state.stack_backends = imgui.checkbox("Stack backends", state.stack_backends)
         if state.stack_backends:
             imgui.same_line()
@@ -3567,8 +3171,6 @@ def main():
             _, state.stack_mast3r = imgui.checkbox("MASt3R##stk", state.stack_mast3r)
             imgui.same_line()
             _, state.stack_vggt = imgui.checkbox("VGGT##stk", state.stack_vggt)
-            imgui.same_line()
-            _, state.stack_mvdust3r = imgui.checkbox("MVD##stk", state.stack_mvdust3r)
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
