@@ -135,6 +135,17 @@ if not exist "vggt\vggt\models" (
 echo VGGT: OK
 echo.
 
+if not exist "pow3r\pow3r\model" (
+    echo Cloning Pow3R...
+    if exist "pow3r" rmdir /s /q pow3r
+    git clone --recursive https://github.com/naver/pow3r.git pow3r
+    if errorlevel 1 (
+        echo WARNING: Failed to clone Pow3R. Pow3R backend will not be available.
+    )
+)
+echo Pow3R: OK
+echo.
+
 :: ── Install dependencies ──
 echo Installing PyTorch with CUDA support...
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121

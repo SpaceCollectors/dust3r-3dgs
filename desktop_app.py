@@ -738,8 +738,8 @@ class AppState:
         self.image_dir = ""
 
         # Backend
-        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap
-        self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap']
+        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap, 4=pow3r
+        self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap', 'pow3r']
         self.camera_source_idx = 0  # 0=same, 1=COLMAP, 2=DUSt3R, 3=MASt3R, 4=VGGT
         self.camera_sources = ['same', 'colmap', 'dust3r', 'mast3r', 'vggt']
         self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT']
@@ -941,8 +941,183 @@ def run_reconstruction(state, scene_gl):
             del model, predictions
             torch.cuda.empty_cache()
 
-        elif backend == '_removed_mvdust3r_placeholder':
-            pass  # MV-DUSt3R removed — results were unreliable at 224px
+        elif backend == 'pow3r':
+            # Pow3R — DUSt3R with optional camera/depth conditioning
+            import copy as _copy
+            POW3R_DIR = os.path.join(SCRIPT_DIR, 'pow3r')
+            _saved_path = _copy.copy(sys.path)
+            sys.path.insert(0, POW3R_DIR)
+            sys.path.insert(0, os.path.join(POW3R_DIR, 'dust3r'))
+            sys.path.insert(0, os.path.join(POW3R_DIR, 'dust3r', 'croco'))
+
+            # Clear cached dust3r modules so pow3r's version loads
+            _cached_mods = {k: v for k, v in sys.modules.items()
+                           if k.startswith('dust3r') or k.startswith('croco')}
+            for k in _cached_mods:
+                del sys.modules[k]
+
+            try:
+                from dust3r.utils.image import load_images as pow3r_load_images
+                from dust3r.utils.device import to_numpy
+                from pow3r.model.sliding import AsymmetricSliding
+
+                state.status = "Loading Pow3R model..."
+                state.recon_frac = 0.1
+
+                # Download checkpoint if not cached
+                ckpt_url = "https://download.europe.naverlabs.com/ComputerVision/Pow3R/Pow3R_ViTLarge_BaseDecoder_512_linear.pth"
+                ckpt_dir = os.path.join(POW3R_DIR, 'checkpoints')
+                os.makedirs(ckpt_dir, exist_ok=True)
+                ckpt_path = os.path.join(ckpt_dir, 'Pow3R_ViTLarge_BaseDecoder_512_linear.pth')
+                if not os.path.exists(ckpt_path):
+                    state.status = "Downloading Pow3R weights..."
+                    import urllib.request
+                    print(f"  Downloading {ckpt_url}...")
+                    urllib.request.urlretrieve(ckpt_url, ckpt_path)
+
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                slider = AsymmetricSliding(
+                    crop_res=(384, 512), bootstrap_depth='c2f_both',
+                    fix_rays='full', sparsify_depth=1.1)
+                slider.load_from_checkpoint(ckpt)
+                slider = slider.to('cuda').eval()
+
+                state.status = "Loading images for Pow3R..."
+                state.recon_frac = 0.2
+                imgs = pow3r_load_images(state.image_paths, size=512, verbose=True)
+
+                # Inject known cameras if available
+                if state.cached_cameras is not None:
+                    print("  Injecting known cameras into Pow3R views...")
+                    for i, img_dict in enumerate(imgs):
+                        if i < len(state.cached_cameras) and state.cached_cameras[i] is not None:
+                            c2w, K, W_cam, H_cam = state.cached_cameras[i]
+                            # Scale K to match Pow3R's image size
+                            H_p, W_p = img_dict['true_shape'][0] if hasattr(img_dict['true_shape'], '__len__') else (384, 512)
+                            K_scaled = K.copy().astype(np.float32)
+                            K_scaled[0, :] *= W_p / W_cam
+                            K_scaled[1, :] *= H_p / H_cam
+                            img_dict['camera_intrinsics'] = K_scaled
+                            img_dict['camera_pose'] = c2w.astype(np.float32)
+
+                # Run pairwise on all consecutive pairs
+                state.status = "Running Pow3R inference..."
+                state.recon_frac = 0.4
+                from dust3r.image_pairs import make_pairs as pow3r_make_pairs
+
+                all_pts = []
+                all_colors = []
+                n_pairs = len(imgs) - 1 if len(imgs) > 1 else 1
+
+                if len(imgs) == 1:
+                    imgs = [imgs[0], _copy.deepcopy(imgs[0])]
+
+                # Process all pairs
+                for pi in range(len(imgs)):
+                    for pj in range(pi + 1, min(pi + 3, len(imgs))):  # pairs with up to 2 neighbors
+                        state.refine_progress = f"Pow3R pair {pi+1}-{pj+1}..."
+                        view1, view2 = imgs[pi], imgs[pj]
+
+                        with torch.no_grad():
+                            pred1, pred2 = slider(view1, view2)
+
+                        # Extract points
+                        pts1 = to_numpy(pred1['pts3d'][0])  # (H, W, 3)
+                        pts2 = to_numpy(pred2['pts3d_in_other_view'][0])
+                        conf1 = to_numpy(pred1['conf'][0])
+                        conf2 = to_numpy(pred2['conf'][0])
+                        img1 = to_numpy(view1['img'].permute(0, 2, 3, 1)[0])
+                        img2 = to_numpy(view2['img'].permute(0, 2, 3, 1)[0])
+                        img1 = (img1 + 1) / 2  # [-1,1] -> [0,1]
+                        img2 = (img2 + 1) / 2
+
+                        # Filter by confidence
+                        conf_thr = max(np.percentile(conf1, 10), 1.0)
+                        m1 = conf1 > conf_thr
+                        m2 = conf2 > conf_thr
+
+                        all_pts.append(pts1[m1])
+                        all_colors.append((np.clip(img1[m1], 0, 1) * 255).astype(np.uint8))
+                        all_pts.append(pts2[m2])
+                        all_colors.append((np.clip(img2[m2], 0, 1) * 255).astype(np.uint8))
+
+                del slider, ckpt
+                torch.cuda.empty_cache()
+
+                if all_pts:
+                    points = np.concatenate(all_pts, axis=0).astype(np.float32)
+                    colors = np.concatenate(all_colors, axis=0)
+
+                    # Estimate cameras via PnP (same as DUSt3R pair viewer approach)
+                    # For now, use cached cameras if available, else estimate from first pair
+                    if state.cached_cameras is not None:
+                        cam_poses = [c[0] for c in state.cached_cameras]
+                    else:
+                        cam_poses = None
+
+                    # Build VGGTScene wrapper
+                    from app import VGGTScene
+                    from PIL import Image as PILImage
+
+                    # Rebuild per-view pts3d from the pair outputs
+                    # Use the first occurrence of each view
+                    imgs_np = []
+                    pts3d_all = []
+                    conf_all = []
+                    for i in range(len(state.image_paths)):
+                        img_pil = PILImage.open(state.image_paths[i]).convert('RGB')
+                        W_full, H_full = img_pil.size
+                        img_np = np.array(img_pil).astype(np.float32) / 255.0
+                        imgs_np.append(img_np)
+                        # Placeholder — pow3r pts are in pair frames, not per-view
+                        pts3d_all.append(np.zeros((H_full, W_full, 3), dtype=np.float32))
+                        conf_all.append(np.ones((H_full, W_full), dtype=np.float32))
+
+                    orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
+
+                    if cam_poses is not None:
+                        extrinsic = np.zeros((len(cam_poses), 3, 4), dtype=np.float32)
+                        intrinsic_all = []
+                        for i, (c2w, K, W_c, H_c) in enumerate(state.cached_cameras):
+                            w2c = np.linalg.inv(c2w)
+                            extrinsic[i] = w2c[:3, :].astype(np.float32)
+                            intrinsic_all.append(K.astype(np.float32))
+                        intrinsic_all = np.stack(intrinsic_all)
+                    else:
+                        # Dummy cameras
+                        extrinsic = np.stack([np.eye(4)[:3, :].astype(np.float32)] * len(imgs_np))
+                        K_dummy = np.eye(3, dtype=np.float32)
+                        K_dummy[0, 0] = K_dummy[1, 1] = 500
+                        K_dummy[0, 2] = orig_sizes[0][0] / 2
+                        K_dummy[1, 2] = orig_sizes[0][1] / 2
+                        intrinsic_all = np.stack([K_dummy] * len(imgs_np))
+
+                    state.scene = VGGTScene(imgs_np, extrinsic, intrinsic_all,
+                                            pts3d_all, conf_all, orig_sizes)
+
+                    # Display the combined point cloud
+                    if len(points) > 200000:
+                        idx = np.random.choice(len(points), 200000, replace=False)
+                        scene_gl.set_points(points[idx], colors[idx])
+                    else:
+                        scene_gl.set_points(points, colors)
+                    state.has_points = True; state.needs_recenter = True
+
+                    if cam_poses:
+                        ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+                        scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+
+                    state.status = f"Pow3R: {len(points):,d} points from {len(state.image_paths)} images"
+                else:
+                    state.status = "Pow3R produced no points"
+
+            finally:
+                sys.path = _saved_path
+                for k in list(sys.modules.keys()):
+                    if k.startswith('dust3r') or k.startswith('croco') or k.startswith('pow3r'):
+                        del sys.modules[k]
+                for k, v in _cached_mods.items():
+                    sys.modules[k] = v
 
         elif backend == 'colmap':
             # COLMAP SfM — sparse reconstruction, accurate cameras
@@ -3162,7 +3337,7 @@ def main():
             imgui.same_line()
             imgui.text_colored(f"({len(state.cached_cameras)} cached)", 0.5, 1.0, 0.5)
         _, state.backend_idx = imgui.combo("Point Cloud",
-            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "COLMAP"])
+            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "COLMAP", "Pow3R"])
         _, state.stack_backends = imgui.checkbox("Stack backends", state.stack_backends)
         if state.stack_backends:
             imgui.same_line()
