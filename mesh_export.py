@@ -266,85 +266,79 @@ def _estimate_intrinsics(pts_orig, pts_cam, H, W):
     return np.array([fx, fy, cx, cy])
 
 
-def _smooth_cloud(verts, colors, radius_mult=1.5, view_ids=None, iterations=5):
-    """Voxel merge first, then iterative cross-view attraction on the merged cloud.
+def _smooth_cloud(verts, colors, radius_mult=1.5, view_ids=None, iterations=3):
+    """Voxel merge first (fast reduction), then cross-view attraction on the reduced set.
 
-    1. Voxel downsample to merge obvious duplicates and create uniform spacing
-    2. Cross-view attraction: remaining points from different views pull toward
-       each other over several iterations, collapsing remaining layers
-    3. Final voxel merge to collapse the converged points
+    1. Voxel downsample at user radius — fast, reduces point count massively
+    2. Cross-view attraction on the reduced cloud — pulls remaining layers together
+    3. Final voxel merge to collapse converged points
     """
     import open3d as o3d
     from scipy.spatial import cKDTree
 
     n_before = len(verts)
 
-    # Step 1: Initial voxel merge — removes obvious duplicates
+    # Compute median point spacing
     sample_idx = np.random.choice(len(verts), min(10000, len(verts)), replace=False)
     tree0 = cKDTree(verts[sample_idx])
     d0, _ = tree0.query(verts[sample_idx], k=2)
     median_dist = float(np.median(d0[:, 1]))
-    voxel_size = median_dist * max(radius_mult, 1.0)
+    voxel_size = median_dist * max(radius_mult, 0.1)
 
+    # Step 1: Voxel merge — fast point reduction
     print(f"  Voxel merge (size={voxel_size:.6f})...")
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(verts.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
 
     if view_ids is not None:
-        # Track view IDs through voxel merge via nearest-neighbor remap
         pcd_merged, _, idx_lists = pcd.voxel_down_sample_and_trace(
             voxel_size, pcd.get_min_bound(), pcd.get_max_bound())
-        # For each merged point, assign the most common view ID from its source points
+        # Track: does this voxel contain points from multiple views?
         merged_vids = np.zeros(len(idx_lists), dtype=np.int32)
+        multi_view = np.zeros(len(idx_lists), dtype=bool)
         for mi, orig_indices in enumerate(idx_lists):
             src_views = view_ids[[int(oi) for oi in orig_indices]]
             merged_vids[mi] = np.bincount(src_views).argmax()
+            multi_view[mi] = len(np.unique(src_views)) > 1
         pcd = pcd_merged
+        print(f"  After merge: {n_before:,d} -> {len(pcd.points):,d} ({multi_view.sum():,d} multi-view)")
     else:
         pcd = pcd.voxel_down_sample(voxel_size)
         merged_vids = None
+        print(f"  After merge: {n_before:,d} -> {len(pcd.points):,d}")
 
+    # Step 2: Cross-view attraction on the reduced cloud (fast now)
     pts = np.asarray(pcd.points).copy()
-    print(f"  After merge: {n_before:,d} -> {len(pts):,d}")
-
-    # Step 2: Cross-view attraction on the merged cloud (vectorized)
     N = len(pts)
+    attract_radius = voxel_size * 3.0
     if merged_vids is not None and len(np.unique(merged_vids)) > 1 and N < 500000:
-        attract_radius = voxel_size * 2.0
-        print(f"  Cross-view attraction ({iterations} iters, {N:,d} pts, radius={attract_radius:.6f})...")
+        print(f"  Cross-view attraction ({iterations} iters, {N:,d} pts)...")
         for it in range(iterations):
             tree = cKDTree(pts)
-            # Find all pairs within radius (vectorized, returns Nx2 array)
             pairs = tree.query_pairs(r=attract_radius, output_type='ndarray')
             if len(pairs) == 0:
                 break
 
-            # Filter to cross-view pairs only
             cross = merged_vids[pairs[:, 0]] != merged_vids[pairs[:, 1]]
             pairs = pairs[cross]
             if len(pairs) == 0:
                 break
 
-            # For each point, accumulate cross-view neighbor positions
             shift_sum = np.zeros_like(pts)
             shift_count = np.zeros(N, dtype=np.float64)
-
-            # Direction a->b: a shifts toward b
             np.add.at(shift_sum, pairs[:, 0], pts[pairs[:, 1]])
             np.add.at(shift_count, pairs[:, 0], 1.0)
-            # Direction b->a: b shifts toward a
             np.add.at(shift_sum, pairs[:, 1], pts[pairs[:, 0]])
             np.add.at(shift_count, pairs[:, 1], 1.0)
 
             moved = shift_count > 0
             avg_neighbor = shift_sum[moved] / shift_count[moved, None]
-            pts[moved] += (avg_neighbor - pts[moved]) * 0.3  # 30% attraction
+            pts[moved] += (avg_neighbor - pts[moved]) * 0.4
 
-            n_moved = moved.sum()
-            print(f"    Iter {it+1}: {n_moved:,d} points, {len(pairs):,d} cross-view pairs")
+            print(f"    Iter {it+1}: {moved.sum():,d} points, {len(pairs):,d} cross-view pairs")
 
-        # Step 3: Final voxel merge to collapse converged points
+        # Step 3: Re-merge to collapse attracted points
         pcd.points = o3d.utility.Vector3dVector(pts)
         pcd = pcd.voxel_down_sample(voxel_size)
 

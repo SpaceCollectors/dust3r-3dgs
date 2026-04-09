@@ -1564,11 +1564,6 @@ def run_dense_mesh(state, scene_gl):
         pts3d_list, confs_list = _extract_scene_data(state)
         mesh_min_conf = state.min_conf
 
-        # For DUSt3R, auto-threshold relative to median confidence
-        if not hasattr(scene, '_is_vggt') and not hasattr(scene, 'canonical_paths'):
-            if any(c is not None for c in confs_list):
-                mesh_min_conf = float(np.median(np.concatenate([c.ravel() for c in confs_list]))) * 0.5
-
         from mesh_export import create_dense_mesh, _smooth_cloud, _collect_points
         from mesh_export import _mesh_local_delaunay, _mesh_ball_pivot_from_cloud, _close_holes_pymeshlab
 
@@ -2653,6 +2648,124 @@ def main():
         _, state.show_console = imgui.checkbox("Console", state.show_console)
         imgui.separator()
 
+        # ── Project ──
+        if imgui.button("New Project"):
+            # Reset everything
+            state.__init__()
+            scene_gl.point_count = 0
+            scene_gl.mesh_face_count = 0
+            scene_gl.mesh_has_uvs = False
+            scene_gl.mesh_tex_id = None
+            if hasattr(scene_gl, '_mesh_uvs'):
+                scene_gl._mesh_uvs = None
+            camera.distance = 3.0
+            camera.target = np.zeros(3, dtype=np.float32)
+            camera.yaw = camera.pitch = 0.0
+            state.status = "New project"
+
+        imgui.same_line()
+        if imgui.button("Save Project"):
+            import tkinter as tk
+            from tkinter import filedialog
+            import pickle
+            root = tk.Tk(); root.withdraw()
+            path = filedialog.asksaveasfilename(
+                title="Save Project", defaultextension=".d3d",
+                filetypes=[("3D Recon Project", "*.d3d"), ("All files", "*.*")])
+            root.destroy()
+            if path:
+                try:
+                    save_data = {
+                        'image_paths': state.image_paths,
+                        'image_dir': state.image_dir,
+                        'mesh_data': state.mesh_data,
+                        'min_conf': state.min_conf,
+                        'pts3d_list': state.pts3d_list,
+                        'confs_list': state.confs_list,
+                        'scene_rot': (state.scene_rot_x, state.scene_rot_y, state.scene_rot_z),
+                    }
+                    with open(path, 'wb') as f:
+                        pickle.dump(save_data, f)
+                    state.status = f"Project saved to {path}"
+                except Exception as e:
+                    state.status = f"Save failed: {e}"
+
+        imgui.same_line()
+        if imgui.button("Load Project"):
+            import tkinter as tk
+            from tkinter import filedialog
+            import pickle
+            root = tk.Tk(); root.withdraw()
+            path = filedialog.askopenfilename(
+                title="Load Project",
+                filetypes=[("3D Recon Project", "*.d3d"), ("All files", "*.*")])
+            root.destroy()
+            if path:
+                try:
+                    with open(path, 'rb') as f:
+                        save_data = pickle.load(f)
+                    state.image_paths = save_data.get('image_paths', [])
+                    state.image_dir = save_data.get('image_dir', '')
+                    state.min_conf = save_data.get('min_conf', 2.0)
+                    state.pts3d_list = save_data.get('pts3d_list')
+                    state.confs_list = save_data.get('confs_list')
+                    rot = save_data.get('scene_rot', (0, 0, 0))
+                    state.scene_rot_x, state.scene_rot_y, state.scene_rot_z = rot
+
+                    # Restore point cloud display
+                    if state.pts3d_list is not None:
+                        all_pts, all_cols = [], []
+                        for i in range(len(state.pts3d_list)):
+                            p = state.pts3d_list[i]
+                            c = state.confs_list[i] if state.confs_list else None
+                            img = None
+                            # Try to load image for colors
+                            if i < len(state.image_paths):
+                                try:
+                                    from PIL import Image as PILImage
+                                    img_pil = PILImage.open(state.image_paths[i]).convert('RGB')
+                                    img = np.array(img_pil).astype(np.float32) / 255.0
+                                    # Resize to match pts shape if needed
+                                    if p.ndim == 3 and img.shape[:2] != p.shape[:2]:
+                                        img_pil = img_pil.resize((p.shape[1], p.shape[0]))
+                                        img = np.array(img_pil).astype(np.float32) / 255.0
+                                except Exception:
+                                    pass
+                            if p.ndim == 3:
+                                mask = c.reshape(p.shape[:2]) > state.min_conf if c is not None else np.ones(p.shape[:2], dtype=bool)
+                                all_pts.append(p[mask])
+                                if img is not None:
+                                    all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                                else:
+                                    all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+                            else:
+                                mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p), dtype=bool)
+                                all_pts.append(p[mask])
+                                all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+                        if all_pts:
+                            pts = np.concatenate(all_pts, axis=0)
+                            cols = np.concatenate(all_cols, axis=0)
+                            if len(pts) > 200000:
+                                idx = np.random.choice(len(pts), 200000, replace=False)
+                                pts, cols = pts[idx], cols[idx]
+                            scene_gl.set_points(pts, cols)
+                            state.has_points = True
+                            state.needs_recenter = True
+
+                    # Restore mesh
+                    md = save_data.get('mesh_data')
+                    if md is not None:
+                        state.mesh_data = md
+                        scene_gl.set_mesh(md[0], md[1], md[2])
+                        state.has_mesh = True
+
+                    state.status = f"Project loaded from {path}"
+                except Exception as e:
+                    state.status = f"Load failed: {e}"
+                    import traceback; traceback.print_exc()
+
+        imgui.separator()
+
         # ── Load Images ──
         imgui.text("Images")
         if imgui.button("Open Folder..."):
@@ -2811,16 +2924,38 @@ def main():
         # ── Dense Mesh ──
         imgui.text("Dense Mesh")
         _, state.mesh_mode_idx = imgui.combo("Method", state.mesh_mode_idx, state.mesh_mode_labels)
-        _, state.use_smoothing = imgui.checkbox("Smooth Points", state.use_smoothing)
+        changed_smooth, state.use_smoothing = imgui.checkbox("Smooth Points", state.use_smoothing)
         if state.use_smoothing:
             imgui.same_line()
-            _, state.smooth_radius = imgui.slider_float("##smooth_r", state.smooth_radius, 0.5, 10.0, format="%.1fx")
+            _, state.smooth_radius = imgui.slider_float("##smooth_r", state.smooth_radius, 0.1, 10.0, format="%.1fx")
             if state.has_points and not state.refining:
                 if imgui.button("Preview Smooth", width=-1):
                     state.refining = True
                     state.refine_thread = threading.Thread(
                         target=_run_smooth_preview, args=(state, scene_gl), daemon=True)
                     state.refine_thread.start()
+        # When unchecking smooth, restore original point cloud
+        if changed_smooth and not state.use_smoothing and state.scene is not None and state.has_points:
+            try:
+                pts3d_list, confs_list = _extract_scene_data(state)
+                all_pts, all_cols = [], []
+                for i in range(len(state.scene.imgs)):
+                    p, c_arr, img = pts3d_list[i], confs_list[i], state.scene.imgs[i]
+                    if p.ndim == 3:
+                        mask = c_arr.reshape(p.shape[:2]) > state.min_conf if c_arr is not None else np.ones(p.shape[:2], dtype=bool)
+                    else:
+                        mask = c_arr.ravel() > state.min_conf if c_arr is not None else np.ones(len(p), dtype=bool)
+                    all_pts.append(p[mask] if p.ndim == 3 else p[mask])
+                    all_cols.append((np.clip((img[mask] if p.ndim == 3 else img.reshape(-1, 3)[mask]), 0, 1) * 255).astype(np.uint8))
+                pts = np.concatenate(all_pts, axis=0)
+                cols = np.concatenate(all_cols, axis=0)
+                if len(pts) > 200000:
+                    idx = np.random.choice(len(pts), 200000, replace=False)
+                    pts, cols = pts[idx], cols[idx]
+                scene_gl.set_points(pts, cols)
+                state.status = f"Restored {len(pts):,d} points"
+            except Exception:
+                pass
         _, state.hole_cap_size = imgui.slider_int("Hole Cap Size", state.hole_cap_size, 0, 500)
         _, state.target_faces = imgui.input_int("Target Faces", state.target_faces, 10000, 50000)
         state.target_faces = max(1000, state.target_faces)
