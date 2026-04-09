@@ -745,6 +745,10 @@ class AppState:
         self.camera_source_labels = ['Same as Point Cloud', 'COLMAP', 'DUSt3R', 'MASt3R', 'VGGT', 'MV-DUSt3R+']
         self.cached_cameras = None  # list of (c2w, K, W, H) from camera source
         self.stack_backends = False  # run multiple backends and merge points
+        self.stack_dust3r = True
+        self.stack_mast3r = False
+        self.stack_vggt = True
+        self.stack_mvdust3r = False
 
         # Reconstruction
         self.scene = None
@@ -1069,19 +1073,31 @@ def run_reconstruction(state, scene_gl):
                     img['true_shape'] = torch.from_numpy(img['true_shape']).long()
 
                 # Reorder views for better spatial coverage (from demo.py)
+                # Track permutation so we can un-shuffle the output
                 from copy import deepcopy
-                if len(imgs) < 12:
-                    if len(imgs) > 3:
+                n_mv = len(imgs)
+                reorder = list(range(n_mv))  # reorder[new_pos] = original_idx
+                if n_mv < 12:
+                    if n_mv > 3:
                         imgs[1], imgs[3] = deepcopy(imgs[3]), deepcopy(imgs[1])
-                    if len(imgs) > 6:
+                        reorder[1], reorder[3] = reorder[3], reorder[1]
+                    if n_mv > 6:
                         imgs[2], imgs[6] = deepcopy(imgs[6]), deepcopy(imgs[2])
+                        reorder[2], reorder[6] = reorder[6], reorder[2]
                 else:
-                    cid = len(imgs) // 4 + 1
+                    cid = n_mv // 4 + 1
                     imgs[1], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[1])
-                    cid = (len(imgs) * 2) // 4 + 1
+                    reorder[1], reorder[cid] = reorder[cid], reorder[1]
+                    cid = (n_mv * 2) // 4 + 1
                     imgs[2], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[2])
-                    cid = (len(imgs) * 3) // 4 + 1
+                    reorder[2], reorder[cid] = reorder[cid], reorder[2]
+                    cid = (n_mv * 3) // 4 + 1
                     imgs[3], imgs[cid] = deepcopy(imgs[cid]), deepcopy(imgs[3])
+                    reorder[3], reorder[cid] = reorder[cid], reorder[3]
+                # Build inverse: unshuffle[original_idx] = position_in_output
+                unshuffle = [0] * n_mv
+                for new_pos, orig_idx in enumerate(reorder):
+                    unshuffle[orig_idx] = new_pos
 
                 state.status = "Running MV-DUSt3R+ inference..."
                 state.recon_frac = 0.35
@@ -1145,9 +1161,15 @@ def run_reconstruction(state, scene_gl):
                 state.status = "Extracting point cloud..."
                 state.recon_frac = 0.75
 
-                pts3d_np = [to_numpy(p) for p in pts3d_list]
-                msk_np = to_numpy(msk)
-                rgbimg_np = [to_numpy(r) for r in rgbimg]
+                pts3d_np_raw = [to_numpy(p) for p in pts3d_list]
+                msk_np_raw = to_numpy(msk)
+                rgbimg_np_raw = [to_numpy(r) for r in rgbimg]
+
+                # Un-shuffle to match original image_paths order
+                pts3d_np = [pts3d_np_raw[unshuffle[i]] for i in range(n_mv)]
+                msk_np = np.stack([msk_np_raw[unshuffle[i]] for i in range(n_mv)])
+                rgbimg_np = [rgbimg_np_raw[unshuffle[i]] for i in range(n_mv)]
+                cams2world = np.stack([cams2world[unshuffle[i]] for i in range(n_mv)])
 
                 # Build point cloud
                 all_pts = []
@@ -1170,10 +1192,12 @@ def run_reconstruction(state, scene_gl):
                 state.recon_frac = 0.85
 
                 # Save data for scene building (done after module restore below)
-                conf_np = to_numpy(conf)
+                # conf_np also needs un-shuffling
+                conf_np_raw = to_numpy(conf)
+                conf_np = [conf_np_raw[unshuffle[i]] for i in range(n_mv)]
                 _mvd_result = dict(
                     rgbimg_np=rgbimg_np, cams2world=cams2world, focals_val=focals_val,
-                    pts3d_np=pts3d_np, conf_np=list(conf_np), h=h, w=w,
+                    pts3d_np=pts3d_np, conf_np=conf_np, h=h, w=w,
                     points=points)
 
                 del model, output
@@ -1702,7 +1726,15 @@ def _run_stacked_reconstruction(state, scene_gl):
             print(f"  DUSt3R camera estimation failed: {e}")
 
     # Run each backend that can produce dense points
-    stack_backends = ['dust3r', 'vggt']  # MASt3R could be added but needs different handling
+    stack_backends = []
+    if state.stack_dust3r: stack_backends.append('dust3r')
+    if state.stack_mast3r: stack_backends.append('mast3r')
+    if state.stack_vggt: stack_backends.append('vggt')
+    if state.stack_mvdust3r: stack_backends.append('mvdust3r')
+    if not stack_backends:
+        state.status = "No backends selected for stacking"
+        state.reconstructing = False
+        return
     all_pts3d = []
     all_confs = []
     first_scene = None
@@ -3472,9 +3504,16 @@ def main():
             imgui.text_colored(f"({len(state.cached_cameras)} cached)", 0.5, 1.0, 0.5)
         _, state.backend_idx = imgui.combo("Point Cloud",
             state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "MV-DUSt3R+", "COLMAP"])
-        _, state.stack_backends = imgui.checkbox("Stack all backends", state.stack_backends)
+        _, state.stack_backends = imgui.checkbox("Stack backends", state.stack_backends)
         if state.stack_backends:
-            imgui.text_colored("  Will run DUSt3R + MASt3R + VGGT and merge", 0.5, 1.0, 0.5)
+            imgui.same_line()
+            _, state.stack_dust3r = imgui.checkbox("DUSt3R##stk", state.stack_dust3r)
+            imgui.same_line()
+            _, state.stack_mast3r = imgui.checkbox("MASt3R##stk", state.stack_mast3r)
+            imgui.same_line()
+            _, state.stack_vggt = imgui.checkbox("VGGT##stk", state.stack_vggt)
+            imgui.same_line()
+            _, state.stack_mvdust3r = imgui.checkbox("MVD##stk", state.stack_mvdust3r)
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
