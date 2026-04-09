@@ -13,8 +13,68 @@ import sys
 import time
 import math
 import threading
+import io
+import collections
 import numpy as np
 from pathlib import Path
+
+
+class _ConsoleCapture:
+    """Captures stdout/stderr into a ring buffer for in-app display."""
+
+    def __init__(self, maxlines=500):
+        self.lines = collections.deque(maxlen=maxlines)
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        self._lock = threading.Lock()
+
+    def install(self):
+        sys.stdout = _TeeWriter(self._original_stdout, self)
+        sys.stderr = _TeeWriter(self._original_stderr, self)
+
+    def add(self, text):
+        with self._lock:
+            for line in text.splitlines():
+                if line.strip():
+                    self.lines.append(line)
+
+    def get_lines(self):
+        with self._lock:
+            return list(self.lines)
+
+    def clear(self):
+        with self._lock:
+            self.lines.clear()
+
+
+class _TeeWriter:
+    """Writes to both the original stream and the console capture."""
+
+    def __init__(self, original, capture):
+        self._original = original
+        self._capture = capture
+
+    def write(self, text):
+        if text and text.strip():
+            self._capture.add(text)
+        try:
+            self._original.write(text)
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+    # Forward any other attributes to original
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+# Global console capture
+_console = _ConsoleCapture()
 
 import glfw
 import OpenGL.GL as gl
@@ -660,6 +720,8 @@ class GLScene:
 
 class AppState:
     def __init__(self):
+        self.show_console = False  # overlay console on viewport
+
         # Images
         self.image_paths = []
         self.image_dir = ""
@@ -710,13 +772,12 @@ class AppState:
         # Mesh data (numpy, for saving)
         self.mesh_data = None  # (verts, faces, colors)
         self.target_faces = 100000  # target face count for dense mesh
-        self.mesh_mode_idx = 0     # 0=reprojected grid, 1=ball pivot
-        self.mesh_modes = ['reprojected', 'ballpivot']
-        self.mesh_mode_labels = ['Reprojected Grid', 'Ball Pivot']
+        self.mesh_mode_idx = 0     # 0=reprojected grid, 1=ball pivot, 2=local delaunay
+        self.mesh_modes = ['reprojected', 'ballpivot', 'delaunay']
+        self.mesh_mode_labels = ['Reprojected Grid', 'Ball Pivot', 'Local Delaunay']
         self.hole_cap_size = 50    # max boundary edges to close (higher = close bigger holes)
         self.smooth_radius = 2.0   # neighbor merge radius multiplier
-        self.smoothed_points = None   # (points, colors) after smoothing
-        self.original_points = None   # (points, colors) before smoothing, for undo
+        self.use_smoothing = False # whether to smooth before meshing
         self.ai_depth_mix = 0.7  # 0=pure dust3r, 1=full AI detail
         self.ai_highpass_radius = 10.0  # high-pass sigma in pixels
         self.ai_refine_poses = True  # re-optimize poses after depth injection
@@ -1418,54 +1479,44 @@ def _extract_scene_data(state):
 
 
 
-def _run_smooth_points(state, scene_gl):
-    """Smooth the point cloud by merging nearby points. Keeps original for undo."""
+
+def _run_smooth_preview(state, scene_gl):
+    """Preview the smoothed point cloud without meshing."""
     state.refine_progress = "Smoothing points..."
     try:
         from mesh_export import _smooth_cloud
 
         pts3d_list, confs_list = _extract_scene_data(state)
         imgs = state.scene.imgs
+        mesh_min_conf = state.min_conf
 
-        # Collect current points (confidence-filtered)
-        all_pts, all_cols = [], []
+        all_pts, all_cols, all_vids = [], [], []
         for i in range(len(imgs)):
-            p = pts3d_list[i]
-            c = confs_list[i]
-            img = imgs[i]
+            p, c_arr, img = pts3d_list[i], confs_list[i], imgs[i]
             if p.ndim == 3:
                 H, W = p.shape[:2]
-                mask = c.reshape(H, W) > state.min_conf if c is not None else np.ones((H, W), dtype=bool)
-                all_pts.append(p[mask])
-                all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                mask = c_arr.reshape(H, W) > mesh_min_conf if c_arr is not None else np.ones((H, W), dtype=bool)
             else:
-                mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p), dtype=bool)
-                all_pts.append(p[mask])
-                all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+                mask = c_arr.ravel() > mesh_min_conf if c_arr is not None else np.ones(len(p), dtype=bool)
+            n = int(mask.sum())
+            all_pts.append(p[mask] if p.ndim == 3 else p[mask])
+            all_cols.append((np.clip((img[mask] if p.ndim == 3 else img.reshape(-1, 3)[mask]), 0, 1) * 255).astype(np.uint8))
+            all_vids.append(np.full(n, i, dtype=np.int32))
 
         points = np.concatenate(all_pts, axis=0).astype(np.float32)
         colors = np.concatenate(all_cols, axis=0)
+        view_ids = np.concatenate(all_vids, axis=0)
 
-        # Save original for undo (only first time), always smooth from original
-        if state.original_points is None:
-            state.original_points = (points.copy(), colors.copy())
-        else:
-            points, colors = state.original_points
+        pts, cols = _smooth_cloud(points, colors, radius_mult=state.smooth_radius, view_ids=view_ids)
 
-        # Smooth from original cloud
-        smoothed_pts, smoothed_cols = _smooth_cloud(points, colors, radius_mult=state.smooth_radius)
-
-        # Store and display
-        state.smoothed_points = (smoothed_pts, smoothed_cols)
-
-        disp_pts, disp_cols = smoothed_pts, smoothed_cols
+        disp_pts, disp_cols = pts, cols
         if len(disp_pts) > 200000:
             idx = np.random.choice(len(disp_pts), 200000, replace=False)
             disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
         scene_gl.set_points(disp_pts, disp_cols)
-        state.status = f"Smoothed: {len(points):,d} -> {len(smoothed_pts):,d} points (radius={state.smooth_radius:.1f}x)"
+        state.status = f"Smoothed: {len(points):,d} -> {len(pts):,d} points (radius={state.smooth_radius:.1f}x)"
     except Exception as e:
-        state.status = f"Smooth failed: {e}"
+        state.status = f"Smooth preview failed: {e}"
         import traceback; traceback.print_exc()
     finally:
         state.refining = False
@@ -1473,7 +1524,7 @@ def _run_smooth_points(state, scene_gl):
 
 
 def run_dense_mesh(state, scene_gl):
-    """Generate dense mesh by triangulating depth maps."""
+    """Generate dense mesh."""
     state.refine_progress = "Generating dense mesh..."
     try:
         scene = state.scene
@@ -1482,7 +1533,6 @@ def run_dense_mesh(state, scene_gl):
             state.refining = False
             return
 
-        # Always grid-triangulate from depth maps (preserves connectivity, no holes)
         imgs = scene.imgs
         pts3d_list, confs_list = _extract_scene_data(state)
         mesh_min_conf = state.min_conf
@@ -1492,26 +1542,62 @@ def run_dense_mesh(state, scene_gl):
             if any(c is not None for c in confs_list):
                 mesh_min_conf = float(np.median(np.concatenate([c.ravel() for c in confs_list]))) * 0.5
 
-        from mesh_export import create_dense_mesh
-        state.refine_progress = "Triangulating depth maps..."
+        from mesh_export import create_dense_mesh, _smooth_cloud, _collect_points
+        from mesh_export import _mesh_local_delaunay, _mesh_ball_pivot_from_cloud, _close_holes_pymeshlab
 
-        # Get camera poses for normal orientation
+        # Get camera poses
         cam_poses = None
+        cam_center = None
         try:
             c2w = scene.get_im_poses().detach().cpu().numpy()
             cam_poses = [c2w[i] for i in range(len(imgs))]
+            cam_center = np.mean([c[:3, 3] for c in cam_poses], axis=0)
         except Exception:
             pass
 
-        print(f"  min_conf for mesh: {mesh_min_conf:.3f}")
-        print(f"  pts3d shapes: {[p.shape for p in pts3d_list]}")
-        print(f"  conf ranges: {[(c.min(), c.max()) for c in confs_list]}")
-
         mesh_mode = state.mesh_modes[state.mesh_mode_idx]
-        verts, faces, colors = create_dense_mesh(
-            imgs, pts3d_list, confs_list,
-            cam2world_list=cam_poses, min_conf=mesh_min_conf,
-            mode=mesh_mode, hole_cap_size=state.hole_cap_size)
+
+        # If smoothing enabled, collect all points, smooth, then mesh the unified cloud
+        if state.use_smoothing:
+            state.refine_progress = "Collecting points..."
+            all_pts, all_cols, all_vids = [], [], []
+            for i in range(len(imgs)):
+                p, c_arr, img = pts3d_list[i], confs_list[i], imgs[i]
+                if p.ndim == 3:
+                    H, W = p.shape[:2]
+                    mask = c_arr.reshape(H, W) > mesh_min_conf if c_arr is not None else np.ones((H, W), dtype=bool)
+                    all_pts.append(p[mask]); all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                    all_vids.append(np.full(mask.sum(), i, dtype=np.int32))
+                else:
+                    mask = c_arr.ravel() > mesh_min_conf if c_arr is not None else np.ones(len(p), dtype=bool)
+                    all_pts.append(p[mask]); all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+                    all_vids.append(np.full(mask.sum(), i, dtype=np.int32))
+
+            points = np.concatenate(all_pts, axis=0).astype(np.float32)
+            colors_raw = np.concatenate(all_cols, axis=0)
+            view_ids = np.concatenate(all_vids, axis=0)
+
+            state.refine_progress = f"Smoothing {len(points):,d} points..."
+            pts, cols = _smooth_cloud(points, colors_raw,
+                                       radius_mult=state.smooth_radius, view_ids=view_ids)
+
+            state.refine_progress = f"Meshing {len(pts):,d} points ({mesh_mode})..."
+            if mesh_mode == 'delaunay':
+                verts, faces, colors = _mesh_local_delaunay(pts, cols, cam_center=cam_center)
+            else:
+                verts, faces, colors = _mesh_ball_pivot_from_cloud(pts, cols, cam_center=cam_center)
+
+            if state.hole_cap_size > 0 and len(faces) > 0:
+                verts, faces, colors = _close_holes_pymeshlab(verts, faces, colors, state.hole_cap_size)
+
+        else:
+            # No smoothing — use per-view data with selected method
+            print(f"  min_conf: {mesh_min_conf:.3f}, mode: {mesh_mode}")
+            state.refine_progress = f"Creating mesh ({mesh_mode})..."
+            verts, faces, colors = create_dense_mesh(
+                imgs, pts3d_list, confs_list,
+                cam2world_list=cam_poses, min_conf=mesh_min_conf,
+                mode=mesh_mode, hole_cap_size=state.hole_cap_size)
 
         if len(faces) > 0:
             state.mesh_data = (verts, faces, colors)
@@ -1532,10 +1618,9 @@ def run_dense_mesh(state, scene_gl):
 
 
 def run_decimate(state, scene_gl):
-    """Decimate existing mesh to target face count using Open3D quadric decimation."""
+    """Decimate existing mesh to target face count."""
     state.refine_progress = "Decimating mesh..."
     try:
-        import open3d as o3d
         verts, faces, colors = state.mesh_data
         target = state.target_faces
         n_before = len(faces)
@@ -1548,18 +1633,61 @@ def run_decimate(state, scene_gl):
         state.refine_progress = f"Decimating {n_before:,d} -> {target:,d} faces..."
         print(f"  Decimating {n_before:,d} -> {target:,d} faces...")
 
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
-        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
-        mesh.vertex_colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+        # Try PyMeshLab first (best quality), fall back to Open3D
+        try:
+            import pymeshlab
+            ms = pymeshlab.MeshSet()
+            m = pymeshlab.Mesh(
+                vertex_matrix=verts.astype(np.float64),
+                face_matrix=faces.astype(np.int32),
+                v_color_matrix=np.column_stack([
+                    colors.astype(np.float64) / 255.0,
+                    np.ones((len(colors), 1), dtype=np.float64)
+                ])
+            )
+            ms.add_mesh(m)
 
-        mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target)
-        mesh.remove_degenerate_triangles()
-        mesh.remove_duplicated_vertices()
+            try:
+                ms.meshing_decimation_quadric_edge_collapse(
+                    targetfacenum=target,
+                    qualitythr=0.5,
+                    preserveboundary=True,
+                    preservenormal=True,
+                    preservetopology=True,
+                    optimalplacement=True,
+                    autoclean=True)
+            except TypeError:
+                # Older PyMeshLab versions may have different parameter names
+                ms.simplification_quadric_edge_collapse_decimation(
+                    targetfacenum=target,
+                    preserveboundary=True,
+                    preservenormal=True,
+                    optimalplacement=True)
 
-        verts_out = np.asarray(mesh.vertices, dtype=np.float32)
-        faces_out = np.asarray(mesh.triangles, dtype=np.int32)
-        colors_out = (np.asarray(mesh.vertex_colors) * 255).clip(0, 255).astype(np.uint8)
+            mesh_out = ms.current_mesh()
+            verts_out = mesh_out.vertex_matrix().astype(np.float32)
+            faces_out = mesh_out.face_matrix().astype(np.int32)
+            if mesh_out.has_vertex_color():
+                vc = mesh_out.vertex_color_matrix()
+                colors_out = (vc[:, :3] * 255).clip(0, 255).astype(np.uint8)
+            else:
+                colors_out = np.full((len(verts_out), 3), 128, dtype=np.uint8)
+            print(f"  Decimated with PyMeshLab: {len(faces_out):,d} faces")
+
+        except Exception as e_pml:
+            print(f"  PyMeshLab decimation failed ({e_pml}), using Open3D...")
+            import open3d as o3d
+            mesh = o3d.geometry.TriangleMesh()
+            mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+            mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+            mesh.vertex_colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+            mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target)
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_vertices()
+            verts_out = np.asarray(mesh.vertices, dtype=np.float32)
+            faces_out = np.asarray(mesh.triangles, dtype=np.int32)
+            colors_out = (np.asarray(mesh.vertex_colors) * 255).clip(0, 255).astype(np.uint8)
+            print(f"  Decimated with Open3D: {len(faces_out):,d} faces")
 
         state.mesh_data = (verts_out, faces_out, colors_out)
         scene_gl.set_mesh(verts_out, faces_out, colors_out)
@@ -2411,6 +2539,8 @@ def _texture_pymeshlab(verts, faces, colors, views, output_dir, state):
 
 
 def main():
+    _console.install()
+
     if not glfw.init():
         print("Could not initialize GLFW")
         return
@@ -2489,10 +2619,11 @@ def main():
         imgui.begin("Controls", flags=imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_TITLE_BAR)
         imgui.begin_child("ScrollRegion", 0, 0, border=False)
 
-        # Status
+        # Status + console toggle
         imgui.text_colored(state.status, 0.4, 0.8, 1.0)
         if state.error_msg:
             imgui.text_colored(state.error_msg, 1.0, 0.3, 0.3)
+        _, state.show_console = imgui.checkbox("Console", state.show_console)
         imgui.separator()
 
         # ── Load Images ──
@@ -2648,32 +2779,21 @@ def main():
 
         imgui.separator()
 
-        # ── Point Cloud Smoothing ──
-        if state.has_points and not state.refining:
-            imgui.text("Point Cloud")
-            _, state.smooth_radius = imgui.slider_float("Smooth Radius", state.smooth_radius, 0.5, 10.0, format="%.1fx")
-            if imgui.button("Smooth Points", width=-1):
-                state.refining = True
-                state.refine_thread = threading.Thread(
-                    target=_run_smooth_points, args=(state, scene_gl), daemon=True)
-                state.refine_thread.start()
-            if state.original_points is not None:
-                imgui.same_line()
-                if imgui.button("Undo##smooth"):
-                    pts, cols = state.original_points
-                    state.smoothed_points = None
-                    state.original_points = None
-                    disp_pts, disp_cols = pts, cols
-                    if len(disp_pts) > 200000:
-                        idx = np.random.choice(len(disp_pts), 200000, replace=False)
-                        disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
-                    scene_gl.set_points(disp_pts, disp_cols)
-                    state.status = f"Restored original {len(pts):,d} points"
-            imgui.separator()
+        imgui.separator()
 
         # ── Dense Mesh ──
         imgui.text("Dense Mesh")
         _, state.mesh_mode_idx = imgui.combo("Method", state.mesh_mode_idx, state.mesh_mode_labels)
+        _, state.use_smoothing = imgui.checkbox("Smooth Points", state.use_smoothing)
+        if state.use_smoothing:
+            imgui.same_line()
+            _, state.smooth_radius = imgui.slider_float("##smooth_r", state.smooth_radius, 0.5, 10.0, format="%.1fx")
+            if state.has_points and not state.refining:
+                if imgui.button("Preview Smooth", width=-1):
+                    state.refining = True
+                    state.refine_thread = threading.Thread(
+                        target=_run_smooth_preview, args=(state, scene_gl), daemon=True)
+                    state.refine_thread.start()
         _, state.hole_cap_size = imgui.slider_int("Hole Cap Size", state.hole_cap_size, 0, 500)
         _, state.target_faces = imgui.input_int("Target Faces", state.target_faces, 10000, 50000)
         state.target_faces = max(1000, state.target_faces)
@@ -2801,6 +2921,24 @@ def main():
         # ── In-app debug image viewer ──
         debug_imgs.flush()
         debug_imgs.draw_window("Debug Views")
+
+        # ── Console Overlay ──
+        if state.show_console:
+            console_h = min(300, win_h // 3)
+            imgui.set_next_window_position(400, win_h - console_h)
+            imgui.set_next_window_size(win_w - 400, console_h)
+            imgui.set_next_window_bg_alpha(0.85)
+            imgui.begin("Console", flags=imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+                        imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_FOCUS_ON_APPEARING)
+            lines = _console.get_lines()
+            # Show last N lines that fit
+            max_lines = max(1, console_h // 16)
+            for line in lines[-max_lines:]:
+                imgui.text_unformatted(line)
+            # Auto-scroll to bottom
+            if imgui.get_scroll_y() < imgui.get_scroll_max_y():
+                imgui.set_scroll_here_y(1.0)
+            imgui.end()
 
         # Render ImGui
         gl.glViewport(0, 0, win_w, win_h)

@@ -19,9 +19,25 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
 
     mode='reprojected': Voxel-merge all points, shared vertex grid triangulation.
     mode='ballpivot':   Voxel-dedup, ball-pivot.
+    mode='delaunay':    Voxel-dedup, local tangent-plane Delaunay.
     hole_cap_size:      Max boundary edges to close (0=disable, via PyMeshLab).
     """
-    if mode == 'reprojected' and cam2world_list is not None:
+    if mode == 'delaunay':
+        all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf)
+        if len(all_points) == 0:
+            return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3), dtype=np.uint8)
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(all_points.astype(np.float64))
+        pcd.colors = o3d.utility.Vector3dVector(all_colors.astype(np.float64) / 255.0)
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        extent = np.linalg.norm(np.asarray(pcd.points).max(0) - np.asarray(pcd.points).min(0))
+        pcd = pcd.voxel_down_sample(extent / 800)
+        pts = np.asarray(pcd.points, dtype=np.float32)
+        cols = (np.asarray(pcd.colors) * 255).clip(0, 255).astype(np.uint8)
+        cam_center = np.mean([c[:3, 3] for c in cam2world_list], axis=0) if cam2world_list else None
+        v, f, c = _mesh_local_delaunay(pts, cols, cam_center=cam_center)
+    elif mode == 'reprojected' and cam2world_list is not None:
         v, f, c = _mesh_reprojected_grid(imgs, pts3d_list, confs_list,
                                           cam2world_list, min_conf)
     else:
@@ -250,30 +266,220 @@ def _estimate_intrinsics(pts_orig, pts_cam, H, W):
     return np.array([fx, fy, cx, cy])
 
 
-def _smooth_cloud(verts, colors, radius_mult=1.5):
-    """Voxel downsample: uniform grid, average all points per cell.
-    Produces perfectly uniform point spacing."""
+def _smooth_cloud(verts, colors, radius_mult=1.5, view_ids=None, iterations=5):
+    """Voxel merge first, then iterative cross-view attraction on the merged cloud.
+
+    1. Voxel downsample to merge obvious duplicates and create uniform spacing
+    2. Cross-view attraction: remaining points from different views pull toward
+       each other over several iterations, collapsing remaining layers
+    3. Final voxel merge to collapse the converged points
+    """
     import open3d as o3d
+    from scipy.spatial import cKDTree
 
     n_before = len(verts)
-    print(f"  Voxel smoothing {n_before:,d} points...")
 
+    # Step 1: Initial voxel merge — removes obvious duplicates
+    sample_idx = np.random.choice(len(verts), min(10000, len(verts)), replace=False)
+    tree0 = cKDTree(verts[sample_idx])
+    d0, _ = tree0.query(verts[sample_idx], k=2)
+    median_dist = float(np.median(d0[:, 1]))
+    voxel_size = median_dist * max(radius_mult, 1.0)
+
+    print(f"  Voxel merge (size={voxel_size:.6f})...")
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(verts.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
 
-    # Voxel size from median nearest-neighbor distance * multiplier
-    dists = np.asarray(pcd.compute_nearest_neighbor_distance())
-    median_dist = float(np.median(dists))
-    voxel_size = median_dist * radius_mult
+    if view_ids is not None:
+        # Track view IDs through voxel merge via nearest-neighbor remap
+        pcd_merged, _, idx_lists = pcd.voxel_down_sample_and_trace(
+            voxel_size, pcd.get_min_bound(), pcd.get_max_bound())
+        # For each merged point, assign the most common view ID from its source points
+        merged_vids = np.zeros(len(idx_lists), dtype=np.int32)
+        for mi, orig_indices in enumerate(idx_lists):
+            src_views = view_ids[[int(oi) for oi in orig_indices]]
+            merged_vids[mi] = np.bincount(src_views).argmax()
+        pcd = pcd_merged
+    else:
+        pcd = pcd.voxel_down_sample(voxel_size)
+        merged_vids = None
 
-    pcd = pcd.voxel_down_sample(voxel_size)
+    pts = np.asarray(pcd.points).copy()
+    print(f"  After merge: {n_before:,d} -> {len(pts):,d}")
+
+    # Step 2: Cross-view attraction on the merged cloud (vectorized)
+    N = len(pts)
+    if merged_vids is not None and len(np.unique(merged_vids)) > 1 and N < 500000:
+        attract_radius = voxel_size * 2.0
+        print(f"  Cross-view attraction ({iterations} iters, {N:,d} pts, radius={attract_radius:.6f})...")
+        for it in range(iterations):
+            tree = cKDTree(pts)
+            # Find all pairs within radius (vectorized, returns Nx2 array)
+            pairs = tree.query_pairs(r=attract_radius, output_type='ndarray')
+            if len(pairs) == 0:
+                break
+
+            # Filter to cross-view pairs only
+            cross = merged_vids[pairs[:, 0]] != merged_vids[pairs[:, 1]]
+            pairs = pairs[cross]
+            if len(pairs) == 0:
+                break
+
+            # For each point, accumulate cross-view neighbor positions
+            shift_sum = np.zeros_like(pts)
+            shift_count = np.zeros(N, dtype=np.float64)
+
+            # Direction a->b: a shifts toward b
+            np.add.at(shift_sum, pairs[:, 0], pts[pairs[:, 1]])
+            np.add.at(shift_count, pairs[:, 0], 1.0)
+            # Direction b->a: b shifts toward a
+            np.add.at(shift_sum, pairs[:, 1], pts[pairs[:, 0]])
+            np.add.at(shift_count, pairs[:, 1], 1.0)
+
+            moved = shift_count > 0
+            avg_neighbor = shift_sum[moved] / shift_count[moved, None]
+            pts[moved] += (avg_neighbor - pts[moved]) * 0.3  # 30% attraction
+
+            n_moved = moved.sum()
+            print(f"    Iter {it+1}: {n_moved:,d} points, {len(pairs):,d} cross-view pairs")
+
+        # Step 3: Final voxel merge to collapse converged points
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd = pcd.voxel_down_sample(voxel_size)
 
     out_v = np.asarray(pcd.points, dtype=np.float32)
     out_c = (np.asarray(pcd.colors) * 255).clip(0, 255).astype(np.uint8)
 
-    print(f"  Voxel smooth: {n_before:,d} -> {len(out_v):,d} points (voxel={voxel_size:.6f})")
+    print(f"  Smooth: {n_before:,d} -> {len(out_v):,d} points")
     return out_v, out_c
+
+
+def _mesh_local_delaunay(points, colors, cam_center=None, k=20):
+    """Surface reconstruction via local 2D Delaunay on tangent planes.
+
+    For each point, project its K nearest neighbors onto the local tangent plane
+    (defined by the point's estimated normal), run 2D Delaunay, keep triangles
+    that touch the center point. Produces a clean surface following local geometry.
+    """
+    import open3d as o3d
+    from scipy.spatial import Delaunay, cKDTree
+
+    V = len(points)
+    if V < 3:
+        return points, np.zeros((0, 3), dtype=np.int32), colors
+
+    print(f"  Local Delaunay on {V:,d} points (k={k})...")
+
+    # Estimate normals
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
+        radius=0, max_nn=k))
+    if cam_center is not None:
+        pcd.orient_normals_towards_camera_location(cam_center)
+    else:
+        pcd.orient_normals_consistent_tangent_plane(k=min(k, 15))
+    normals = np.asarray(pcd.normals, dtype=np.float64)
+
+    # KD-tree for neighbor queries
+    tree = cKDTree(points)
+    _, nn_idx = tree.query(points, k=k)  # (V, k) indices
+
+    # Compute median NN distance for edge length filtering
+    nn_dists = np.linalg.norm(points[nn_idx[:, 1]] - points, axis=-1)
+    median_dist = np.median(nn_dists)
+    max_edge = median_dist * 5.0
+
+    # For each point: project neighbors to tangent plane, local Delaunay
+    all_tris = set()
+    batch = max(1, V // 10)
+
+    for pi in range(V):
+        if pi % batch == 0:
+            print(f"    {pi:,d} / {V:,d} ({pi * 100 // V}%)")
+
+        n = normals[pi]
+        center = points[pi]
+        neighbors = nn_idx[pi]  # k indices including self
+
+        # Build local tangent basis
+        # Pick any vector not parallel to n for cross product
+        if abs(n[0]) < 0.9:
+            tangent = np.cross(n, [1, 0, 0])
+        else:
+            tangent = np.cross(n, [0, 1, 0])
+        tangent /= max(np.linalg.norm(tangent), 1e-12)
+        bitangent = np.cross(n, tangent)
+
+        # Project neighbors to 2D tangent plane
+        rel = points[neighbors] - center
+        u = rel @ tangent
+        v = rel @ bitangent
+        pts_2d = np.column_stack([u, v])
+
+        # 2D Delaunay
+        if len(pts_2d) < 3:
+            continue
+        try:
+            tri = Delaunay(pts_2d)
+        except Exception:
+            continue
+
+        # Keep triangles that include point 0 (the center point = self)
+        for simplex in tri.simplices:
+            if 0 not in simplex:
+                continue
+            # Map local indices back to global
+            a, b, c = int(neighbors[simplex[0]]), int(neighbors[simplex[1]]), int(neighbors[simplex[2]])
+
+            # Edge length check
+            d0 = np.linalg.norm(points[a] - points[b])
+            d1 = np.linalg.norm(points[b] - points[c])
+            d2 = np.linalg.norm(points[a] - points[c])
+            if d0 > max_edge or d1 > max_edge or d2 > max_edge:
+                continue
+
+            # Canonical face key for dedup
+            key = tuple(sorted([a, b, c]))
+            all_tris.add(key)
+
+    faces = np.array(list(all_tris), dtype=np.int32) if all_tris else np.zeros((0, 3), dtype=np.int32)
+    print(f"  Local Delaunay: {V:,d} verts, {len(faces):,d} faces")
+    return points.astype(np.float32), faces, colors
+
+
+def _mesh_ball_pivot_from_cloud(points, colors, cam_center=None):
+    """Ball-pivot a pre-processed point cloud into a mesh."""
+    import open3d as o3d
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0, max_nn=30))
+    if cam_center is not None:
+        pcd.orient_normals_towards_camera_location(cam_center)
+    else:
+        pcd.orient_normals_consistent_tangent_plane(k=15)
+
+    dists = np.asarray(pcd.compute_nearest_neighbor_distance())
+    avg_dist = np.mean(dists)
+    radii = [avg_dist * 1.0, avg_dist * 2.0, avg_dist * 4.0, avg_dist * 8.0]
+    print(f"  Ball-pivoting (radii={[f'{r:.5f}' for r in radii]})...")
+
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector(radii))
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_vertices()
+
+    out_v = np.asarray(mesh.vertices, dtype=np.float32)
+    out_f = np.asarray(mesh.triangles, dtype=np.int32)
+    out_c = ((np.asarray(mesh.vertex_colors) * 255).clip(0, 255).astype(np.uint8)
+             if mesh.has_vertex_colors() else np.full((len(out_v), 3), 128, dtype=np.uint8))
+    print(f"  Ball-pivot: {len(out_v):,d} verts, {len(out_f):,d} faces")
+    return out_v, out_f, out_c
 
 
 def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf):
