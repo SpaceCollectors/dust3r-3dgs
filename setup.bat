@@ -1,29 +1,89 @@
 @echo off
+setlocal enabledelayedexpansion
 title 3D Reconstruction Studio — Setup
 echo ============================================
 echo   3D Reconstruction Studio — First-Time Setup
 echo ============================================
 echo.
 
-:: Check for Python
+cd /d "%~dp0"
+
+:: ── Find or install Python ──
+set PYTHON_CMD=
+set PYTHON_DIR=%~dp0python
+
+:: Check for local portable Python first
+if exist "%PYTHON_DIR%\python.exe" (
+    set PYTHON_CMD=%PYTHON_DIR%\python.exe
+    echo Found local portable Python.
+    goto :have_python
+)
+
+:: Check system Python
 where python >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python not found. Please install Python 3.10+ from python.org
-    echo Make sure to check "Add Python to PATH" during installation.
+if not errorlevel 1 (
+    :: Verify it's Python 3.10+
+    python -c "import sys; exit(0 if sys.version_info >= (3, 10) else 1)" 2>nul
+    if not errorlevel 1 (
+        set PYTHON_CMD=python
+        echo Found system Python.
+        goto :have_python
+    )
+)
+
+:: No Python found — download portable Python
+echo Python 3.10+ not found. Downloading portable Python 3.11...
+echo.
+
+set PY_URL=https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-pc-windows-msvc-shared-install_only_stripped.tar.gz
+set PY_ARCHIVE=python-portable.tar.gz
+
+:: Download
+echo Downloading from GitHub (python-build-standalone)...
+powershell -Command "& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%PY_URL%' -OutFile '%PY_ARCHIVE%'}" 2>nul
+if not exist "%PY_ARCHIVE%" (
+    echo ERROR: Download failed. Please install Python 3.10+ manually from python.org
     pause
     exit /b 1
 )
 
-:: Show Python version
-python --version
+:: Extract
+echo Extracting...
+powershell -Command "& {tar -xzf '%PY_ARCHIVE%'}" 2>nul
+if not exist "%PYTHON_DIR%\python.exe" (
+    :: tar might extract to a different folder name
+    for /d %%D in (cpython-*) do (
+        if exist "%%D\python.exe" (
+            rename "%%D" "python"
+        ) else if exist "%%D\install\python.exe" (
+            move "%%D\install" "python" >nul
+            rmdir "%%D" 2>nul
+        )
+    )
+)
+del "%PY_ARCHIVE%" 2>nul
+
+if exist "%PYTHON_DIR%\python.exe" (
+    set PYTHON_CMD=%PYTHON_DIR%\python.exe
+    echo Portable Python installed to %PYTHON_DIR%
+    :: Ensure pip is available
+    "%PYTHON_CMD%" -m ensurepip --upgrade 2>nul
+) else (
+    echo ERROR: Failed to extract Python. Please install Python 3.10+ manually.
+    pause
+    exit /b 1
+)
+
+:have_python
+"%PYTHON_CMD%" --version
 echo.
 
-:: Create virtual environment
+:: ── Create virtual environment ──
 if not exist "venv" (
     echo Creating virtual environment...
-    python -m venv venv
+    "%PYTHON_CMD%" -m venv venv
     if errorlevel 1 (
-        echo ERROR: Failed to create venv. Make sure Python 3.10+ is installed.
+        echo ERROR: Failed to create venv.
         pause
         exit /b 1
     )
@@ -36,22 +96,19 @@ echo.
 :: Activate venv
 call venv\Scripts\activate.bat
 
-:: Install PyTorch with CUDA
+:: ── Install dependencies ──
 echo Installing PyTorch with CUDA support...
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 echo.
 
-:: Install main requirements
 echo Installing project dependencies...
 pip install -r requirements.txt
 echo.
 
-:: Install desktop app dependencies (ImGui + OpenGL)
 echo Installing desktop GUI dependencies...
-pip install imgui[glfw] PyOpenGL glfw xatlas
+pip install imgui[glfw] PyOpenGL glfw xatlas pymeshlab
 echo.
 
-:: Install extra dependencies (MV-DUSt3R+, depth estimation, etc.)
 echo Installing extra dependencies...
 pip install torchmetrics opencv-python open3d
 echo.
@@ -71,13 +128,13 @@ if exist "mvdust3r\requirements.txt" (
 )
 echo.
 
-:: Try to build CUDA RoPE kernels (optional, speeds up inference)
+:: Optional CUDA kernels
 echo Building optional CUDA kernels...
 if exist "mast3r\dust3r\croco\models\curope\setup.py" (
     pushd mast3r\dust3r\croco\models\curope
     python setup.py build_ext --inplace 2>nul
     if errorlevel 1 (
-        echo   [SKIP] CUDA RoPE kernels — not critical, inference still works.
+        echo   [SKIP] CUDA RoPE kernels — not critical.
     ) else (
         echo   [OK] CUDA RoPE kernels built.
     )
@@ -85,24 +142,30 @@ if exist "mast3r\dust3r\croco\models\curope\setup.py" (
 )
 echo.
 
+:: ── Update launch script to use correct Python ──
+:: Write launch_desktop.bat that uses the venv
+(
+echo @echo off
+echo title 3D Reconstruction Studio
+echo cd /d "%%~dp0"
+echo call venv\Scripts\activate.bat
+echo python desktop_app.py %%*
+echo pause
+) > launch_desktop.bat
+
 :: Create desktop shortcut
-echo Creating desktop shortcut...
-python -c "import os, sys; exec(open(os.path.join(os.path.dirname(sys.argv[0]) if sys.argv[0] else '.', 'create_shortcut.py')).read())" 2>nul
-if errorlevel 1 (
-    :: Fallback: create a simple launcher .bat on the desktop
-    echo @echo off > "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
-    echo cd /d "%~dp0" >> "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
-    echo call venv\Scripts\activate.bat >> "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
-    echo python desktop_app.py >> "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
-    echo Created launcher on Desktop.
-)
+echo @echo off > "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
+echo cd /d "%~dp0" >> "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
+echo call venv\Scripts\activate.bat >> "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
+echo python desktop_app.py >> "%USERPROFILE%\Desktop\3D Reconstruction Studio.bat"
+echo Created launcher on Desktop.
 echo.
 
 echo ============================================
 echo   Setup complete!
 echo.
-echo   You can now run the app by:
-echo     1. Double-click "3D Reconstruction Studio" on your Desktop
+echo   Run the app by:
+echo     1. Double-click "3D Reconstruction Studio" on Desktop
 echo     2. Or run: launch_desktop.bat
 echo ============================================
 pause
