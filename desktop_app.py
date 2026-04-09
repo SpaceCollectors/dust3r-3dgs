@@ -960,6 +960,7 @@ def run_reconstruction(state, scene_gl):
             try:
                 from dust3r.utils.image import load_images as pow3r_load_images
                 from dust3r.utils.device import to_numpy
+                from pow3r.model.model import Pow3R  # needed for eval(ckpt['definition'])
 
                 state.status = "Loading Pow3R model..."
                 state.recon_frac = 0.1
