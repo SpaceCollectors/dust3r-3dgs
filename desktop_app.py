@@ -1524,31 +1524,60 @@ def run_reconstruction(state, scene_gl):
 
         # Recentering handled by main loop via needs_recenter flag
 
-        # Auto-align scene: compute average camera up vector → align to world Y
+        # Auto-align: detect up direction from cameras and point cloud
         if state.has_points and state.scene is not None:
             try:
                 c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
-                # In OpenCV convention, camera Y points DOWN in the image,
-                # so the scene "up" is -Y of the camera (negate column 1)
-                avg_up = np.zeros(3, dtype=np.float64)
-                for i in range(len(c2w_poses)):
-                    avg_up -= c2w_poses[i][:3, 1]  # negate: cam Y is down
-                avg_up /= max(np.linalg.norm(avg_up), 1e-8)
 
-                # Compute rotation from avg_up to world Y=[0,1,0]
+                # Method 1: Camera up vectors (try both OpenCV and OpenGL conventions)
+                avg_up_cv = np.zeros(3, dtype=np.float64)   # OpenCV: -Y is up
+                avg_up_gl = np.zeros(3, dtype=np.float64)   # OpenGL: +Y is up
+                avg_cam_pos = np.zeros(3, dtype=np.float64)
+                for i in range(len(c2w_poses)):
+                    avg_up_cv -= c2w_poses[i][:3, 1]
+                    avg_up_gl += c2w_poses[i][:3, 1]
+                    avg_cam_pos += c2w_poses[i][:3, 3]
+                avg_up_cv /= max(np.linalg.norm(avg_up_cv), 1e-8)
+                avg_up_gl /= max(np.linalg.norm(avg_up_gl), 1e-8)
+                avg_cam_pos /= len(c2w_poses)
+
+                # Method 2: Cameras should be above the scene center
+                # (most photos are taken from above, looking down or level)
+                pts3d_list, _ = _extract_scene_data(state)
+                all_pts = []
+                for p in pts3d_list:
+                    if p is not None:
+                        all_pts.append(p.reshape(-1, 3))
+                if all_pts:
+                    pts_center = np.concatenate(all_pts, axis=0).mean(axis=0)
+                else:
+                    pts_center = np.zeros(3)
+
+                # Pick the convention where the up vector points from scene center toward cameras
+                cam_dir = avg_cam_pos - pts_center
+                cam_dir /= max(np.linalg.norm(cam_dir), 1e-8)
+
+                # Which up convention agrees more with "cameras are above scene"?
+                score_cv = np.dot(avg_up_cv, cam_dir)
+                score_gl = np.dot(avg_up_gl, cam_dir)
+                avg_up = avg_up_cv if score_cv > score_gl else avg_up_gl
+                print(f"  Up detection: cv={score_cv:.2f}, gl={score_gl:.2f}, using {'cv' if score_cv > score_gl else 'gl'}")
+
+                # Compute rotation to align avg_up with world Y
                 target_up = np.array([0.0, 1.0, 0.0])
                 dot = np.clip(np.dot(avg_up, target_up), -1.0, 1.0)
-                if abs(dot) < 0.999:
+
+                if dot < -0.5:
+                    state.scene_rot_x = 180.0
+                    print(f"  Auto-flipped (upside-down)")
+                elif abs(dot) < 0.99:
                     axis = np.cross(avg_up, target_up)
                     axis /= max(np.linalg.norm(axis), 1e-8)
                     angle = np.arccos(dot)
-                    # Convert axis-angle to euler XYZ (approximate for scene_rot)
-                    # Use Rodrigues to get rotation matrix, then extract euler angles
                     K_mat = np.array([[0, -axis[2], axis[1]],
                                       [axis[2], 0, -axis[0]],
                                       [-axis[1], axis[0], 0]])
                     R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
-                    # Extract Euler XYZ from R_align
                     sy = np.sqrt(R_align[0, 0] ** 2 + R_align[1, 0] ** 2)
                     if sy > 1e-6:
                         rx = np.arctan2(R_align[2, 1], R_align[2, 2])
@@ -1561,11 +1590,7 @@ def run_reconstruction(state, scene_gl):
                     state.scene_rot_x = float(np.degrees(rx))
                     state.scene_rot_y = float(np.degrees(ry))
                     state.scene_rot_z = float(np.degrees(rz))
-                    print(f"  Auto-aligned scene (rot={state.scene_rot_x:.1f}, {state.scene_rot_y:.1f}, {state.scene_rot_z:.1f})")
-                elif dot < -0.5:
-                    # Nearly opposite — just flip
-                    state.scene_rot_x = 180.0
-                    print("  Auto-flipped scene (upside-down)")
+                    print(f"  Auto-aligned (rot={state.scene_rot_x:.1f}, {state.scene_rot_y:.1f}, {state.scene_rot_z:.1f})")
             except Exception as e:
                 print(f"  Auto-align failed: {e}")
 
