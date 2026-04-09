@@ -1900,37 +1900,58 @@ def run_upscale_points(state, scene_gl):
                 mono_x = np.clip((cols * scale_x).astype(int), 0, W_full - 1)
                 mono_z = mono_depth[mono_y, mono_x]
 
-                # DepthAnything outputs inverse depth (larger=closer)
-                # Try both direct and inverse, pick the one that correlates better
+                # Build nonlinear LUT from mono depth → metric depth
+                # using matched pixel pairs from the existing reconstruction
                 valid = (existing_z > 0.01) & (mono_z > 0.01)
-                if valid.sum() > 10:
+                if valid.sum() > 50:
                     ez = existing_z[valid]
                     mz = mono_z[valid]
-                    inv_mz = 1.0 / np.maximum(mz, 1e-6)
 
-                    # Correlation: positive = same direction, negative = inverted
-                    corr_direct = np.corrcoef(ez, mz)[0, 1]
-                    corr_inv = np.corrcoef(ez, inv_mz)[0, 1]
-
-                    if corr_inv > corr_direct:
-                        # Mono depth is inverted — use 1/mono
-                        print(f"    Depth is inverted (corr direct={corr_direct:.2f}, inv={corr_inv:.2f})")
+                    # Check if inverted (DepthAnything: larger=closer)
+                    if np.corrcoef(ez, 1.0 / np.maximum(mz, 1e-6))[0, 1] > np.corrcoef(ez, mz)[0, 1]:
+                        print(f"    Mono depth is inverted, converting...")
                         mono_depth = 1.0 / np.maximum(mono_depth, 1e-6)
-                        mz = inv_mz
+                        mz = 1.0 / np.maximum(mz, 1e-6)
 
-                    # Fit: existing_z ≈ a * mono + b
-                    A = np.column_stack([mz, np.ones(valid.sum())])
-                    result_fit = np.linalg.lstsq(A, ez, rcond=None)
-                    a, b = result_fit[0]
-                    print(f"    Depth fit: a={a:.4f}, b={b:.4f}")
+                    # Build LUT: sort mono values, map to corresponding metric values
+                    # Use percentile bins for robustness
+                    n_bins = 100
+                    percentiles = np.linspace(0, 100, n_bins + 1)
+                    mono_bins = np.percentile(mz, percentiles)
+                    metric_bins = np.zeros(n_bins + 1, dtype=np.float64)
+                    for bi in range(n_bins + 1):
+                        lo = mono_bins[max(0, bi - 1)]
+                        hi = mono_bins[min(bi + 1, n_bins)]
+                        in_bin = (mz >= lo) & (mz <= hi)
+                        if in_bin.any():
+                            metric_bins[bi] = np.median(ez[in_bin])
+                        elif bi > 0:
+                            metric_bins[bi] = metric_bins[bi - 1]
+
+                    # Smooth the LUT to avoid noise
+                    from scipy.ndimage import uniform_filter1d
+                    metric_bins = uniform_filter1d(metric_bins, size=5)
+
+                    # Ensure monotonic (sort of — metric depth should increase with mono depth)
+                    for bi in range(1, len(metric_bins)):
+                        metric_bins[bi] = max(metric_bins[bi], metric_bins[bi - 1] + 1e-6)
+
+                    print(f"    LUT: mono [{mono_bins[0]:.3f}-{mono_bins[-1]:.3f}] -> metric [{metric_bins[0]:.3f}-{metric_bins[-1]:.3f}]")
+
+                    # Apply LUT to full-res mono depth via interpolation
+                    aligned_depth = np.interp(mono_depth.ravel(), mono_bins, metric_bins).reshape(mono_depth.shape)
+                    depth_lut = True
                 else:
-                    a, b = 1.0, 0.0
+                    depth_lut = False
             else:
-                a, b = 1.0, 0.0
+                depth_lut = False
 
-            # Apply alignment
-            aligned_depth = mono_depth * a + b
-            aligned_depth = np.maximum(aligned_depth, 0.01)
+            if not depth_lut:
+                # Fallback: no alignment data, use raw mono depth
+                aligned_depth = mono_depth
+                print(f"    WARNING: no depth alignment data, using raw mono depth")
+
+            aligned_depth = np.maximum(aligned_depth, 0.01).astype(np.float32)
 
             # Back-project full-res pixels to 3D using known camera
             # Estimate K at full resolution from existing scene
