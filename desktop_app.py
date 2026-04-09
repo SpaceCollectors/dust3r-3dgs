@@ -1011,7 +1011,7 @@ def run_reconstruction(state, scene_gl):
                     elif isinstance(ts, torch.Tensor):
                         ts = ts.ravel()
                     H_p, W_p = int(ts[0]), int(ts[1])
-                    img_dict['true_shape'] = (H_p, W_p)  # plain tuple for Pow3R
+                    img_dict['true_shape'] = np.array([H_p, W_p], dtype=np.int64)
 
                     if state.cached_cameras is not None and i < len(state.cached_cameras) and state.cached_cameras[i] is not None:
                         # Use known cameras
