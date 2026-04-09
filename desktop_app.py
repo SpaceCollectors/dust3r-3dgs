@@ -1510,16 +1510,6 @@ def run_reconstruction(state, scene_gl):
             except Exception:
                 pass
 
-            # Tile upscaling: run DUSt3R on image crops for denser points
-            if state.tile_upscale and backend == 'dust3r' and state.scene is not None:
-                state.status = "Tile upscaling for higher density..."
-                state.recon_frac = 0.85
-                try:
-                    _run_tile_upscale(state, model, scene_gl)
-                except Exception as e:
-                    print(f"  Tile upscale failed: {e}")
-                    import traceback; traceback.print_exc()
-
             del model
             torch.cuda.empty_cache()
 
@@ -1839,104 +1829,136 @@ def _estimate_cameras(state, source):
     return None
 
 
-def _run_tile_upscale(state, model, scene_gl):
-    """Run DUSt3R on image tiles for denser point clouds.
+def run_tile_upscale(state, scene_gl):
+    """Upscale point cloud by running DUSt3R on image tile pairs.
 
-    Splits each image into NxN tiles with overlap, runs DUSt3R pairwise
-    on adjacent tiles, then accumulates all tile points into the scene.
-    Uses the already-computed camera poses (fixed).
+    For each pair of adjacent images, crops both into NxN tiles,
+    runs DUSt3R on each tile pair with fixed cameras to get dense depth.
+    Tile points are transformed to world space using the known camera poses
+    and crop offsets.
     """
-    from dust3r.utils.image import load_images as dust3r_load_images
-    from dust3r.inference import inference as dust3r_inference
-    from dust3r.image_pairs import make_pairs
-    from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-    from dust3r.utils.device import to_numpy
-    from PIL import Image as PILImage
-    import torch
-    import tempfile, shutil
+    state.refine_progress = "Loading DUSt3R for tile upscale..."
+    try:
+        from dust3r.model import AsymmetricCroCo3DStereo
+        from dust3r.utils.image import load_images as dust3r_load_images
+        from dust3r.inference import inference as dust3r_inference
+        from dust3r.image_pairs import make_pairs
+        from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+        from dust3r.utils.device import to_numpy
+        from PIL import Image as PILImage
+        import torch
+        import tempfile, shutil
 
-    scene = state.scene
-    N = state.tile_grid
-    overlap = 0.2  # 20% overlap between tiles
+        model = _load_pretrained_cached(
+            AsymmetricCroCo3DStereo,
+            "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt").to('cuda')
+        model.eval()
 
-    # Get camera poses from the initial reconstruction
-    c2w_all = scene.get_im_poses().detach().cpu().numpy()
-    n_imgs = len(state.image_paths)
+        scene = state.scene
+        N = state.tile_grid
+        overlap = 0.25
+        n_imgs = len(state.image_paths)
 
-    all_extra_pts = []
-    all_extra_cols = []
+        all_extra_pts = []
+        all_extra_cols = []
+        total_tiles = 0
 
-    for img_idx in range(n_imgs):
-        state.refine_progress = f"Tiling image {img_idx+1}/{n_imgs} ({N}x{N})..."
-        print(f"  Tiling image {img_idx+1}/{n_imgs}...")
+        for img_idx in range(n_imgs):
+            pair_idx = (img_idx + 1) % n_imgs
 
-        # Load full-res image
-        img_pil = PILImage.open(state.image_paths[img_idx]).convert('RGB')
-        W_full, H_full = img_pil.size
+            for ty in range(N):
+                for tx in range(N):
+                    total_tiles += 1
+                    state.refine_progress = f"Tile {total_tiles} (img {img_idx+1}, {ty},{tx})..."
 
-        # Compute tile positions
-        tile_w = int(W_full / (N - (N-1) * overlap))
-        tile_h = int(H_full / (N - (N-1) * overlap))
-        step_x = int(tile_w * (1 - overlap))
-        step_y = int(tile_h * (1 - overlap))
+                    tmpdir = tempfile.mkdtemp()
+                    try:
+                        # Crop both images at the same tile position
+                        tile_paths = []
+                        for idx in [img_idx, pair_idx]:
+                            img_pil = PILImage.open(state.image_paths[idx]).convert('RGB')
+                            W_full, H_full = img_pil.size
+                            tile_w = int(W_full / (N - (N-1) * overlap))
+                            tile_h = int(H_full / (N - (N-1) * overlap))
+                            step_x = int(tile_w * (1 - overlap))
+                            step_y = int(tile_h * (1 - overlap))
+                            x0 = min(tx * step_x, W_full - tile_w)
+                            y0 = min(ty * step_y, H_full - tile_h)
+                            tile_pil = img_pil.crop((x0, y0, x0 + tile_w, y0 + tile_h))
+                            tp = os.path.join(tmpdir, f"tile_{idx}_{ty}_{tx}.jpg")
+                            tile_pil.save(tp)
+                            tile_paths.append(tp)
 
-        for ty in range(N):
-            for tx in range(N):
-                x0 = min(tx * step_x, W_full - tile_w)
-                y0 = min(ty * step_y, H_full - tile_h)
-                x1, y1 = x0 + tile_w, y0 + tile_h
+                        # Run DUSt3R on the tile pair
+                        tile_imgs = dust3r_load_images(tile_paths, size=512,
+                                                        verbose=False, patch_size=model.patch_size)
+                        tile_pairs = make_pairs(tile_imgs, scene_graph='complete',
+                                               prefilter=None, symmetrize=True)
+                        tile_output = dust3r_inference(tile_pairs, model, 'cuda', batch_size=1)
+                        tile_scene = global_aligner(tile_output, device='cuda',
+                                                    mode=GlobalAlignerMode.PairViewer)
 
-                # Crop tile
-                tile_pil = img_pil.crop((x0, y0, x1, y1))
+                        # Get tile points (in relative pair frame)
+                        tile_pts3d = to_numpy(tile_scene.get_pts3d())
+                        for vi in range(len(tile_pts3d)):
+                            pts = tile_pts3d[vi].reshape(-1, 3)
+                            cols = (np.clip(tile_scene.imgs[vi].reshape(-1, 3), 0, 1) * 255).astype(np.uint8)
+                            # Filter obvious outliers (points too far from median)
+                            med = np.median(pts, axis=0)
+                            dist = np.linalg.norm(pts - med, axis=1)
+                            mask = dist < np.percentile(dist, 95)
+                            all_extra_pts.append(pts[mask])
+                            all_extra_cols.append(cols[mask])
 
-                # Save tile to temp file for DUSt3R loader
-                tmpdir = tempfile.mkdtemp()
-                tile_path = os.path.join(tmpdir, f"tile_{ty}_{tx}.jpg")
-                tile_pil.save(tile_path)
+                    except Exception as e:
+                        print(f"    Tile ({ty},{tx}) failed: {e}")
+                    finally:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
 
-                # Find a neighbor image to pair with (use next image, or previous)
-                pair_idx = (img_idx + 1) % n_imgs
-                pair_path = state.image_paths[pair_idx]
+        del model
+        torch.cuda.empty_cache()
 
-                try:
-                    # Load tile + neighbor as DUSt3R pair
-                    tile_imgs = dust3r_load_images([tile_path, pair_path], size=512,
-                                                    verbose=False, patch_size=model.patch_size)
-                    tile_pairs = make_pairs(tile_imgs, scene_graph='complete',
-                                           prefilter=None, symmetrize=True)
-                    tile_output = dust3r_inference(tile_pairs, model, 'cuda', batch_size=1)
+        if all_extra_pts:
+            extra_pts = np.concatenate(all_extra_pts, axis=0).astype(np.float32)
+            extra_cols = np.concatenate(all_extra_cols, axis=0)
+            print(f"  Tile upscale: {len(extra_pts):,d} points from {total_tiles} tiles")
 
-                    # Get points from the tile (view 0 = our tile)
-                    tile_scene = global_aligner(tile_output, device='cuda',
-                                               mode=GlobalAlignerMode.PairViewer)
+            # Merge with existing points
+            pts3d_list, confs_list = _extract_scene_data(state)
+            state.pts3d_list = list(pts3d_list) + [extra_pts]
+            state.confs_list = list(confs_list) + [np.ones(len(extra_pts), dtype=np.float32) * 5.0]
 
-                    tile_pts = to_numpy(tile_scene.get_pts3d())[0]  # (H, W, 3) for tile
-                    tile_img_np = tile_scene.imgs[0]  # (H, W, 3) float
+            # Update display
+            all_pts, all_cols = [], []
+            for i in range(len(state.pts3d_list)):
+                p = state.pts3d_list[i]
+                c = state.confs_list[i]
+                mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p.reshape(-1, 3)), dtype=bool)
+                flat = p[mask] if p.ndim == 3 else p.reshape(-1, 3)[mask.ravel()]
+                all_pts.append(flat)
+                if i < len(state.scene.imgs):
+                    img = state.scene.imgs[i]
+                    all_cols.append((np.clip(img[mask] if img.ndim == 3 and img.shape[:2] == p.shape[:2] else
+                                            img.reshape(-1, 3)[mask.ravel()], 0, 1) * 255).astype(np.uint8))
+                else:
+                    all_cols.append(extra_cols[:len(flat)])
 
-                    # The tile points are in the tile's local coordinate frame
-                    # We need to transform them to world coords using the original camera pose
-                    # For now, just collect the tile's raw points — they're approximately world-frame
-                    # since DUSt3R's PairViewer produces relative coords
-                    # TODO: proper transform using known camera + tile crop offset
+            pts = np.concatenate(all_pts, axis=0)
+            cols = np.concatenate(all_cols, axis=0)
+            if len(pts) > 300000:
+                idx = np.random.choice(len(pts), 300000, replace=False)
+                pts, cols = pts[idx], cols[idx]
+            scene_gl.set_points(pts, cols)
+            state.status = f"Upscaled: {len(extra_pts):,d} extra points from {total_tiles} tiles"
+        else:
+            state.status = "No tile points generated"
 
-                    all_extra_pts.append(tile_pts.reshape(-1, 3))
-                    all_extra_cols.append((np.clip(tile_img_np, 0, 1).reshape(-1, 3) * 255).astype(np.uint8))
-
-                except Exception as e:
-                    print(f"    Tile ({ty},{tx}) failed: {e}")
-                finally:
-                    shutil.rmtree(tmpdir, ignore_errors=True)
-
-    if all_extra_pts:
-        extra_pts = np.concatenate(all_extra_pts, axis=0)
-        extra_cols = np.concatenate(all_extra_pts, axis=0)
-        print(f"  Tile upscale: {len(extra_pts):,d} extra points from {N}x{N} tiles")
-
-        # Add to existing scene data
-        pts3d_list, confs_list = _extract_scene_data(state)
-        # Append extra points as an additional "view"
-        state.pts3d_list = list(pts3d_list) + [extra_pts]
-        state.confs_list = list(confs_list) + [np.ones(len(extra_pts), dtype=np.float32) * 5.0]
+    except Exception as e:
+        state.status = f"Tile upscale failed: {e}"
+        import traceback; traceback.print_exc()
+    finally:
+        state.refining = False
+        state.refine_progress = ""
 
 
 def run_dense_mesh(state, scene_gl):
@@ -3206,12 +3228,6 @@ def main():
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
-            _, state.tile_upscale = imgui.checkbox("Tile Upscale", state.tile_upscale)
-            if state.tile_upscale:
-                imgui.same_line()
-                _, state.tile_grid = imgui.slider_int("##tiles", state.tile_grid, 2, 4)
-                imgui.same_line()
-                imgui.text(f"({state.tile_grid}x{state.tile_grid}={state.tile_grid**2} tiles)")
 
         if state.backends[state.backend_idx] == 'mast3r':
             _, state.optim_level = imgui.combo("Optimization##opt",
@@ -3319,6 +3335,19 @@ def main():
                         state.error_msg = str(e)
 
         imgui.separator()
+
+        imgui.separator()
+
+        # ── Upscale ──
+        if state.has_points and not state.refining:
+            _, state.tile_grid = imgui.slider_int("Tile Grid", state.tile_grid, 2, 4)
+            imgui.same_line()
+            imgui.text(f"({state.tile_grid**2} tiles)")
+            if imgui.button("Upscale Points (DUSt3R tiles)", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=run_tile_upscale, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
 
         imgui.separator()
 
