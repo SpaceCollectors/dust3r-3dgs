@@ -1054,7 +1054,7 @@ print('SUCCESS')
                 for i in range(len(c2w_all)):
                     w2c = np.linalg.inv(c2w_all[i])
                     extrinsic[i] = w2c[:3, :].astype(np.float32)
-                    f = float(result['focals'][i])
+                    f = float(result['focals'][i].item() if hasattr(result['focals'][i], 'item') else result['focals'][i])
                     H, W = pts3d[i].shape[:2]
                     K = np.array([[f, 0, W/2], [0, f, H/2], [0, 0, 1]], dtype=np.float32)
                     intrinsic_all.append(K)
@@ -1400,10 +1400,22 @@ print('SUCCESS')
                     # Update scene data with aligned points
                     state.pts3d_list = pts3d_aligned
                     state.confs_list = list(confs_list)
-                    # Update display
-                    all_pts = [p.reshape(-1, 3) for p in pts3d_aligned]
-                    all_cols = [(state.scene.imgs[i].reshape(-1, 3) * 255).astype(np.uint8)
-                                for i in range(len(state.scene.imgs))]
+                    # Update display with confidence-filtered points
+                    all_pts, all_cols = [], []
+                    for i in range(len(pts3d_aligned)):
+                        p = pts3d_aligned[i]
+                        c = confs_list[i] if i < len(confs_list) else None
+                        if p.ndim == 3:
+                            H, W = p.shape[:2]
+                            mask = c.reshape(H, W) > state.min_conf if c is not None else np.ones((H, W), dtype=bool)
+                            all_pts.append(p[mask])
+                            if i < len(state.scene.imgs):
+                                all_cols.append((np.clip(state.scene.imgs[i][mask], 0, 1) * 255).astype(np.uint8))
+                            else:
+                                all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+                        else:
+                            all_pts.append(p.reshape(-1, 3))
+                            all_cols.append(np.full((len(p.reshape(-1, 3)), 3), 180, dtype=np.uint8))
                     points = np.concatenate(all_pts, axis=0)
                     colors = np.concatenate(all_cols, axis=0)
                     if len(points) > 200000:
