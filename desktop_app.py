@@ -1212,7 +1212,6 @@ def run_reconstruction(state, scene_gl):
                 scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
             del _mvd_result
 
-        else:
         elif backend == 'colmap':
             # COLMAP SfM — sparse reconstruction, accurate cameras
             state.status = "Running COLMAP SfM..."
