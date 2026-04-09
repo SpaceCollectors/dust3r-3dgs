@@ -1150,10 +1150,24 @@ print('SUCCESS')
                 cam = rec.cameras[image.camera_id]
                 K = cam.calibration_matrix()  # 3x3
 
-                # Camera pose (w2c)
-                w2c_34 = image.cam_from_world.matrix()  # 3x4
+                # Camera pose (w2c) — handle different pycolmap API versions
                 w2c = np.eye(4, dtype=np.float32)
-                w2c[:3, :] = w2c_34
+                try:
+                    # pycolmap >= 3.10
+                    cfw = image.cam_from_world
+                    if callable(cfw):
+                        w2c_34 = cfw().matrix()
+                    elif hasattr(cfw, 'matrix'):
+                        w2c_34 = cfw.matrix()
+                    else:
+                        w2c_34 = np.array(cfw)
+                    w2c[:3, :] = w2c_34
+                except Exception:
+                    # Fallback: build from rotation + translation
+                    R = image.rotmat()
+                    t = image.tvec
+                    w2c[:3, :3] = R
+                    w2c[:3, 3] = t
 
                 # COLMAP sparse points don't give per-pixel depth maps
                 # Create a "pseudo depth map" by projecting sparse points into each image
