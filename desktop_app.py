@@ -1040,36 +1040,33 @@ def run_reconstruction(state, scene_gl):
                 # Run pairwise on all consecutive pairs
                 state.status = "Running Pow3R inference..."
                 state.recon_frac = 0.4
-                from dust3r.image_pairs import make_pairs as pow3r_make_pairs
+                from dust3r.utils.device import todevice
 
                 all_pts = []
                 all_colors = []
-                n_pairs = len(imgs) - 1 if len(imgs) > 1 else 1
 
                 if len(imgs) == 1:
                     imgs = [imgs[0], _copy.deepcopy(imgs[0])]
 
-                # Process all pairs
+                # Process all pairs (matching demo_high_res.py pattern)
                 for pi in range(len(imgs)):
-                    for pj in range(pi + 1, min(pi + 3, len(imgs))):  # pairs with up to 2 neighbors
+                    for pj in range(pi + 1, min(pi + 3, len(imgs))):
                         state.refine_progress = f"Pow3R pair {pi+1}-{pj+1}..."
-                        view1, view2 = imgs[pi], imgs[pj]
+                        # Move views to CUDA (critical — demo does todevice before slider call)
+                        view1, view2 = todevice([imgs[pi], imgs[pj]], 'cuda')
 
                         with torch.no_grad():
-                            pred1, pred2 = slider(view1, view2)
+                            pred1, pred2 = to_numpy(slider(view1, view2))
 
-                        # Extract points
-                        pts1 = to_numpy(pred1['pts3d'][0])  # (H, W, 3)
-                        pts2 = to_numpy(pred2['pts3d_in_other_view'][0])
-                        conf1 = to_numpy(pred1['conf'][0])
-                        conf2 = to_numpy(pred2['conf'][0])
+                        # Extract points (already numpy from to_numpy above)
+                        pts1 = pred1['pts3d'][0]  # (H, W, 3)
+                        pts2 = pred2['pts3d_in_other_view'][0]
+                        conf1 = pred1['conf'][0]
+                        conf2 = pred2['conf'][0]
 
-                        # Get images at matching resolution from input views
-                        # The view['img'] is (1, 3, H, W) in [-1, 1]
-                        img1_t = view1['img'][0].permute(1, 2, 0)  # (H, W, 3)
-                        img2_t = view2['img'][0].permute(1, 2, 0)
-                        img1 = to_numpy((img1_t + 1) / 2)  # [0, 1]
-                        img2 = to_numpy((img2_t + 1) / 2)
+                        # Get images from views (on CUDA, need to_numpy)
+                        img1 = to_numpy((view1['img'][0].permute(1, 2, 0) + 1) / 2)
+                        img2 = to_numpy((view2['img'][0].permute(1, 2, 0) + 1) / 2)
 
                         # Resize images to match point map dimensions if needed
                         H1, W1 = pts1.shape[:2]
