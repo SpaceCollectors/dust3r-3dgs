@@ -100,17 +100,28 @@ def _find_cached_model_path(repo_id):
 
 def _load_pretrained_cached(model_class, repo_id):
     """Load a pretrained model from local cache if available, else download."""
-    # Try loading from local cache first (no network)
+    # Try loading from local snapshot cache (no network)
     cached_path = _find_cached_model_path(repo_id)
     if cached_path:
         try:
             model = model_class.from_pretrained(cached_path)
-            print(f"  Loaded {repo_id} from local cache (offline)")
+            print(f"  Loaded {repo_id} from cache (offline)")
             return model
         except Exception as e:
-            print(f"  Cache load failed ({e}), downloading...")
+            print(f"  Cache load failed ({e})")
 
-    # Not cached or cache load failed — download
+    # Try HF offline mode (uses cached blobs)
+    try:
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        model = model_class.from_pretrained(repo_id)
+        print(f"  Loaded {repo_id} in offline mode")
+        return model
+    except Exception:
+        pass
+    finally:
+        os.environ.pop('HF_HUB_OFFLINE', None)
+
+    # Not cached — download
     print(f"  Downloading {repo_id}...")
     return model_class.from_pretrained(repo_id)
 
@@ -989,13 +1000,29 @@ def run_reconstruction(state, scene_gl):
 
                 state.status = "Loading MV-DUSt3R+ weights..."
                 state.recon_frac = 0.05
-                from huggingface_hub import hf_hub_download
-                # Try local cache first
-                cached_mvd = _find_cached_model_path("Zhenggang/MV-DUSt3R")
-                if cached_mvd and os.path.exists(os.path.join(cached_mvd, "checkpoints", "MVDp_s2.pth")):
-                    weights_path = os.path.join(cached_mvd, "checkpoints", "MVDp_s2.pth")
-                    print(f"  Loaded MV-DUSt3R from cache: {weights_path}")
-                else:
+                from huggingface_hub import hf_hub_download, try_to_load_from_cache
+                # Try local cache first — search all known cache locations
+                weights_path = None
+                try:
+                    # Check HF cache
+                    cached = try_to_load_from_cache("Zhenggang/MV-DUSt3R", "checkpoints/MVDp_s2.pth")
+                    if cached and os.path.exists(cached):
+                        weights_path = cached
+                        print(f"  MV-DUSt3R from HF cache: {weights_path}")
+                except Exception:
+                    pass
+                if not weights_path:
+                    # Check local mvdust3r/checkpoints
+                    for search_dir in [MVDUST3R_DIR, os.path.join(MVDUST3R_DIR, 'checkpoints')]:
+                        for root, dirs, files in os.walk(search_dir):
+                            if 'MVDp_s2.pth' in files:
+                                weights_path = os.path.join(root, 'MVDp_s2.pth')
+                                print(f"  MV-DUSt3R from local: {weights_path}")
+                                break
+                        if weights_path:
+                            break
+                if not weights_path:
+                    print("  Downloading MV-DUSt3R weights...")
                     weights_path = hf_hub_download(
                         repo_id="Zhenggang/MV-DUSt3R",
                         filename="checkpoints/MVDp_s2.pth",
