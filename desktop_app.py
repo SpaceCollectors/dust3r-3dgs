@@ -807,7 +807,7 @@ class AppState:
         # Mesh generation settings (kept for compatibility)
 
         # Scene orientation transform (applied in shader)
-        self.scene_rot_x = 0.0  # degrees
+        self.scene_rot_x = 180.0  # degrees (DUSt3R convention: Y-down, flip to Y-up)
         self.scene_rot_y = 0.0
         self.scene_rot_z = 0.0
         self.scene_flip_y = False
