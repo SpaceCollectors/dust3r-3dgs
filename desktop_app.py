@@ -976,11 +976,16 @@ def run_reconstruction(state, scene_gl):
                     print(f"  Downloading {ckpt_url}...")
                     urllib.request.urlretrieve(ckpt_url, ckpt_path)
 
+                # Load checkpoint — it contains the model definition as a string
+                # Don't construct AsymmetricSliding ourselves; let load_from_checkpoint do it
                 ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-                slider = AsymmetricSliding(
-                    crop_res=(384, 512), bootstrap_depth='c2f_both',
-                    fix_rays='full', sparsify_depth=1.1)
-                slider.load_from_checkpoint(ckpt)
+                # The checkpoint might contain a pickled resolver, or just weights+definition
+                if isinstance(ckpt, dict) and 'definition' in ckpt:
+                    slider = AsymmetricSliding(crop_resolution=(384, 512))
+                    slider.load_from_checkpoint(ckpt)
+                else:
+                    # Checkpoint is the resolver object itself
+                    slider = ckpt
                 slider = slider.to('cuda').eval()
 
                 state.status = "Loading images for Pow3R..."
