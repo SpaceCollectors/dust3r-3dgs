@@ -35,41 +35,46 @@ if not errorlevel 1 (
 echo Python 3.10+ not found. Downloading portable Python 3.11...
 echo.
 
-set PY_URL=https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-pc-windows-msvc-shared-install_only_stripped.tar.gz
+set PY_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-pc-windows-msvc-install_only.tar.gz
 set PY_ARCHIVE=python-portable.tar.gz
 
-:: Download
-echo Downloading from GitHub (python-build-standalone)...
-powershell -Command "& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%PY_URL%' -OutFile '%PY_ARCHIVE%'}" 2>nul
+:: Download using PowerShell (works on Windows 10+)
+echo Downloading Python 3.11.9 from GitHub...
+echo URL: %PY_URL%
+echo This may take a minute...
+powershell -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -Uri '%PY_URL%' -OutFile '%PY_ARCHIVE%' -UseBasicParsing } catch { Write-Host $_.Exception.Message; exit 1 }"
 if not exist "%PY_ARCHIVE%" (
+    echo.
     echo ERROR: Download failed. Please install Python 3.10+ manually from python.org
+    echo Make sure to check "Add Python to PATH" during installation.
     pause
     exit /b 1
 )
 
-:: Extract
-echo Extracting...
-powershell -Command "& {tar -xzf '%PY_ARCHIVE%'}" 2>nul
+:: Extract .tar.gz
+echo Extracting Python...
+tar -xzf "%PY_ARCHIVE%" 2>nul
 if not exist "%PYTHON_DIR%\python.exe" (
-    :: tar might extract to a different folder name
-    for /d %%D in (cpython-*) do (
-        if exist "%%D\python.exe" (
-            rename "%%D" "python"
-        ) else if exist "%%D\install\python.exe" (
-            move "%%D\install" "python" >nul
-            rmdir "%%D" 2>nul
-        )
+    :: The archive extracts to a "python" folder with python/install/ structure
+    if exist "python\install\python.exe" (
+        :: Move contents up
+        xcopy /e /y /q "python\install\*" "python\" >nul
+        rmdir /s /q "python\install" 2>nul
     )
 )
 del "%PY_ARCHIVE%" 2>nul
 
 if exist "%PYTHON_DIR%\python.exe" (
     set PYTHON_CMD=%PYTHON_DIR%\python.exe
-    echo Portable Python installed to %PYTHON_DIR%
+    echo Portable Python installed successfully.
+    "%PYTHON_CMD%" --version
     :: Ensure pip is available
-    "%PYTHON_CMD%" -m ensurepip --upgrade 2>nul
+    "%PYTHON_CMD%" -m ensurepip --upgrade >nul 2>nul
 ) else (
-    echo ERROR: Failed to extract Python. Please install Python 3.10+ manually.
+    echo.
+    echo ERROR: Failed to extract Python. Contents found:
+    dir /b python\ 2>nul
+    echo Please install Python 3.10+ manually from python.org
     pause
     exit /b 1
 )
