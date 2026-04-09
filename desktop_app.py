@@ -748,6 +748,7 @@ class AppState:
         self.stack_dust3r = True
         self.stack_mast3r = False
         self.stack_vggt = True
+        self.stack_pow3r = False
 
         # Reconstruction
         self.scene = None
@@ -1604,6 +1605,7 @@ def _run_stacked_reconstruction(state, scene_gl):
     if state.stack_dust3r: stack_backends.append('dust3r')
     if state.stack_mast3r: stack_backends.append('mast3r')
     if state.stack_vggt: stack_backends.append('vggt')
+    if state.stack_pow3r: stack_backends.append('pow3r')
     if not stack_backends:
         state.status = "No backends selected for stacking"
         state.reconstructing = False
@@ -3346,6 +3348,8 @@ def main():
             _, state.stack_mast3r = imgui.checkbox("MASt3R##stk", state.stack_mast3r)
             imgui.same_line()
             _, state.stack_vggt = imgui.checkbox("VGGT##stk", state.stack_vggt)
+            imgui.same_line()
+            _, state.stack_pow3r = imgui.checkbox("Pow3R##stk", state.stack_pow3r)
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
