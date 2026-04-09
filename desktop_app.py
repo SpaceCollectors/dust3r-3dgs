@@ -1004,14 +1004,14 @@ def run_reconstruction(state, scene_gl):
 
                 # Pow3R sliding window requires camera_intrinsics in every view
                 for i, img_dict in enumerate(imgs):
-                    # Get image dimensions from true_shape
+                    # Fix true_shape: Pow3R expects (H, W) tuple, load_images gives [[H, W]]
                     ts = img_dict['true_shape']
-                    if isinstance(ts, torch.Tensor):
-                        H_p, W_p = int(ts[0].item()), int(ts[1].item())
-                    elif hasattr(ts, '__len__') and len(ts) >= 2:
-                        H_p, W_p = int(ts[0]), int(ts[1])
-                    else:
-                        H_p, W_p = 384, 512
+                    if isinstance(ts, np.ndarray):
+                        ts = ts.ravel()
+                    elif isinstance(ts, torch.Tensor):
+                        ts = ts.ravel()
+                    H_p, W_p = int(ts[0]), int(ts[1])
+                    img_dict['true_shape'] = (H_p, W_p)  # plain tuple for Pow3R
 
                     if state.cached_cameras is not None and i < len(state.cached_cameras) and state.cached_cameras[i] is not None:
                         # Use known cameras
