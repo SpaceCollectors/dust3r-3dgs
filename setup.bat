@@ -19,15 +19,16 @@ if exist "%PYTHON_DIR%\python.exe" (
     goto :have_python
 )
 
-:: Check system Python
+:: Check system Python (must be 3.10-3.12 — 3.13+ breaks too many packages)
 where python >nul 2>&1
 if not errorlevel 1 (
-    :: Verify it's Python 3.10+
-    python -c "import sys; exit(0 if sys.version_info >= (3, 10) else 1)" 2>nul
+    python -c "import sys; exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)" 2>nul
     if not errorlevel 1 (
         set PYTHON_CMD=python
-        echo Found system Python.
+        echo Found compatible system Python.
         goto :have_python
+    ) else (
+        echo System Python found but not 3.10-3.12 (PyTorch/Open3D need 3.10-3.12^).
     )
 )
 
@@ -84,6 +85,14 @@ if exist "%PYTHON_DIR%\python.exe" (
 echo.
 
 :: ── Create virtual environment ──
+:: Check if existing venv uses the right Python version
+if exist "venv\Scripts\python.exe" (
+    "venv\Scripts\python.exe" -c "import sys; exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)" 2>nul
+    if errorlevel 1 (
+        echo Existing venv uses wrong Python version, recreating...
+        rmdir /s /q venv
+    )
+)
 if not exist "venv" (
     echo Creating virtual environment...
     "%PYTHON_CMD%" -m venv venv
