@@ -3524,6 +3524,11 @@ def main():
         _, state.scene_rot_x = imgui.slider_float("Rot X", state.scene_rot_x, -180, 180)
         _, state.scene_rot_y = imgui.slider_float("Rot Y", state.scene_rot_y, -180, 180)
         _, state.scene_rot_z = imgui.slider_float("Rot Z", state.scene_rot_z, -180, 180)
+        if imgui.button("Flip Up"):
+            state.scene_rot_x = (state.scene_rot_x + 180) % 360 - 180
+        imgui.same_line()
+        if imgui.button("Reset Rot"):
+            state.scene_rot_x = state.scene_rot_y = state.scene_rot_z = 0.0
         imgui.separator()
 
         # ── Export ──
