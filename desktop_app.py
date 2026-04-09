@@ -754,6 +754,7 @@ class AppState:
 
         # Point cloud / Mesh
         self.has_points = False
+        self.points_modified = False  # True after smooth/upscale (don't reset on conf change)
         self.has_mesh = False
         self.draw_mode = 0  # 0=points, 1=mesh, 2=wireframe, 3=normals, 4=shaded
         self.draw_modes = ['points', 'mesh', 'wireframe', 'normals', 'shaded']
@@ -1716,6 +1717,7 @@ def _run_smooth_preview(state, scene_gl):
             idx = np.random.choice(len(disp_pts), 200000, replace=False)
             disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
         scene_gl.set_points(disp_pts, disp_cols)
+        state.points_modified = True
         state.status = f"Smoothed: {len(points):,d} -> {len(pts):,d} points (radius={state.smooth_radius:.1f}x)"
     except Exception as e:
         state.status = f"Smooth preview failed: {e}"
@@ -2019,6 +2021,7 @@ def run_upscale_points(state, scene_gl):
                 disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
             scene_gl.set_points(disp_pts, disp_cols)
             state.has_points = True
+            state.points_modified = True
             state.status = f"Upscaled: {len(dense_pts):,d} dense points from {n_imgs} images"
 
     except Exception as e:
@@ -3306,7 +3309,8 @@ def main():
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
 
         # Live-update point cloud when confidence threshold changes
-        if changed_conf and state.scene is not None and state.has_points and not state.reconstructing:
+        # (only if cloud hasn't been modified by smooth/upscale)
+        if changed_conf and state.scene is not None and state.has_points and not state.reconstructing and not state.points_modified:
             try:
                 pts3d_list, confs_list = _extract_scene_data(state)
                 all_pts, all_cols = [], []
@@ -3448,6 +3452,7 @@ def main():
                     idx = np.random.choice(len(pts), 200000, replace=False)
                     pts, cols = pts[idx], cols[idx]
                 scene_gl.set_points(pts, cols)
+                state.points_modified = False
                 state.status = f"Restored {len(pts):,d} points"
             except Exception:
                 pass
