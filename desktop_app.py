@@ -3406,6 +3406,14 @@ def main():
 
         imgui.separator()
 
+        # ── Upscale ──
+        if state.has_points and state.scene is not None and not state.refining:
+            if imgui.button("Upscale Points (Mono Depth)", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=run_upscale_points, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
+
         imgui.separator()
 
         # ── Dense Mesh ──
