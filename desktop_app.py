@@ -958,27 +958,8 @@ def run_reconstruction(state, scene_gl):
                 del sys.modules[k]
 
             try:
-                # Patch BaseResolver to accept both crop_res and crop_resolution
-                # (checkpoint was saved with old param name)
-                import pow3r.model.inference as _pow3r_inf
-                _orig_init = _pow3r_inf.BaseResolver.__init__
-                def _patched_init(self, crop_resolution=None, fix_rays=False, crop_res=None, **kw):
-                    if crop_resolution is None and crop_res is not None:
-                        crop_resolution = crop_res
-                    _orig_init(self, crop_resolution=crop_resolution, fix_rays=fix_rays, **kw)
-                _pow3r_inf.BaseResolver.__init__ = _patched_init
-
                 from dust3r.utils.image import load_images as pow3r_load_images
                 from dust3r.utils.device import to_numpy
-                from pow3r.model.inference import AsymmetricSliding
-
-                # Patch gen_rays to handle both (2,) and (1,2) true_shape formats
-                import pow3r.datasets.utils.modalities as _mod
-                _orig_gen_rays = _mod._gen_rays
-                def _patched_gen_rays(true_shape, K):
-                    ts = np.asarray(true_shape).ravel()
-                    return _orig_gen_rays(ts, K)
-                _mod._gen_rays = _patched_gen_rays
 
                 state.status = "Loading Pow3R model..."
                 state.recon_frac = 0.1
@@ -994,169 +975,85 @@ def run_reconstruction(state, scene_gl):
                     print(f"  Downloading {ckpt_url}...")
                     urllib.request.urlretrieve(ckpt_url, ckpt_path)
 
-                # Load checkpoint — it contains the model definition as a string
-                # Don't construct AsymmetricSliding ourselves; let load_from_checkpoint do it
+                # Load raw Pow3R model from checkpoint (skip sliding window wrapper)
                 ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-                # The checkpoint might contain a pickled resolver, or just weights+definition
-                if isinstance(ckpt, dict) and 'definition' in ckpt:
-                    slider = AsymmetricSliding(crop_resolution=(384, 512))
-                    slider.load_from_checkpoint(ckpt)
-                else:
-                    # Checkpoint is the resolver object itself
-                    slider = ckpt
-                slider = slider.to('cuda').eval()
+                print(f"  Creating Pow3R model from checkpoint...")
+                model = eval(ckpt['definition'])
+                model.load_state_dict(ckpt['weights'])
+                model = model.to('cuda').eval()
 
                 state.status = "Loading images for Pow3R..."
                 state.recon_frac = 0.2
                 imgs = pow3r_load_images(state.image_paths, size=512, verbose=True)
 
-                # Pow3R sliding window requires camera_intrinsics in every view
-                for i, img_dict in enumerate(imgs):
-                    # Fix true_shape: Pow3R expects (H, W) tuple, load_images gives [[H, W]]
-                    ts = img_dict['true_shape']
-                    if isinstance(ts, np.ndarray):
-                        ts = ts.ravel()
-                    elif isinstance(ts, torch.Tensor):
-                        ts = ts.ravel()
-                    H_p, W_p = int(ts[0]), int(ts[1])
-                    img_dict['true_shape'] = np.array([[H_p, W_p]], dtype=np.int64)  # (1, 2) batch format
-
-                    if state.cached_cameras is not None and i < len(state.cached_cameras) and state.cached_cameras[i] is not None:
-                        # Use known cameras
-                        c2w, K, W_cam, H_cam = state.cached_cameras[i]
-                        K_scaled = K.copy().astype(np.float32)
-                        K_scaled[0, :] *= W_p / W_cam
-                        K_scaled[1, :] *= H_p / H_cam
-                        img_dict['camera_intrinsics'] = torch.from_numpy(K_scaled).float()
-                        img_dict['camera_pose'] = torch.from_numpy(c2w.astype(np.float32)).float()
-                    else:
-                        # Default intrinsics (approximate 60° FOV)
-                        focal = max(W_p, H_p) * 0.85
-                        K_default = torch.tensor([[focal, 0, W_p/2],
-                                                  [0, focal, H_p/2],
-                                                  [0, 0, 1]], dtype=torch.float32)
-                        img_dict['camera_intrinsics'] = K_default
-
-                # Run pairwise on all consecutive pairs
+                # Run pairwise — same as DUSt3R but using Pow3R model directly
                 state.status = "Running Pow3R inference..."
                 state.recon_frac = 0.4
                 from dust3r.utils.device import todevice
-
-                all_pts = []
-                all_colors = []
+                from dust3r.inference import inference as dust3r_inference
+                from dust3r.image_pairs import make_pairs
 
                 if len(imgs) == 1:
                     imgs = [imgs[0], _copy.deepcopy(imgs[0])]
 
-                # Process all pairs (matching demo_high_res.py pattern)
-                for pi in range(len(imgs)):
-                    for pj in range(pi + 1, min(pi + 3, len(imgs))):
-                        state.refine_progress = f"Pow3R pair {pi+1}-{pj+1}..."
-                        # Move views to CUDA (critical — demo does todevice before slider call)
-                        view1, view2 = todevice([imgs[pi], imgs[pj]], 'cuda')
+                pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
+                output = dust3r_inference(pairs, model, 'cuda', batch_size=1)
 
-                        with torch.no_grad():
-                            pred1, pred2 = to_numpy(slider(view1, view2))
+                # Use DUSt3R's global aligner for multi-view alignment
+                from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+                mode = GlobalAlignerMode.PointCloudOptimizer if len(imgs) > 2 else GlobalAlignerMode.PairViewer
+                scene = global_aligner(output, device='cuda', mode=mode)
 
-                        # Extract points (already numpy from to_numpy above)
-                        pts1 = pred1['pts3d'][0]  # (H, W, 3)
-                        pts2 = pred2['pts3d_in_other_view'][0]
-                        conf1 = pred1['conf'][0]
-                        conf2 = pred2['conf'][0]
+                # If we have cached cameras, use them as fixed poses
+                if state.cached_cameras is not None and len(state.cached_cameras) == len(imgs) and mode == GlobalAlignerMode.PointCloudOptimizer:
+                    state.status = "Setting known cameras..."
+                    known_poses = [torch.tensor(c[0], dtype=torch.float32) for c in state.cached_cameras]
+                    known_focals = [c[1][0, 0] for c in state.cached_cameras]
+                    scene.preset_pose(torch.stack(known_poses))
+                    scene.preset_focal(torch.tensor(known_focals))
+                    state.status = "Optimizing depth with fixed cameras..."
+                    scene.compute_global_alignment(init='known_poses', niter=state.niter1,
+                                                   schedule='linear', lr=0.01)
+                elif mode == GlobalAlignerMode.PointCloudOptimizer:
+                    state.status = "Pow3R global alignment..."
+                    scene.compute_global_alignment(init='mst', niter=state.niter1,
+                                                   schedule='linear', lr=0.01)
 
-                        # Get images from views (on CUDA, need to_numpy)
-                        img1 = to_numpy((view1['img'][0].permute(1, 2, 0) + 1) / 2)
-                        img2 = to_numpy((view2['img'][0].permute(1, 2, 0) + 1) / 2)
+                state.scene = scene
 
-                        # Resize images to match point map dimensions if needed
-                        H1, W1 = pts1.shape[:2]
-                        H2, W2 = pts2.shape[:2]
-                        if img1.shape[:2] != (H1, W1):
-                            from PIL import Image as PILImage
-                            img1 = np.array(PILImage.fromarray((img1 * 255).astype(np.uint8)).resize((W1, H1))).astype(np.float32) / 255.0
-                        if img2.shape[:2] != (H2, W2):
-                            from PIL import Image as PILImage
-                            img2 = np.array(PILImage.fromarray((img2 * 255).astype(np.uint8)).resize((W2, H2))).astype(np.float32) / 255.0
-
-                        # Filter by confidence
-                        conf_thr = max(np.percentile(conf1, 10), 1.0)
-                        m1 = conf1 > conf_thr
-                        m2 = conf2 > conf_thr
-
-                        all_pts.append(pts1[m1])
-                        all_colors.append((np.clip(img1[m1], 0, 1) * 255).astype(np.uint8))
-                        all_pts.append(pts2[m2])
-                        all_colors.append((np.clip(img2[m2], 0, 1) * 255).astype(np.uint8))
-
-                del slider, ckpt
-                torch.cuda.empty_cache()
+                # Extract point cloud (same as DUSt3R path)
+                rgbimg = scene.imgs
+                pts3d_raw = to_numpy(scene.get_pts3d())
+                all_pts = []
+                all_colors = []
+                for i in range(len(rgbimg)):
+                    p = pts3d_raw[i]
+                    all_pts.append(p.reshape(-1, 3))
+                    all_colors.append((rgbimg[i].reshape(-1, 3) * 255).astype(np.uint8))
 
                 if all_pts:
-                    points = np.concatenate(all_pts, axis=0).astype(np.float32)
+                    points = np.concatenate(all_pts, axis=0)
                     colors = np.concatenate(all_colors, axis=0)
-
-                    # Estimate cameras via PnP (same as DUSt3R pair viewer approach)
-                    # For now, use cached cameras if available, else estimate from first pair
-                    if state.cached_cameras is not None:
-                        cam_poses = [c[0] for c in state.cached_cameras]
-                    else:
-                        cam_poses = None
-
-                    # Build VGGTScene wrapper
-                    from app import VGGTScene
-                    from PIL import Image as PILImage
-
-                    # Rebuild per-view pts3d from the pair outputs
-                    # Use the first occurrence of each view
-                    imgs_np = []
-                    pts3d_all = []
-                    conf_all = []
-                    for i in range(len(state.image_paths)):
-                        img_pil = PILImage.open(state.image_paths[i]).convert('RGB')
-                        W_full, H_full = img_pil.size
-                        img_np = np.array(img_pil).astype(np.float32) / 255.0
-                        imgs_np.append(img_np)
-                        # Placeholder — pow3r pts are in pair frames, not per-view
-                        pts3d_all.append(np.zeros((H_full, W_full, 3), dtype=np.float32))
-                        conf_all.append(np.ones((H_full, W_full), dtype=np.float32))
-
-                    orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
-
-                    if cam_poses is not None:
-                        extrinsic = np.zeros((len(cam_poses), 3, 4), dtype=np.float32)
-                        intrinsic_all = []
-                        for i, (c2w, K, W_c, H_c) in enumerate(state.cached_cameras):
-                            w2c = np.linalg.inv(c2w)
-                            extrinsic[i] = w2c[:3, :].astype(np.float32)
-                            intrinsic_all.append(K.astype(np.float32))
-                        intrinsic_all = np.stack(intrinsic_all)
-                    else:
-                        # Dummy cameras
-                        extrinsic = np.stack([np.eye(4)[:3, :].astype(np.float32)] * len(imgs_np))
-                        K_dummy = np.eye(3, dtype=np.float32)
-                        K_dummy[0, 0] = K_dummy[1, 1] = 500
-                        K_dummy[0, 2] = orig_sizes[0][0] / 2
-                        K_dummy[1, 2] = orig_sizes[0][1] / 2
-                        intrinsic_all = np.stack([K_dummy] * len(imgs_np))
-
-                    state.scene = VGGTScene(imgs_np, extrinsic, intrinsic_all,
-                                            pts3d_all, conf_all, orig_sizes)
-
-                    # Display the combined point cloud
                     if len(points) > 200000:
                         idx = np.random.choice(len(points), 200000, replace=False)
-                        scene_gl.set_points(points[idx], colors[idx])
-                    else:
-                        scene_gl.set_points(points, colors)
+                        points, colors = points[idx], colors[idx]
+                    scene_gl.set_points(points, colors)
                     state.has_points = True; state.needs_recenter = True
 
-                    if cam_poses:
+                # Show cameras
+                try:
+                    c2w_all = scene.get_im_poses().detach().cpu().numpy()
+                    cam_poses = [c2w_all[i] for i in range(len(c2w_all))]
+                    if cam_poses and len(points) > 0:
                         ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
                         scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+                except Exception:
+                    pass
 
-                    state.status = f"Pow3R: {len(points):,d} points from {len(state.image_paths)} images"
-                else:
-                    state.status = "Pow3R produced no points"
+                state.status = f"Pow3R: {len(points):,d} points from {len(imgs)} images"
+
+                del model, ckpt
+                torch.cuda.empty_cache()
 
             finally:
                 sys.path = _saved_path
