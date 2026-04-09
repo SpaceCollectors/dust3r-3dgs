@@ -972,6 +972,14 @@ def run_reconstruction(state, scene_gl):
                 from dust3r.utils.device import to_numpy
                 from pow3r.model.inference import AsymmetricSliding
 
+                # Patch gen_rays to handle both (2,) and (1,2) true_shape formats
+                import pow3r.datasets.utils.modalities as _mod
+                _orig_gen_rays = _mod._gen_rays
+                def _patched_gen_rays(true_shape, K):
+                    ts = np.asarray(true_shape).ravel()
+                    return _orig_gen_rays(ts, K)
+                _mod._gen_rays = _patched_gen_rays
+
                 state.status = "Loading Pow3R model..."
                 state.recon_frac = 0.1
 
@@ -1011,7 +1019,7 @@ def run_reconstruction(state, scene_gl):
                     elif isinstance(ts, torch.Tensor):
                         ts = ts.ravel()
                     H_p, W_p = int(ts[0]), int(ts[1])
-                    img_dict['true_shape'] = np.array([H_p, W_p], dtype=np.int64)
+                    img_dict['true_shape'] = np.array([[H_p, W_p]], dtype=np.int64)  # (1, 2) batch format
 
                     if state.cached_cameras is not None and i < len(state.cached_cameras) and state.cached_cameras[i] is not None:
                         # Use known cameras
