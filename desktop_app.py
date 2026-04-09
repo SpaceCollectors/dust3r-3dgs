@@ -958,6 +958,16 @@ def run_reconstruction(state, scene_gl):
                 del sys.modules[k]
 
             try:
+                # Patch BaseResolver to accept both crop_res and crop_resolution
+                # (checkpoint was saved with old param name)
+                import pow3r.model.inference as _pow3r_inf
+                _orig_init = _pow3r_inf.BaseResolver.__init__
+                def _patched_init(self, crop_resolution=None, fix_rays=False, crop_res=None, **kw):
+                    if crop_resolution is None and crop_res is not None:
+                        crop_resolution = crop_res
+                    _orig_init(self, crop_resolution=crop_resolution, fix_rays=fix_rays, **kw)
+                _pow3r_inf.BaseResolver.__init__ = _patched_init
+
                 from dust3r.utils.image import load_images as pow3r_load_images
                 from dust3r.utils.device import to_numpy
                 from pow3r.model.inference import AsymmetricSliding
@@ -1032,10 +1042,23 @@ def run_reconstruction(state, scene_gl):
                         pts2 = to_numpy(pred2['pts3d_in_other_view'][0])
                         conf1 = to_numpy(pred1['conf'][0])
                         conf2 = to_numpy(pred2['conf'][0])
-                        img1 = to_numpy(view1['img'].permute(0, 2, 3, 1)[0])
-                        img2 = to_numpy(view2['img'].permute(0, 2, 3, 1)[0])
-                        img1 = (img1 + 1) / 2  # [-1,1] -> [0,1]
-                        img2 = (img2 + 1) / 2
+
+                        # Get images at matching resolution from input views
+                        # The view['img'] is (1, 3, H, W) in [-1, 1]
+                        img1_t = view1['img'][0].permute(1, 2, 0)  # (H, W, 3)
+                        img2_t = view2['img'][0].permute(1, 2, 0)
+                        img1 = to_numpy((img1_t + 1) / 2)  # [0, 1]
+                        img2 = to_numpy((img2_t + 1) / 2)
+
+                        # Resize images to match point map dimensions if needed
+                        H1, W1 = pts1.shape[:2]
+                        H2, W2 = pts2.shape[:2]
+                        if img1.shape[:2] != (H1, W1):
+                            from PIL import Image as PILImage
+                            img1 = np.array(PILImage.fromarray((img1 * 255).astype(np.uint8)).resize((W1, H1))).astype(np.float32) / 255.0
+                        if img2.shape[:2] != (H2, W2):
+                            from PIL import Image as PILImage
+                            img2 = np.array(PILImage.fromarray((img2 * 255).astype(np.uint8)).resize((W2, H2))).astype(np.float32) / 255.0
 
                         # Filter by confidence
                         conf_thr = max(np.percentile(conf1, 10), 1.0)
