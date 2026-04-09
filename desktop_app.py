@@ -962,6 +962,14 @@ def run_reconstruction(state, scene_gl):
                 from dust3r.utils.device import to_numpy
                 from pow3r.model.model import Pow3R  # needed for eval(ckpt['definition'])
 
+                # Patch CroCo Block.forward to accept **kw (Pow3R passes rays/depth)
+                from croco.models.blocks import Block as _CroCoBlock
+                _orig_block_fwd = _CroCoBlock.forward
+                if 'kw' not in _orig_block_fwd.__code__.co_varnames:
+                    def _patched_block_fwd(self, x, xpos, **kw):
+                        return _orig_block_fwd(self, x, xpos)
+                    _CroCoBlock.forward = _patched_block_fwd
+
                 state.status = "Loading Pow3R model..."
                 state.recon_frac = 0.1
 
