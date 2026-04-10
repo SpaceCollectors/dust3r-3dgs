@@ -2091,16 +2091,39 @@ def run_densify_colmap(state, scene_gl):
             filter_min_ncc=state.pm_filter_min_ncc,
             existing_pts=existing,
             colmap_workdir=getattr(state, '_colmap_workdir', None))
-        dense_pts, dense_cols = densify_colmap(
+        dense_pts, dense_cols, colmap_cams = densify_colmap(
             state.image_paths, c2w_list, K_list, progress_fn=progress, **pm_opts)
 
         if len(dense_pts) > 0:
             # REPLACE all point data with the dense cloud only
-            # (COLMAP runs its own SfM so the dense cloud is in a different
-            # coordinate frame — mixing with DUSt3R sparse would be wrong)
             state.pts3d_list = [dense_pts]
             state.confs_list = [np.ones(len(dense_pts), dtype=np.float32) * 10.0]
             state._dense_colors = dense_cols
+
+            # Update scene with COLMAP cameras (same frame as the dense cloud)
+            if colmap_cams and len(colmap_cams) > 0:
+                from app import VGGTScene
+                from PIL import Image as PILImage
+                imgs_np = []
+                for p in state.image_paths:
+                    img = PILImage.open(p).convert('RGB')
+                    imgs_np.append(np.array(img).astype(np.float32) / 255.0)
+                extrinsic = np.zeros((len(colmap_cams), 3, 4), dtype=np.float32)
+                intrinsic_all = []
+                for i, (c2w, K, W, H) in enumerate(colmap_cams):
+                    w2c = np.linalg.inv(c2w)
+                    extrinsic[i] = w2c[:3, :].astype(np.float32)
+                    intrinsic_all.append(K)
+                orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
+                state.scene = VGGTScene(imgs_np, extrinsic, np.stack(intrinsic_all),
+                                        [dense_pts], [np.ones(len(dense_pts), dtype=np.float32) * 10],
+                                        orig_sizes)
+                state.cached_cameras = colmap_cams
+                # Update camera display
+                cam_poses = [c2w for c2w, K, W, H in colmap_cams]
+                ext = np.linalg.norm(dense_pts.max(0) - dense_pts.min(0))
+                scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+                print(f"  Updated scene with {len(colmap_cams)} COLMAP cameras")
 
             # Display the dense cloud
             disp_pts, disp_cols = dense_pts, dense_cols

@@ -1105,7 +1105,7 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
         # Step 5: Load the fused point cloud
         if not os.path.exists(output_ply):
             print("  ERROR: fused.ply not found")
-            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8), None
 
         import open3d as o3d
         pcd = o3d.io.read_point_cloud(output_ply)
@@ -1116,12 +1116,48 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             cols = np.full((len(pts), 3), 180, dtype=np.uint8)
 
         print(f"  Dense cloud: {len(pts):,d} points")
-        return pts, cols
+
+        # Read COLMAP cameras so caller can update scene
+        colmap_cameras = None
+        try:
+            import pycolmap
+            rec = pycolmap.Reconstruction(sparse_sub)
+            colmap_cameras = []
+            name_to_idx = {os.path.basename(p): i for i, p in enumerate(image_paths)}
+            for img_id, image in sorted(rec.images.items()):
+                name = image.name
+                if name not in name_to_idx:
+                    continue
+                cam = rec.cameras[image.camera_id]
+                K = cam.calibration_matrix().astype(np.float32)
+                # Get c2w
+                try:
+                    cfw = image.cam_from_world
+                    if callable(cfw):
+                        w2c_34 = np.array(cfw().matrix())
+                    elif hasattr(cfw, 'matrix'):
+                        w2c_34 = np.array(cfw.matrix())
+                    else:
+                        w2c_34 = np.array(cfw)
+                except Exception:
+                    w2c_34 = np.eye(3, 4)
+                w2c = np.eye(4, dtype=np.float32)
+                w2c[:3, :] = w2c_34.astype(np.float32)
+                c2w = np.linalg.inv(w2c).astype(np.float32)
+                colmap_cameras.append((name_to_idx[name], c2w, K, cam.width, cam.height))
+            # Sort by original image index
+            colmap_cameras.sort(key=lambda x: x[0])
+            colmap_cameras = [(c2w, K, W, H) for _, c2w, K, W, H in colmap_cameras]
+            print(f"  Read {len(colmap_cameras)} COLMAP cameras")
+        except Exception as e:
+            print(f"  Could not read COLMAP cameras: {e}")
+
+        return pts, cols, colmap_cameras
 
     except Exception as e:
         print(f"  COLMAP dense failed: {e}")
         import traceback; traceback.print_exc()
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8), None
     finally:
         if not reuse:
             shutil.rmtree(workdir, ignore_errors=True)
