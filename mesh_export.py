@@ -15,7 +15,7 @@ import struct
 def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
                       intrinsics_list=None, min_conf=2.0,
                       poisson_depth=8, normal_radius=0.03, trim_percentile=5,
-                      mode='reprojected', hole_cap_size=50):
+                      mode='reprojected', hole_cap_size=50, dense_colors=None):
     """Create mesh from multi-view point clouds.
 
     mode='reprojected': Voxel-merge all points, shared vertex grid triangulation.
@@ -24,7 +24,7 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
     hole_cap_size:      Max boundary edges to close (0=disable, via PyMeshLab).
     """
     if mode == 'poisson':
-        all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf)
+        all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf, dense_colors=dense_colors)
         if len(all_points) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3), dtype=np.uint8)
         import open3d as o3d
@@ -70,7 +70,7 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
         c = (mesh_colors * 255).clip(0, 255).astype(np.uint8)
         print(f"  Poisson mesh: {len(v):,d} verts, {len(f):,d} faces")
     elif mode == 'delaunay':
-        all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf)
+        all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf, dense_colors=dense_colors)
         if len(all_points) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3), dtype=np.uint8)
         import open3d as o3d
@@ -536,7 +536,7 @@ def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf):
     """Voxel-dedup all points, then ball-pivot into a single mesh."""
     import open3d as o3d
 
-    all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf)
+    all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf, dense_colors=dense_colors)
     if len(all_points) == 0:
         return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3), dtype=np.uint8)
     print(f"  Combined: {len(all_points):,d} points")

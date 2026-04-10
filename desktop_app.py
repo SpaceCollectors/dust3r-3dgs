@@ -2450,7 +2450,8 @@ def run_dense_mesh(state, scene_gl):
                 cam2world_list=cam_poses, min_conf=mesh_min_conf,
                 mode=mesh_mode, hole_cap_size=state.hole_cap_size,
                 poisson_depth=state.poisson_depth_val,
-                trim_percentile=state.poisson_trim)
+                trim_percentile=state.poisson_trim,
+                dense_colors=getattr(state, '_dense_colors', None))
 
         if len(faces) > 0:
             state.mesh_data = (verts, faces, colors)
