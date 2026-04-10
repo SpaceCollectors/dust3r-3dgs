@@ -754,6 +754,8 @@ class AppState:
         self.recon_frac = 0.0  # 0.0–1.0 progress fraction
         self.recon_thread = None
 
+        self.mask_sky = False  # auto-detect and mask sky pixels
+
         # Point cloud / Mesh
         self.has_points = False
         self.points_modified = False  # True after smooth/upscale (don't reset on conf change)
@@ -1375,6 +1377,30 @@ print('SUCCESS')
 
         # Recentering handled by main loop via needs_recenter flag
 
+        # Sky masking: zero confidence for sky pixels
+        if state.mask_sky and state.has_points:
+            try:
+                state.status = "Detecting sky..."
+                sky_masks = _detect_sky_masks(state.image_paths)
+                if sky_masks:
+                    pts3d_list, confs_list = _extract_scene_data(state)
+                    for i in range(min(len(sky_masks), len(confs_list))):
+                        sky = sky_masks[i]
+                        c = confs_list[i]
+                        if c is not None and c.ndim == 2:
+                            # Resize sky mask to match confidence map if needed
+                            if sky.shape != c.shape:
+                                from PIL import Image as PILImage
+                                sky = np.array(PILImage.fromarray(sky).resize(
+                                    (c.shape[1], c.shape[0]), PILImage.NEAREST))
+                            c[sky] = 0
+                            confs_list[i] = c
+                    state.confs_list = confs_list
+                    n_masked = sum(m.sum() for m in sky_masks)
+                    print(f"  Sky masked: {n_masked:,d} pixels across {len(sky_masks)} images")
+            except Exception as e:
+                print(f"  Sky masking failed: {e}")
+
         # Align to reference frame: if this is the first reconstruction, cache cameras.
         # If subsequent reconstruction, align to the cached cameras via Procrustes.
         if state.has_points and state.scene is not None:
@@ -1723,6 +1749,44 @@ def _align_to_cached_cameras(pts3d_list, cam_poses_c2w, cached_cameras):
     # Use cached cameras directly
     new_c2w = [cached_cameras[i][0] for i in range(len(cached_cameras))]
     return pts3d_list, new_c2w
+
+
+def _detect_sky_masks(image_paths):
+    """Detect sky pixels in images using SegFormer semantic segmentation.
+    Returns list of (H, W) boolean masks where True = sky."""
+    try:
+        from transformers import pipeline as hf_pipeline
+        from PIL import Image as PILImage
+        import torch
+
+        print("  Loading sky segmentation model...")
+        seg = hf_pipeline('image-segmentation', model='nvidia/segformer-b0-finetuned-ade-20k',
+                          device='cuda' if torch.cuda.is_available() else 'cpu')
+
+        sky_masks = []
+        for i, path in enumerate(image_paths):
+            img = PILImage.open(path).convert('RGB')
+            results = seg(img)
+
+            # Find sky segment (label 'sky' in ADE20K)
+            sky_mask = np.zeros((img.height, img.width), dtype=bool)
+            for r in results:
+                if 'sky' in r['label'].lower():
+                    mask = np.array(r['mask'].convert('L')) > 128
+                    sky_mask |= mask
+
+            sky_masks.append(sky_mask)
+            n_sky = sky_mask.sum()
+            print(f"    Image {i+1}: {n_sky:,d} sky pixels ({n_sky * 100 // max(sky_mask.size, 1)}%)")
+
+        del seg
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return sky_masks
+
+    except Exception as e:
+        print(f"  Sky detection failed: {e}")
+        return None
 
 
 def _extract_scene_data(state):
@@ -3280,6 +3344,7 @@ def main():
             _, state.niter2 = imgui.input_int("Refine Iters", state.niter2, 50, 100)
 
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
+        _, state.mask_sky = imgui.checkbox("Mask Sky", state.mask_sky)
 
         # Live-update point cloud when confidence threshold changes
         # (only if cloud hasn't been modified by smooth/upscale)
