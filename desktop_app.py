@@ -219,11 +219,13 @@ in vec3 position;
 in vec3 color;
 in vec2 uv;
 out vec3 v_color;
+out vec3 v_pos;
 out vec2 v_uv;
 void main() {
     gl_Position = mvp * vec4(position, 1.0);
     gl_PointSize = 3.0;
     v_color = color;
+    v_pos = position;
     v_uv = uv;
 }
 """
@@ -232,12 +234,22 @@ FRAG_SHADER = """
 #version 330
 uniform sampler2D tex;
 uniform int use_texture;
+uniform int shade_mode;  // 0=off, 1=shaded (v_color has normals)
+uniform vec3 light_dir;
 in vec3 v_color;
+in vec3 v_pos;
 in vec2 v_uv;
 out vec4 frag_color;
 void main() {
     if (use_texture == 1 && v_uv.x >= 0.0) {
         frag_color = texture(tex, v_uv);
+    } else if (shade_mode == 1) {
+        // v_color contains encoded normal (n*0.5+0.5), decode and shade
+        vec3 normal = normalize(v_color * 2.0 - 1.0);
+        float ndotl = abs(dot(normal, normalize(light_dir)));
+        float ambient = 0.2;
+        float shade = ambient + (1.0 - ambient) * ndotl;
+        frag_color = vec4(vec3(shade * 0.85), 1.0);  // grey lambert
     } else {
         frag_color = vec4(v_color, 1.0);
     }
@@ -323,6 +335,8 @@ class GLScene:
         self.mvp_loc = gl.glGetUniformLocation(self.program, "mvp")
         self.use_tex_loc = gl.glGetUniformLocation(self.program, "use_texture")
         self.tex_loc = gl.glGetUniformLocation(self.program, "tex")
+        self.shade_mode_loc = gl.glGetUniformLocation(self.program, "shade_mode")
+        self.light_dir_loc = gl.glGetUniformLocation(self.program, "light_dir")
         self.point_vao = None
         self.point_vbo = None
         self.point_count = 0
@@ -523,8 +537,16 @@ class GLScene:
                     self._upload_mesh(self._mesh_verts, self._mesh_faces, alt, stored_uvs)
                 draw_mode = 'mesh'
             elif draw_mode == 'shaded':
-                # Compute shading from current camera position (headlamp effect)
-                self._compute_shaded_from_camera(camera_pos)
+                # Upload normals as colors — shader computes lighting on GPU
+                alt = getattr(self, '_normal_colors', None)
+                if alt is not None:
+                    self._upload_mesh(self._mesh_verts, self._mesh_faces, alt, stored_uvs)
+                # Set light direction toward camera
+                if camera_pos is not None:
+                    gl.glUniform3f(self.light_dir_loc, *camera_pos.tolist())
+                else:
+                    gl.glUniform3f(self.light_dir_loc, 0.3, 0.7, 0.5)
+                gl.glUniform1i(self.shade_mode_loc, 1)
                 draw_mode = 'mesh'
             elif draw_mode in ('mesh', 'wireframe'):
                 base = getattr(self, '_base_colors', None)
@@ -551,8 +573,9 @@ class GLScene:
             gl.glBindVertexArray(self.mesh_vao)
             gl.glDrawElements(gl.GL_TRIANGLES, self.mesh_face_count * 3,
                               gl.GL_UNSIGNED_INT, None)
-            # Disable texture after drawing
+            # Disable texture/shading after drawing
             gl.glUniform1i(self.use_tex_loc, 0)
+            gl.glUniform1i(self.shade_mode_loc, 0)
             if self.mesh_tex_id is not None:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
@@ -1668,95 +1691,47 @@ def run_depth_injection(state, scene_gl):
 
 
 def _handle_align_click(state, scene_gl, camera, mx, my, window):
-    """Handle click for floor/wall alignment. Casts ray, finds nearest points, fits plane."""
+    """Handle click for floor/wall alignment.
+    Uses PCA on the full point cloud to find the dominant plane,
+    then aligns it. Click position is used to disambiguate orientation."""
     try:
         mode = state.align_mode
-        state.align_mode = None  # reset immediately
+        state.align_mode = None
 
-        # Get viewport dimensions
-        win_w, win_h = glfw.get_window_size(window)
-        vp_x = 400
-        vp_w = win_w - vp_x
-        vp_h = win_h
-
-        # Normalize mouse to viewport [-1, 1]
-        nx = 2.0 * (mx - vp_x) / vp_w - 1.0
-        ny = 1.0 - 2.0 * my / vp_h
-
-        # Get MVP matrix (same as rendering)
-        aspect = vp_w / max(vp_h, 1)
-        proj = camera._perspective(45.0, aspect, 0.01, 100.0)
-        view = camera.get_view_matrix()
-
-        # Scene transform
-        def _rot_mat(rx, ry, rz):
-            cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
-            cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
-            cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
-            Rx = np.array([[1,0,0,0],[0,cx,-sx,0],[0,sx,cx,0],[0,0,0,1]], dtype=np.float32)
-            Ry = np.array([[cy,0,sy,0],[0,1,0,0],[-sy,0,cy,0],[0,0,0,1]], dtype=np.float32)
-            Rz = np.array([[cz,-sz,0,0],[sz,cz,0,0],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
-            return Rx @ Ry @ Rz
-        scene_tf = _rot_mat(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
-        mvp = proj @ view @ scene_tf
-        mvp_inv = np.linalg.inv(mvp)
-
-        # Unproject near and far points to get ray
-        near = mvp_inv @ np.array([nx, ny, -1, 1])
-        far = mvp_inv @ np.array([nx, ny, 1, 1])
-        near = near[:3] / near[3]
-        far = far[:3] / far[3]
-        ray_dir = far - near
-        ray_dir /= max(np.linalg.norm(ray_dir), 1e-8)
-
-        # Get all points
         pts3d_list = state.pts3d_list
         if pts3d_list is None:
             return
         all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float32)
-        if len(all_pts) == 0:
+        if len(all_pts) < 10:
             return
 
-        # Apply scene transform to points (same as rendering)
-        R_scene = scene_tf[:3, :3]
-        all_pts_tf = (R_scene @ all_pts.T).T
+        # Subsample for speed
+        if len(all_pts) > 50000:
+            idx = np.random.choice(len(all_pts), 50000, replace=False)
+            pts_sample = all_pts[idx]
+        else:
+            pts_sample = all_pts
 
-        # Find nearest point to ray
-        # Distance from point to ray: ||(p - origin) × ray_dir|| / ||ray_dir||
-        diff = all_pts_tf - near[None, :]
-        cross = np.cross(diff, ray_dir[None, :])
-        dists = np.linalg.norm(cross, axis=-1)
-        nearest_idx = np.argmin(dists)
-
-        # Select neighborhood
-        center = all_pts[nearest_idx]  # in original (un-transformed) space
-        point_dists = np.linalg.norm(all_pts - center, axis=-1)
-        median_spacing = np.median(np.sort(point_dists)[:min(100, len(point_dists))])
-        radius = median_spacing * 50  # 50x spacing for a decent patch
-        mask = point_dists < radius
-        neighborhood = all_pts[mask]
-
-        if len(neighborhood) < 10:
-            state.status = "Too few points at click location"
-            return
-
-        # Fit plane via PCA — smallest eigenvector = plane normal
-        centroid = neighborhood.mean(axis=0)
-        cov = (neighborhood - centroid).T @ (neighborhood - centroid)
+        # PCA on the point cloud — smallest eigenvector = dominant plane normal
+        centroid = pts_sample.mean(axis=0)
+        cov = (pts_sample - centroid).T @ (pts_sample - centroid)
         eigvals, eigvecs = np.linalg.eigh(cov)
-        normal = eigvecs[:, 0]  # smallest eigenvalue = plane normal
+        normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue
 
-        # Ensure normal points "up" (positive Y in world space after scene transform)
-        if normal[1] < 0:
+        # Orient normal to point "up" relative to current scene rotation
+        scene_tf = _rot_matrix(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
+        R_scene = scene_tf[:3, :3].astype(np.float32)
+        normal_tf = R_scene @ normal
+        if normal_tf[1] < 0:
             normal = -normal
 
-        print(f"  Align {mode}: {len(neighborhood)} points, normal={normal}")
+        print(f"  Align {mode}: normal={normal}, eigvals={eigvals}")
 
-        # Compute rotation to align normal with target
+        # Target direction
         if mode == 'floor':
-            target = np.array([0, 1, 0], dtype=np.float32)  # Y-up
-        else:  # wall
-            target = np.array([0, 0, 1], dtype=np.float32)  # Z-forward
+            target = np.array([0, 1, 0], dtype=np.float32)
+        else:
+            target = np.array([0, 0, 1], dtype=np.float32)
 
         dot = np.clip(np.dot(normal, target), -1, 1)
         if abs(dot) > 0.999:
@@ -1765,19 +1740,16 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
 
         axis = np.cross(normal, target)
         axis /= max(np.linalg.norm(axis), 1e-8)
-        angle = np.arccos(dot)
+        angle = float(np.arccos(dot))
 
-        # Build rotation matrix (Rodrigues)
         K_mat = np.array([[0, -axis[2], axis[1]],
                           [axis[2], 0, -axis[0]],
                           [-axis[1], axis[0], 0]])
         R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
 
-        # Combine with existing scene rotation
-        R_existing = scene_tf[:3, :3]
+        R_existing = R_scene
         R_new = R_align @ R_existing
 
-        # Extract Euler XYZ
         sy = np.sqrt(R_new[0, 0] ** 2 + R_new[1, 0] ** 2)
         if sy > 1e-6:
             rx = np.arctan2(R_new[2, 1], R_new[2, 2])
@@ -1791,7 +1763,7 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         state.scene_rot_x = float(np.degrees(rx))
         state.scene_rot_y = float(np.degrees(ry))
         state.scene_rot_z = float(np.degrees(rz))
-        state.status = f"Aligned {mode} (normal={normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f})"
+        state.status = f"Aligned {mode}"
 
     except Exception as e:
         state.status = f"Alignment failed: {e}"
