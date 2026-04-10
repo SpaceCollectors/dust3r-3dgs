@@ -984,8 +984,7 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                                '--input_path', prior_dir,
                                '--output_path', sparse_dir,
                                '--Mapper.ba_refine_focal_length', '1',
-                               '--Mapper.ba_refine_extra_params', '0',
-                               '--Mapper.fix_existing_images', '0'],
+                               '--Mapper.ba_refine_extra_params', '0'],
                               capture_output=True, text=True, timeout=600)
                 if r.stderr:
                     for line in r.stderr.split('\n'):
@@ -1076,6 +1075,8 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                 t = re.search(r'Total: ([\d.]+)s', line)
                 if t:
                     print(f"    {t.group(1)}s")
+            elif 'Error' in line or 'Check failed' in line or 'FATAL' in line:
+                print(f"  ERROR: {line}")
         proc.wait(timeout=1800)
         if proc.returncode != 0:
             raise RuntimeError(f"PatchMatch failed (code {proc.returncode})")
