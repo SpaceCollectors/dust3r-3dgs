@@ -3728,6 +3728,9 @@ def main():
             _, state.niter1 = imgui.input_int("Coarse Iters", state.niter1, 50, 100)
             _, state.niter2 = imgui.input_int("Refine Iters", state.niter2, 50, 100)
 
+        if state.backends[state.backend_idx] == 'pow3r':
+            _, state.niter1 = imgui.input_int("Iterations##pow3r", state.niter1, 50, 100)
+
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
         _, state.mask_sky = imgui.checkbox("Mask Sky", state.mask_sky)
         _, state.mask_prompt = imgui.input_text("Isolate Subject", state.mask_prompt, 256)
