@@ -1752,13 +1752,20 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         nearest_idx = np.argmin(ray_dists)
         hit_pt = all_pts[nearest_idx]  # in original space
 
-        # Select neighborhood around hit point (in original space)
-        point_dists = np.linalg.norm(all_pts - hit_pt, axis=-1)
-        # Auto radius: use align_radius * median of nearest 100 points
-        sorted_dists = np.sort(point_dists)
-        median_local = float(np.median(sorted_dists[1:min(100, len(sorted_dists))]))
-        radius = median_local * state.align_radius
-        mask = point_dists < radius
+        # Select points that project within the circle radius (screen space)
+        circle_px = 40  # must match the visual circle
+        # Project all display-space points to screen
+        pts_h = np.column_stack([pts_display, np.ones(len(pts_display))]).astype(np.float64)
+        clip = (mvp.astype(np.float64) @ pts_h.T).T
+        w = clip[:, 3]
+        valid_w = np.abs(w) > 1e-6
+        ndc_x = np.zeros(len(all_pts)); ndc_y = np.zeros(len(all_pts))
+        ndc_x[valid_w] = clip[valid_w, 0] / w[valid_w]
+        ndc_y[valid_w] = clip[valid_w, 1] / w[valid_w]
+        screen_x = (ndc_x + 1) * 0.5 * vp_w + vp_x
+        screen_y = (1 - ndc_y) * 0.5 * vp_h
+        screen_dist = np.sqrt((screen_x - mx) ** 2 + (screen_y - my) ** 2)
+        mask = valid_w & (screen_dist < circle_px)
         neighborhood = all_pts[mask]
 
         print(f"  Hit point: {hit_pt}, radius: {radius:.6f} ({state.align_radius}x), {mask.sum()} points selected")
@@ -3792,8 +3799,6 @@ def main():
 
         # Scene orientation
         imgui.text("Orientation")
-        _, state.align_radius = imgui.input_float("Align Radius", state.align_radius, 5.0, 10.0)
-        state.align_radius = max(0.5, state.align_radius)
         if state.align_mode:
             imgui.text_colored(f"Click on the {state.align_mode} to align (yellow = selected)", 1.0, 1.0, 0.3)
             if imgui.button("Cancel"):
@@ -4049,6 +4054,15 @@ def main():
         # ── In-app debug image viewer ──
         debug_imgs.flush()
         debug_imgs.draw_window("Debug Views")
+
+        # ── Align cursor circle ──
+        if state.align_mode:
+            mx_cur, my_cur = glfw.get_cursor_pos(window)
+            if mx_cur > vp_x:  # only in viewport area
+                draw_list = imgui.get_foreground_draw_list()
+                circle_px = 40  # fixed pixel radius on screen
+                draw_list.add_circle(mx_cur, my_cur, circle_px, imgui.get_color_u32_rgba(1, 1, 0, 0.8), 32, 2.0)
+                draw_list.add_circle_filled(mx_cur, my_cur, 3, imgui.get_color_u32_rgba(1, 1, 0, 1.0), 12)
 
         # ── Console Overlay ──
         if state.show_console:
