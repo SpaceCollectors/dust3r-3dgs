@@ -1782,24 +1782,36 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         eigvals, eigvecs = np.linalg.eigh(cov)
         normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue = plane normal
 
-        # Target direction
+        # Transform normal to current display space (where existing rotation is applied)
+        normal_display = R_scene @ normal
+        normal_display /= max(np.linalg.norm(normal_display), 1e-8)
+
         if mode == 'floor':
+            # Floor: align the surface normal to Y-up (full 3D rotation)
             target = np.array([0, 1, 0], dtype=np.float32)
+            if np.dot(normal_display, target) < 0:
+                normal_display = -normal_display
         else:
+            # Wall: only rotate around Y axis (preserve floor alignment)
+            # Project normal onto XZ plane (remove Y component)
+            normal_display[1] = 0
+            norm_len = np.linalg.norm(normal_display)
+            if norm_len < 0.01:
+                state.status = "Wall is parallel to Y — can't align"
+                return
+            normal_display /= norm_len
             target = np.array([0, 0, 1], dtype=np.float32)
+            if np.dot(normal_display, target) < 0:
+                normal_display = -normal_display
 
-        # Orient normal toward target hemisphere
-        if np.dot(normal, target) < 0:
-            normal = -normal
+        print(f"  Align {mode}: {len(neighborhood)} pts, normal_display={normal_display}")
 
-        print(f"  Align {mode}: hit={hit_pt}, {len(neighborhood)} pts, normal={normal}")
-
-        dot = np.clip(np.dot(normal, target), -1, 1)
+        dot = np.clip(np.dot(normal_display, target), -1, 1)
         if abs(dot) > 0.999:
             state.status = f"Already aligned to {mode}"
             return
 
-        axis = np.cross(normal, target)
+        axis = np.cross(normal_display, target)
         axis /= max(np.linalg.norm(axis), 1e-8)
         angle = float(np.arccos(dot))
 
@@ -1808,7 +1820,7 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
                           [-axis[1], axis[0], 0]])
         R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
 
-        # Combine: new = align @ existing
+        # Combine: new = align_in_display_space @ existing
         R_new = R_align @ R_scene
 
         # Extract Euler XYZ
