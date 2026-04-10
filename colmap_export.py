@@ -162,19 +162,27 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
     all_colors = []
     all_confs_flat = []
 
-    for i in range(n_images):
-        conf = confs_list[i]
-        if _is_vggt_scene(scene) or _is_mast3r_scene(scene):
-            mask = conf > min_conf_thr
-        else:
-            # DUSt3R: threshold raw confidence by median
-            mask = conf > np.median(conf)
+    for i in range(min(n_images, len(pts3d_list))):
+        pts = pts3d_list[i]
+        conf = confs_list[i] if i < len(confs_list) else None
 
-        pts = pts3d_list[i][mask]
-        colors = (np.clip(imgs[i][mask], 0, 1) * 255).astype(np.uint8)
-        all_pts.append(pts)
-        all_colors.append(colors)
-        all_confs_flat.append(conf[mask])
+        if conf is None:
+            continue
+
+        # Skip if pts and image shapes don't match (e.g., dense cloud vs small image)
+        if i < len(imgs) and pts.ndim == 3 and pts.shape[:2] == imgs[i].shape[:2]:
+            if _is_vggt_scene(scene) or _is_mast3r_scene(scene):
+                mask = conf > min_conf_thr
+            else:
+                mask = conf > np.median(conf)
+            all_pts.append(pts[mask])
+            all_colors.append((np.clip(imgs[i][mask], 0, 1) * 255).astype(np.uint8))
+            all_confs_flat.append(conf[mask])
+        elif pts.ndim == 2:
+            # Flat array (e.g., COLMAP dense cloud) — skip for COLMAP export
+            continue
+        else:
+            continue
 
     if len(all_pts) > 0:
         all_pts = np.concatenate(all_pts, axis=0)

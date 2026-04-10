@@ -821,6 +821,8 @@ class AppState:
 
         # Scene orientation transform (applied in shader)
         self.scene_rot_x = 180.0  # degrees (DUSt3R convention: Y-down, flip to Y-up)
+        self.align_mode = None  # None, 'floor', or 'wall' — waiting for click
+        self.align_radius = 0.5  # radius multiplier for point selection
         self.scene_rot_y = 0.0
         self.scene_rot_z = 0.0
         self.scene_flip_y = False
@@ -1772,6 +1774,138 @@ def _run_stacked_reconstruction(state, scene_gl):
     state.status = f"Stacked: {len(all_pts3d)} views from {len(stack_backends)} backends, {sum(len(p.reshape(-1,3)) for p in all_pts3d):,d} total points"
     state.reconstructing = False
     state.recon_frac = 1.0
+
+
+def _handle_align_click(state, scene_gl, camera, mx, my, window):
+    """Handle click for floor/wall alignment. Casts ray, finds nearest points, fits plane."""
+    try:
+        mode = state.align_mode
+        state.align_mode = None  # reset immediately
+
+        # Get viewport dimensions
+        win_w, win_h = glfw.get_window_size(window)
+        vp_x = 400
+        vp_w = win_w - vp_x
+        vp_h = win_h
+
+        # Normalize mouse to viewport [-1, 1]
+        nx = 2.0 * (mx - vp_x) / vp_w - 1.0
+        ny = 1.0 - 2.0 * my / vp_h
+
+        # Get MVP matrix (same as rendering)
+        aspect = vp_w / max(vp_h, 1)
+        proj = camera._perspective(45.0, aspect, 0.01, 100.0)
+        view = camera.get_view_matrix()
+
+        # Scene transform
+        def _rot_mat(rx, ry, rz):
+            cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
+            cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
+            cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
+            Rx = np.array([[1,0,0,0],[0,cx,-sx,0],[0,sx,cx,0],[0,0,0,1]], dtype=np.float32)
+            Ry = np.array([[cy,0,sy,0],[0,1,0,0],[-sy,0,cy,0],[0,0,0,1]], dtype=np.float32)
+            Rz = np.array([[cz,-sz,0,0],[sz,cz,0,0],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
+            return Rx @ Ry @ Rz
+        scene_tf = _rot_mat(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
+        mvp = proj @ view @ scene_tf
+        mvp_inv = np.linalg.inv(mvp)
+
+        # Unproject near and far points to get ray
+        near = mvp_inv @ np.array([nx, ny, -1, 1])
+        far = mvp_inv @ np.array([nx, ny, 1, 1])
+        near = near[:3] / near[3]
+        far = far[:3] / far[3]
+        ray_dir = far - near
+        ray_dir /= max(np.linalg.norm(ray_dir), 1e-8)
+
+        # Get all points
+        pts3d_list = state.pts3d_list
+        if pts3d_list is None:
+            return
+        all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float32)
+        if len(all_pts) == 0:
+            return
+
+        # Apply scene transform to points (same as rendering)
+        R_scene = scene_tf[:3, :3]
+        all_pts_tf = (R_scene @ all_pts.T).T
+
+        # Find nearest point to ray
+        # Distance from point to ray: ||(p - origin) × ray_dir|| / ||ray_dir||
+        diff = all_pts_tf - near[None, :]
+        cross = np.cross(diff, ray_dir[None, :])
+        dists = np.linalg.norm(cross, axis=-1)
+        nearest_idx = np.argmin(dists)
+
+        # Select neighborhood
+        center = all_pts[nearest_idx]  # in original (un-transformed) space
+        point_dists = np.linalg.norm(all_pts - center, axis=-1)
+        median_spacing = np.median(np.sort(point_dists)[:min(100, len(point_dists))])
+        radius = median_spacing * 50  # 50x spacing for a decent patch
+        mask = point_dists < radius
+        neighborhood = all_pts[mask]
+
+        if len(neighborhood) < 10:
+            state.status = "Too few points at click location"
+            return
+
+        # Fit plane via PCA — smallest eigenvector = plane normal
+        centroid = neighborhood.mean(axis=0)
+        cov = (neighborhood - centroid).T @ (neighborhood - centroid)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        normal = eigvecs[:, 0]  # smallest eigenvalue = plane normal
+
+        # Ensure normal points "up" (positive Y in world space after scene transform)
+        if normal[1] < 0:
+            normal = -normal
+
+        print(f"  Align {mode}: {len(neighborhood)} points, normal={normal}")
+
+        # Compute rotation to align normal with target
+        if mode == 'floor':
+            target = np.array([0, 1, 0], dtype=np.float32)  # Y-up
+        else:  # wall
+            target = np.array([0, 0, 1], dtype=np.float32)  # Z-forward
+
+        dot = np.clip(np.dot(normal, target), -1, 1)
+        if abs(dot) > 0.999:
+            state.status = f"Already aligned to {mode}"
+            return
+
+        axis = np.cross(normal, target)
+        axis /= max(np.linalg.norm(axis), 1e-8)
+        angle = np.arccos(dot)
+
+        # Build rotation matrix (Rodrigues)
+        K_mat = np.array([[0, -axis[2], axis[1]],
+                          [axis[2], 0, -axis[0]],
+                          [-axis[1], axis[0], 0]])
+        R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
+
+        # Combine with existing scene rotation
+        R_existing = scene_tf[:3, :3]
+        R_new = R_align @ R_existing
+
+        # Extract Euler XYZ
+        sy = np.sqrt(R_new[0, 0] ** 2 + R_new[1, 0] ** 2)
+        if sy > 1e-6:
+            rx = np.arctan2(R_new[2, 1], R_new[2, 2])
+            ry = np.arctan2(-R_new[2, 0], sy)
+            rz = np.arctan2(R_new[1, 0], R_new[0, 0])
+        else:
+            rx = np.arctan2(-R_new[1, 2], R_new[1, 1])
+            ry = np.arctan2(-R_new[2, 0], sy)
+            rz = 0
+
+        state.scene_rot_x = float(np.degrees(rx))
+        state.scene_rot_y = float(np.degrees(ry))
+        state.scene_rot_z = float(np.degrees(rz))
+        state.status = f"Aligned {mode} (normal={normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f})"
+
+    except Exception as e:
+        state.status = f"Alignment failed: {e}"
+        import traceback; traceback.print_exc()
+        state.align_mode = None
 
 
 def _align_to_cached_cameras(pts3d_list, cam_poses_c2w, cached_cameras):
@@ -3392,6 +3526,11 @@ def main():
         if imgui.get_io().want_capture_mouse:
             return
         if action == glfw.PRESS:
+            # Alignment click: cast ray and find plane
+            if state.align_mode and button == 0:
+                mx, my = glfw.get_cursor_pos(window)
+                _handle_align_click(state, scene_gl, camera, mx, my, window)
+                return
             mouse_down[button] = True
         elif action == glfw.RELEASE:
             mouse_down[button] = False
@@ -3723,14 +3862,23 @@ def main():
             state.draw_mode, ["Points", "Mesh", "Wireframe", "Normals", "Shaded"])
 
         # Scene orientation
-        _, state.scene_rot_x = imgui.slider_float("Rot X", state.scene_rot_x, -180, 180)
-        _, state.scene_rot_y = imgui.slider_float("Rot Y", state.scene_rot_y, -180, 180)
-        _, state.scene_rot_z = imgui.slider_float("Rot Z", state.scene_rot_z, -180, 180)
-        if imgui.button("Flip Up"):
-            state.scene_rot_x = (state.scene_rot_x + 180) % 360 - 180
-        imgui.same_line()
-        if imgui.button("Reset Rot"):
-            state.scene_rot_x = state.scene_rot_y = state.scene_rot_z = 0.0
+        imgui.text("Orientation")
+        if state.align_mode:
+            imgui.text_colored(f"Click on the {state.align_mode} to align", 1.0, 1.0, 0.3)
+            if imgui.button("Cancel"):
+                state.align_mode = None
+        else:
+            if imgui.button("Align Floor"):
+                state.align_mode = 'floor'
+            imgui.same_line()
+            if imgui.button("Align Wall"):
+                state.align_mode = 'wall'
+            imgui.same_line()
+            if imgui.button("Flip Up"):
+                state.scene_rot_x = (state.scene_rot_x + 180) % 360 - 180
+            imgui.same_line()
+            if imgui.button("Reset"):
+                state.scene_rot_x = state.scene_rot_y = state.scene_rot_z = 0.0
         imgui.separator()
 
         # ── Export ──
