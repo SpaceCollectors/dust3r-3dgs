@@ -23,7 +23,43 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
     mode='delaunay':    Voxel-dedup, local tangent-plane Delaunay.
     hole_cap_size:      Max boundary edges to close (0=disable, via PyMeshLab).
     """
-    if mode == 'delaunay':
+    if mode == 'poisson':
+        all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf)
+        if len(all_points) == 0:
+            return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3), dtype=np.uint8)
+        import open3d as o3d
+        print(f"  Poisson reconstruction on {len(all_points):,d} points...")
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(all_points.astype(np.float64))
+        pcd.colors = o3d.utility.Vector3dVector(all_colors.astype(np.float64) / 255.0)
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0, max_nn=30))
+        if cam2world_list:
+            cam_center = np.mean([c[:3, 3] for c in cam2world_list], axis=0)
+            pcd.orient_normals_towards_camera_location(cam_center)
+        else:
+            pcd.orient_normals_consistent_tangent_plane(k=15)
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=poisson_depth, width=0, scale=1.1, linear_fit=True)
+        # Trim low-density regions
+        densities = np.asarray(densities)
+        if trim_percentile > 0:
+            mesh.remove_vertices_by_mask(densities < np.quantile(densities, trim_percentile / 100.0))
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_vertices()
+        # Transfer colors
+        mesh_verts = np.asarray(mesh.vertices, dtype=np.float64)
+        tree = o3d.geometry.KDTreeFlann(pcd)
+        pcd_colors = np.asarray(pcd.colors)
+        mesh_colors = np.zeros((len(mesh_verts), 3), dtype=np.float64)
+        for vi in range(len(mesh_verts)):
+            _, idx, _ = tree.search_knn_vector_3d(mesh_verts[vi], 3)
+            mesh_colors[vi] = np.mean([pcd_colors[j] for j in idx], axis=0)
+        v = mesh_verts.astype(np.float32)
+        f = np.asarray(mesh.triangles, dtype=np.int32)
+        c = (mesh_colors * 255).clip(0, 255).astype(np.uint8)
+        print(f"  Poisson mesh: {len(v):,d} verts, {len(f):,d} faces")
+    elif mode == 'delaunay':
         all_points, all_colors = _collect_points(imgs, pts3d_list, confs_list, min_conf)
         if len(all_points) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int32), np.zeros((0, 3), dtype=np.uint8)

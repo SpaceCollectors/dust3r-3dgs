@@ -804,9 +804,9 @@ class AppState:
         # Mesh data (numpy, for saving)
         self.mesh_data = None  # (verts, faces, colors)
         self.target_faces = 100000  # target face count for dense mesh
-        self.mesh_mode_idx = 0     # 0=reprojected grid, 1=ball pivot, 2=local delaunay
-        self.mesh_modes = ['reprojected', 'ballpivot', 'delaunay']
-        self.mesh_mode_labels = ['Reprojected Grid', 'Ball Pivot', 'Local Delaunay']
+        self.mesh_mode_idx = 0     # 0=reprojected grid, 1=ball pivot, 2=local delaunay, 3=poisson
+        self.mesh_modes = ['reprojected', 'ballpivot', 'delaunay', 'poisson']
+        self.mesh_mode_labels = ['Reprojected Grid', 'Ball Pivot', 'Local Delaunay', 'Poisson']
         self.hole_cap_size = 50    # max boundary edges to close (higher = close bigger holes)
         self.smooth_radius = 2.0   # neighbor merge radius multiplier
         self.use_smoothing = False # whether to smooth before meshing
@@ -2001,17 +2001,23 @@ def _run_smooth_preview(state, scene_gl):
         mesh_min_conf = state.min_conf
 
         all_pts, all_cols, all_vids = [], [], []
-        for i in range(len(imgs)):
-            p, c_arr, img = pts3d_list[i], confs_list[i], imgs[i]
+        for i in range(len(pts3d_list)):
+            p = pts3d_list[i]
+            c_arr = confs_list[i] if i < len(confs_list) else None
             if p.ndim == 3:
                 H, W = p.shape[:2]
                 mask = c_arr.reshape(H, W) > mesh_min_conf if c_arr is not None else np.ones((H, W), dtype=bool)
+                all_pts.append(p[mask])
+                if i < len(imgs):
+                    all_cols.append((np.clip(imgs[i][mask], 0, 1) * 255).astype(np.uint8))
+                else:
+                    all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
             else:
-                mask = c_arr.ravel() > mesh_min_conf if c_arr is not None else np.ones(len(p), dtype=bool)
-            n = int(mask.sum())
-            all_pts.append(p[mask] if p.ndim == 3 else p[mask])
-            all_cols.append((np.clip((img[mask] if p.ndim == 3 else img.reshape(-1, 3)[mask]), 0, 1) * 255).astype(np.uint8))
-            all_vids.append(np.full(n, i, dtype=np.int32))
+                flat = p.reshape(-1, 3)
+                mask = c_arr.ravel() > mesh_min_conf if c_arr is not None else np.ones(len(flat), dtype=bool)
+                all_pts.append(flat[mask])
+                all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+            all_vids.append(np.full(int(mask.sum()), i, dtype=np.int32))
 
         points = np.concatenate(all_pts, axis=0).astype(np.float32)
         colors = np.concatenate(all_cols, axis=0)
