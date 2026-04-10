@@ -1001,16 +1001,21 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                         break
 
                 if sparse_sub is None:
-                    # Mapper failed — try point_triangulator + bundle_adjuster as fallback
-                    print("  Mapper failed, trying triangulator...")
-                    if progress_fn: progress_fn("COLMAP: triangulating...")
-                    subprocess.run([colmap_exe, 'point_triangulator',
+                    # Mapper with priors failed — fall back to full COLMAP mapper
+                    print("  Mapper with priors failed, running full COLMAP SfM...")
+                    if progress_fn: progress_fn("COLMAP: full sparse reconstruction...")
+                    subprocess.run([colmap_exe, 'mapper',
                                    '--database_path', db_path,
                                    '--image_path', img_dir,
-                                   '--input_path', prior_dir,
-                                   '--output_path', prior_dir],
+                                   '--output_path', sparse_dir],
                                   capture_output=True, timeout=600)
-                    sparse_sub = prior_dir
+                    for d in ['0', '1', '2']:
+                        candidate = os.path.join(sparse_dir, d)
+                        if os.path.isdir(candidate):
+                            sparse_sub = candidate
+                            break
+                    if sparse_sub is None:
+                        raise RuntimeError("COLMAP reconstruction failed — no model produced")
 
                 print(f"  Sparse model: {sparse_sub}")
             else:
