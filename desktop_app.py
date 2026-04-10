@@ -1719,8 +1719,15 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue
 
         # Orient normal to point "up" relative to current scene rotation
-        scene_tf = _rot_matrix(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
-        R_scene = scene_tf[:3, :3].astype(np.float32)
+        def _build_rot(rx, ry, rz):
+            cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
+            cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
+            cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
+            Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]], dtype=np.float32)
+            Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]], dtype=np.float32)
+            Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]], dtype=np.float32)
+            return Rx @ Ry @ Rz
+        R_scene = _build_rot(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
         normal_tf = R_scene @ normal
         if normal_tf[1] < 0:
             normal = -normal
