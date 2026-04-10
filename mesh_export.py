@@ -892,9 +892,18 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
                     import subprocess
                     # PatchMatch
                     if progress_fn: progress_fn("PatchMatch stereo (COLMAP exe)...")
+                    # Estimate depth range from camera positions
+                    cam_centers = np.array([c[:3, 3] for c in c2w_list])
+                    scene_extent = np.linalg.norm(cam_centers.max(0) - cam_centers.min(0))
+                    depth_min = max(scene_extent * 0.01, 0.01)
+                    depth_max = scene_extent * 100
+                    print(f"  Depth range: {depth_min:.4f} - {depth_max:.4f}")
+
                     r = subprocess.run([colmap_exe, 'patch_match_stereo',
                                        '--workspace_path', dense_dir,
-                                       '--PatchMatchStereo.geom_consistency', 'true'],
+                                       '--PatchMatchStereo.geom_consistency', 'true',
+                                       '--PatchMatchStereo.depth_min', str(depth_min),
+                                       '--PatchMatchStereo.depth_max', str(depth_max)],
                                       capture_output=True, text=True, timeout=1800)
                     if r.stdout:
                         print(r.stdout[-1000:])
