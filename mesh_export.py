@@ -885,10 +885,25 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
                                        '--workspace_path', dense_dir,
                                        '--PatchMatchStereo.geom_consistency', 'true'],
                                       capture_output=True, text=True, timeout=1800)
-                    print(r.stdout[-500:] if r.stdout else "")
+                    if r.stdout:
+                        print(r.stdout[-1000:])
+                    if r.stderr:
+                        print("  STDERR:", r.stderr[-1000:])
                     if r.returncode != 0:
-                        raise RuntimeError(f"COLMAP patch_match_stereo failed: {r.stderr[-500:]}")
-                    print("  PatchMatch complete (COLMAP exe)")
+                        raise RuntimeError(f"COLMAP patch_match_stereo failed (code {r.returncode})")
+
+                    # Check if depth maps were created
+                    stereo_dir = os.path.join(dense_dir, 'stereo', 'depth_maps')
+                    if os.path.isdir(stereo_dir):
+                        depth_files = [f for f in os.listdir(stereo_dir) if f.endswith('.bin')]
+                        print(f"  PatchMatch complete: {len(depth_files)} depth maps")
+                    else:
+                        print("  WARNING: no depth_maps directory created")
+                        # List what's in stereo/
+                        stereo_base = os.path.join(dense_dir, 'stereo')
+                        if os.path.isdir(stereo_base):
+                            for d in os.listdir(stereo_base):
+                                print(f"    stereo/{d}/: {os.listdir(os.path.join(stereo_base, d)) if os.path.isdir(os.path.join(stereo_base, d)) else 'file'}")
                 else:
                     raise RuntimeError(
                         "No CUDA support. Install COLMAP with CUDA:\n"
