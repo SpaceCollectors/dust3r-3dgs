@@ -3523,6 +3523,8 @@ def main():
                         'pts3d_list': state.pts3d_list,
                         'confs_list': state.confs_list,
                         'scene_rot': (state.scene_rot_x, state.scene_rot_y, state.scene_rot_z),
+                        'cached_cameras': state.cached_cameras,
+                        'dense_colors': getattr(state, '_dense_colors', None),
                     }
                     with open(path, 'wb') as f:
                         pickle.dump(save_data, f)
@@ -3549,23 +3551,26 @@ def main():
                     state.min_conf = save_data.get('min_conf', 2.0)
                     state.pts3d_list = save_data.get('pts3d_list')
                     state.confs_list = save_data.get('confs_list')
+                    state.cached_cameras = save_data.get('cached_cameras')
+                    state._dense_colors = save_data.get('dense_colors')
                     rot = save_data.get('scene_rot', (0, 0, 0))
                     state.scene_rot_x, state.scene_rot_y, state.scene_rot_z = rot
 
                     # Restore point cloud display
                     if state.pts3d_list is not None:
+                        dense_cols = state._dense_colors
+                        n_imgs = len(state.image_paths)
                         all_pts, all_cols = [], []
                         for i in range(len(state.pts3d_list)):
                             p = state.pts3d_list[i]
-                            c = state.confs_list[i] if state.confs_list else None
+                            c = state.confs_list[i] if state.confs_list and i < len(state.confs_list) else None
                             img = None
                             # Try to load image for colors
-                            if i < len(state.image_paths):
+                            if i < n_imgs:
                                 try:
                                     from PIL import Image as PILImage
                                     img_pil = PILImage.open(state.image_paths[i]).convert('RGB')
                                     img = np.array(img_pil).astype(np.float32) / 255.0
-                                    # Resize to match pts shape if needed
                                     if p.ndim == 3 and img.shape[:2] != p.shape[:2]:
                                         img_pil = img_pil.resize((p.shape[1], p.shape[0]))
                                         img = np.array(img_pil).astype(np.float32) / 255.0
@@ -3579,9 +3584,14 @@ def main():
                                 else:
                                     all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
                             else:
-                                mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p), dtype=bool)
-                                all_pts.append(p[mask])
-                                all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+                                flat = p.reshape(-1, 3)
+                                mask = c.ravel() > state.min_conf if c is not None else np.ones(len(flat), dtype=bool)
+                                all_pts.append(flat[mask])
+                                # Use saved dense colors if available
+                                if dense_cols is not None and i >= n_imgs and len(dense_cols) == len(flat):
+                                    all_cols.append(dense_cols[mask])
+                                else:
+                                    all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
                         if all_pts:
                             pts = np.concatenate(all_pts, axis=0)
                             cols = np.concatenate(all_cols, axis=0)
