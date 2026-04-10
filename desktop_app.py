@@ -3409,6 +3409,12 @@ def main():
     while not glfw.window_should_close(window):
       try:
         glfw.poll_events()
+
+        # Skip rendering when minimized or iconified (prevents GL crashes)
+        if glfw.get_window_attrib(window, glfw.ICONIFIED):
+            import time; time.sleep(0.1)
+            continue
+
         impl.process_inputs()
 
         # Mouse drag for orbit/pan
@@ -3861,9 +3867,22 @@ def main():
 
         # ── 3D Viewport ──
         win_w, win_h = glfw.get_window_size(window)
+        if win_w <= 0 or win_h <= 0:
+            imgui.render()
+            glfw.swap_buffers(window)
+            continue
         vp_x = 400
         vp_w = win_w - vp_x
         vp_h = win_h
+
+        # Skip GL rendering when window is not focused (prevents crashes)
+        is_focused = glfw.get_window_attrib(window, glfw.FOCUSED)
+        if not is_focused:
+            imgui.render()
+            impl.render(imgui.get_draw_data())
+            glfw.swap_buffers(window)
+            import time; time.sleep(0.05)
+            continue
 
         gl.glViewport(vp_x, 0, vp_w, vp_h)
         gl.glScissor(vp_x, 0, vp_w, vp_h)
