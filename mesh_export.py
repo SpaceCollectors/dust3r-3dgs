@@ -824,11 +824,13 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
         print(f"  Wrote sparse model: {n_imgs} cameras")
         print(f"  Wrote sparse reconstruction: {n_imgs} images")
 
-        # Step 2: Undistort images
+        # Step 2: Undistort images into a dense workspace
         if progress_fn: progress_fn("Undistorting images...")
+        dense_dir = os.path.join(workdir, "dense")
+        os.makedirs(dense_dir, exist_ok=True)
         sparse_sub = os.path.join(sparse_dir, '0')
         pycolmap.undistort_images(
-            output_path=workdir,
+            output_path=dense_dir,
             input_path=sparse_sub,
             image_path=img_dir)
         print("  Images undistorted")
@@ -839,17 +841,17 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
         opts = pycolmap.PatchMatchOptions()
         opts.num_iterations = 5
         opts.geom_consistency = True
-        pycolmap.patch_match_stereo(workspace_path=workdir, options=opts)
+        pycolmap.patch_match_stereo(workspace_path=dense_dir, options=opts)
         print("  PatchMatch complete")
 
         # Step 4: Stereo fusion
         if progress_fn: progress_fn("Fusing depth maps...")
-        output_ply = os.path.join(workdir, "fused.ply")
+        output_ply = os.path.join(dense_dir, "fused.ply")
         fuse_opts = pycolmap.StereoFusionOptions()
         fuse_opts.min_num_pixels = 3
         pycolmap.stereo_fusion(
             output_path=output_ply,
-            workspace_path=workdir,
+            workspace_path=dense_dir,
             options=fuse_opts)
         print(f"  Fused to {output_ply}")
 
