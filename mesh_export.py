@@ -816,10 +816,20 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
             image = pycolmap.Image(
                 image_id=i + 1,
                 name=os.path.basename(image_paths[i]),
-                camera_id=i + 1,
-                cam_from_world=pycolmap.Rigid3d(
+                camera_id=i + 1)
+            # Set pose after construction (cam_from_world is read-only in constructor)
+            try:
+                image.cam_from_world = pycolmap.Rigid3d(
                     rotation=pycolmap.Rotation3d(np.array([qw, qx, qy, qz])),
-                    translation=t))
+                    translation=t)
+            except (AttributeError, TypeError):
+                # Older pycolmap: set via quaternion + translation directly
+                try:
+                    image.qvec = np.array([qw, qx, qy, qz])
+                    image.tvec = t
+                except Exception:
+                    image.rotmat = R
+                    image.tvec = t
             rec.add_image(image)
             rec.register_image(i + 1)
 
