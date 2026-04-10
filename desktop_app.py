@@ -2093,14 +2093,12 @@ def run_densify_colmap(state, scene_gl):
             state.image_paths, c2w_list, K_list, progress_fn=progress, **pm_opts)
 
         if len(dense_pts) > 0:
-            # Store dense cloud with colors
-            state.pts3d_list = list(pts3d_list) + [dense_pts]
-            state.confs_list = list(confs_list) + [
-                np.ones(len(dense_pts), dtype=np.float32) * 10.0]
-            # Store colors for mesh builder (append fake "image" to scene.imgs)
-            if hasattr(state.scene, 'imgs'):
-                # Store dense colors as a flat array the collect_points can use
-                state._dense_colors = dense_cols
+            # REPLACE all point data with the dense cloud only
+            # (COLMAP runs its own SfM so the dense cloud is in a different
+            # coordinate frame — mixing with DUSt3R sparse would be wrong)
+            state.pts3d_list = [dense_pts]
+            state.confs_list = [np.ones(len(dense_pts), dtype=np.float32) * 10.0]
+            state._dense_colors = dense_cols
 
             # Display the dense cloud
             disp_pts, disp_cols = dense_pts, dense_cols
