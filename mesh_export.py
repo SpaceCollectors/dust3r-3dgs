@@ -33,7 +33,17 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
         pcd.points = o3d.utility.Vector3dVector(all_points.astype(np.float64))
         pcd.colors = o3d.utility.Vector3dVector(all_colors.astype(np.float64) / 255.0)
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0, max_nn=30))
+
+        # Compute and print median point spacing
+        dists = np.asarray(pcd.compute_nearest_neighbor_distance())
+        median_spacing = float(np.median(dists))
+        print(f"  Median point spacing: {median_spacing:.6f}")
+        print(f"  Scene extent: {np.linalg.norm(np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())):.4f}")
+
+        # Normal estimation with radius based on actual point spacing
+        normal_radius = median_spacing * 5
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=normal_radius, max_nn=30))
         if cam2world_list:
             cam_center = np.mean([c[:3, 3] for c in cam2world_list], axis=0)
             pcd.orient_normals_towards_camera_location(cam_center)

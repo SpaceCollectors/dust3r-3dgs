@@ -809,6 +809,8 @@ class AppState:
         self.mesh_mode_labels = ['Reprojected Grid', 'Ball Pivot', 'Local Delaunay', 'Poisson']
         self.hole_cap_size = 50    # max boundary edges to close (higher = close bigger holes)
         self.smooth_radius = 2.0   # neighbor merge radius multiplier
+        self.poisson_depth_val = 10  # Poisson octree depth (higher = more detail)
+        self.poisson_trim = 5.0      # trim percentile for low-density regions
         self.use_smoothing = False # whether to smooth before meshing
         self.ai_depth_mix = 0.7  # 0=pure dust3r, 1=full AI detail
         self.ai_highpass_radius = 10.0  # high-pass sigma in pixels
@@ -2442,7 +2444,9 @@ def run_dense_mesh(state, scene_gl):
             verts, faces, colors = create_dense_mesh(
                 imgs, pts3d_list, confs_list,
                 cam2world_list=cam_poses, min_conf=mesh_min_conf,
-                mode=mesh_mode, hole_cap_size=state.hole_cap_size)
+                mode=mesh_mode, hole_cap_size=state.hole_cap_size,
+                poisson_depth=state.poisson_depth_val,
+                trim_percentile=state.poisson_trim)
 
         if len(faces) > 0:
             state.mesh_data = (verts, faces, colors)
@@ -3803,6 +3807,9 @@ def main():
         # ── Dense Mesh ──
         imgui.text("Dense Mesh")
         _, state.mesh_mode_idx = imgui.combo("Method", state.mesh_mode_idx, state.mesh_mode_labels)
+        if state.mesh_modes[state.mesh_mode_idx] == 'poisson':
+            _, state.poisson_depth_val = imgui.input_int("Octree Depth", state.poisson_depth_val, 1, 1)
+            _, state.poisson_trim = imgui.input_float("Trim %", state.poisson_trim, 1.0, 5.0)
         changed_smooth, state.use_smoothing = imgui.checkbox("Smooth Points", state.use_smoothing)
         if state.use_smoothing:
             imgui.same_line()
