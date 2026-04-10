@@ -1580,14 +1580,15 @@ print('SUCCESS')
     except Exception as e:
         state.error_msg = str(e)
         state.status = f"Error: {e}"
-        import traceback
+        import traceback; traceback.print_exc()
     finally:
         # Restore original image paths (masked ones were just for reconstruction)
-        if 'original_paths' in dir() and original_paths:
-            state.image_paths = original_paths
-        traceback.print_exc()
-
-    state.reconstructing = False
+        try:
+            if original_paths:
+                state.image_paths = original_paths
+        except NameError:
+            pass
+        state.reconstructing = False
 
 
 # ── Main App ─────────────────────────────────────────────────────────────────
