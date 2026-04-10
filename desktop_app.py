@@ -1772,23 +1772,6 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         print(f"  Screen proj range: x=[{screen_x[valid_w].min():.0f}-{screen_x[valid_w].max():.0f}], y=[{screen_y[valid_w].min():.0f}-{screen_y[valid_w].max():.0f}]")
         print(f"  Min screen dist: {screen_dist[valid_w].min():.1f}px, selected: {mask.sum()} points")
 
-        # Visualize: show selected points in yellow, rest dimmed
-        dense_cols = getattr(state, '_dense_colors', None)
-        if dense_cols is not None and len(dense_cols) == len(all_pts):
-            vis_cols = (dense_cols * 0.3).astype(np.uint8)  # dim everything
-        else:
-            vis_cols = np.full((len(all_pts), 3), 60, dtype=np.uint8)
-        vis_cols[mask] = [255, 255, 0]  # yellow for selected
-        disp = all_pts
-        if len(disp) > 300000:
-            idx = np.random.choice(len(disp), 300000, replace=False)
-            # Make sure selected points are included
-            sel_idx = np.where(mask)[0]
-            if len(sel_idx) > 0:
-                idx = np.unique(np.concatenate([idx, sel_idx[:min(len(sel_idx), 50000)]]))
-            disp, vis_cols = all_pts[idx], vis_cols[idx]
-        scene_gl.set_points(disp, vis_cols)
-
         if len(neighborhood) < 10:
             state.status = f"Too few points ({mask.sum()}) — try increasing radius"
             return
