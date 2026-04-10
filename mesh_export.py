@@ -970,38 +970,49 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             # If we have prior cameras (from DUSt3R etc.), use them as initialization
             # Run point_triangulator + bundle_adjuster instead of full mapper
             if c2w_list is not None and K_list is not None and len(c2w_list) == n_imgs:
-                if progress_fn: progress_fn("COLMAP: triangulating with prior cameras...")
+                if progress_fn: progress_fn("COLMAP: mapping with prior cameras...")
                 print("  Using prior cameras for initialization...")
-                prior_dir = os.path.join(sparse_dir, '0')
+                prior_dir = os.path.join(sparse_dir, 'prior')
                 _write_colmap_sparse_model(prior_dir, image_paths, c2w_list, K_list)
 
-                # Triangulate points using prior cameras + matched features
-                print("  Point triangulation...")
-                subprocess.run([colmap_exe, 'point_triangulator',
+                # Run mapper with prior cameras as initialization
+                # This lets COLMAP use our cameras as starting point but refine them
+                print("  Running mapper with camera priors...")
+                r = subprocess.run([colmap_exe, 'mapper',
                                '--database_path', db_path,
                                '--image_path', img_dir,
                                '--input_path', prior_dir,
-                               '--output_path', prior_dir],
-                              capture_output=True, timeout=600)
+                               '--output_path', sparse_dir,
+                               '--Mapper.ba_refine_focal_length', '1',
+                               '--Mapper.ba_refine_extra_params', '0',
+                               '--Mapper.fix_existing_images', '0'],
+                              capture_output=True, text=True, timeout=600)
+                if r.stderr:
+                    for line in r.stderr.split('\n'):
+                        if any(k in line for k in ['Registering', 'Bundle', 'points', 'images']):
+                            print(f"    {line.strip()}")
 
-                # Refine cameras via bundle adjustment
-                if progress_fn: progress_fn("COLMAP: bundle adjustment (refining cameras)...")
-                print("  Bundle adjustment...")
-                refined_dir = os.path.join(sparse_dir, 'refined')
-                os.makedirs(refined_dir, exist_ok=True)
-                subprocess.run([colmap_exe, 'bundle_adjuster',
-                               '--input_path', prior_dir,
-                               '--output_path', refined_dir],
-                              capture_output=True, timeout=600)
+                # Find best reconstruction
+                sparse_sub = None
+                for d in ['0', '1', '2']:
+                    candidate = os.path.join(sparse_dir, d)
+                    if os.path.isdir(candidate):
+                        sparse_sub = candidate
+                        break
 
-                # Use refined if it exists, else fall back to prior
-                if os.path.exists(os.path.join(refined_dir, 'cameras.bin')) or \
-                   os.path.exists(os.path.join(refined_dir, 'cameras.txt')):
-                    sparse_sub = refined_dir
-                    print("  Using bundle-adjusted cameras")
-                else:
+                if sparse_sub is None:
+                    # Mapper failed — try point_triangulator + bundle_adjuster as fallback
+                    print("  Mapper failed, trying triangulator...")
+                    if progress_fn: progress_fn("COLMAP: triangulating...")
+                    subprocess.run([colmap_exe, 'point_triangulator',
+                                   '--database_path', db_path,
+                                   '--image_path', img_dir,
+                                   '--input_path', prior_dir,
+                                   '--output_path', prior_dir],
+                                  capture_output=True, timeout=600)
                     sparse_sub = prior_dir
-                    print("  Bundle adjustment failed, using prior cameras")
+
+                print(f"  Sparse model: {sparse_sub}")
             else:
                 # Full COLMAP mapper (no prior cameras)
                 if progress_fn: progress_fn("COLMAP: sparse reconstruction...")
