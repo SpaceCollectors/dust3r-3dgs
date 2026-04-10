@@ -917,8 +917,26 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
                            '--PatchMatchStereo.filter_min_num_consistent', str(min_consistent)]
                     if max_image_size > 0:
                         cmd += ['--PatchMatchStereo.max_image_size', str(max_image_size)]
-                    print(f"  CMD: {' '.join(cmd[-8:])}")
-                    r = subprocess.run(cmd, timeout=1800)
+                    # Run with live progress parsing
+                    import re
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, bufsize=1)
+                    for line in proc.stdout:
+                        line = line.strip()
+                        # Parse "Processing view X / Y" for progress
+                        m = re.search(r'Processing view (\d+) / (\d+) for (.+)', line)
+                        if m:
+                            cur, total, name = int(m.group(1)), int(m.group(2)), m.group(3)
+                            if progress_fn:
+                                progress_fn(f"PatchMatch {cur}/{total}: {name}")
+                            print(f"  PatchMatch view {cur}/{total}: {name}")
+                        elif 'Total:' in line:
+                            # View finished
+                            t = re.search(r'Total: ([\d.]+)s', line)
+                            if t:
+                                print(f"    {t.group(1)}s")
+                    proc.wait(timeout=1800)
+                    r = proc
                     if r.returncode != 0:
                         raise RuntimeError(f"COLMAP patch_match_stereo failed (code {r.returncode})")
 
@@ -956,11 +974,12 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
             else:
                 import subprocess
                 colmap_exe = _find_colmap_exe()
+                if progress_fn: progress_fn("Fusing depth maps (COLMAP exe)...")
                 r = subprocess.run([colmap_exe, 'stereo_fusion',
                                    '--workspace_path', dense_dir,
                                    '--output_path', output_ply,
                                    '--StereoFusion.min_num_pixels', str(min_consistent)],
-                                  timeout=600)
+                                  capture_output=True, text=True, timeout=600)
                 if r.returncode != 0:
                     raise RuntimeError(f"stereo_fusion failed (code {r.returncode})")
         except Exception as e2:
