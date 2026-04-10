@@ -1768,7 +1768,9 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         mask = valid_w & (screen_dist < circle_px)
         neighborhood = all_pts[mask]
 
-        print(f"  Hit point: {hit_pt}, radius: {radius:.6f} ({state.align_radius}x), {mask.sum()} points selected")
+        print(f"  Click: ({mx:.0f},{my:.0f}), vp=({vp_x},{vp_w}x{vp_h})")
+        print(f"  Screen proj range: x=[{screen_x[valid_w].min():.0f}-{screen_x[valid_w].max():.0f}], y=[{screen_y[valid_w].min():.0f}-{screen_y[valid_w].max():.0f}]")
+        print(f"  Min screen dist: {screen_dist[valid_w].min():.1f}px, selected: {mask.sum()} points")
 
         # Visualize: show selected points in yellow, rest dimmed
         dense_cols = getattr(state, '_dense_colors', None)
