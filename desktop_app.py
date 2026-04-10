@@ -841,7 +841,8 @@ class AppState:
         # Scene orientation transform (applied in shader)
         self.scene_rot_x = 180.0  # degrees (DUSt3R convention: Y-down, flip to Y-up)
         self.align_mode = None  # None, 'floor', or 'wall' — waiting for click
-        self.align_radius = 2.0  # radius multiplier (Nx median local spacing)
+        self.align_floor_normal = None  # stored floor normal vector
+        self.align_wall_normal = None   # stored wall normal vector
         self.scene_rot_y = 0.0
         self.scene_rot_z = 0.0
         self.scene_flip_y = False
@@ -1781,49 +1782,70 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         cov = (neighborhood - centroid).T @ (neighborhood - centroid)
         eigvals, eigvecs = np.linalg.eigh(cov)
         normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue = plane normal
+        normal /= max(np.linalg.norm(normal), 1e-8)
 
-        # Transform normal to current display space (where existing rotation is applied)
-        normal_display = R_scene @ normal
-        normal_display /= max(np.linalg.norm(normal_display), 1e-8)
-
+        # Store the normal for this mode
         if mode == 'floor':
-            # Floor: align the surface normal to Y-up (full 3D rotation)
-            target = np.array([0, 1, 0], dtype=np.float32)
-            if np.dot(normal_display, target) < 0:
-                normal_display = -normal_display
+            state.align_floor_normal = normal.copy()
+            print(f"  Stored floor normal: {normal} ({len(neighborhood)} pts)")
         else:
-            # Wall: only rotate around Y axis (preserve floor alignment)
-            # Project normal onto XZ plane (remove Y component)
-            normal_display[1] = 0
-            norm_len = np.linalg.norm(normal_display)
-            if norm_len < 0.01:
-                state.status = "Wall is parallel to Y — can't align"
-                return
-            normal_display /= norm_len
-            target = np.array([0, 0, 1], dtype=np.float32)
-            if np.dot(normal_display, target) < 0:
-                normal_display = -normal_display
+            state.align_wall_normal = normal.copy()
+            print(f"  Stored wall normal: {normal} ({len(neighborhood)} pts)")
 
-        print(f"  Align {mode}: {len(neighborhood)} pts, normal_display={normal_display}")
+        # Compute rotation from stored normals
+        floor_n = state.align_floor_normal
+        wall_n = state.align_wall_normal
 
-        dot = np.clip(np.dot(normal_display, target), -1, 1)
-        if abs(dot) > 0.999:
-            state.status = f"Already aligned to {mode}"
+        if floor_n is not None and wall_n is not None:
+            # Both normals available — build full rotation from two constraints
+            # Y-axis = floor normal (up)
+            # Z-axis = wall normal (forward)
+            # X-axis = cross(Y, Z) (right)
+            Y = floor_n / max(np.linalg.norm(floor_n), 1e-8)
+            Z = wall_n - np.dot(wall_n, Y) * Y  # orthogonalize wall to floor
+            Z /= max(np.linalg.norm(Z), 1e-8)
+            X = np.cross(Y, Z)
+            X /= max(np.linalg.norm(X), 1e-8)
+
+            # R maps: X→[1,0,0], Y→[0,1,0], Z→[0,0,1]
+            # So R = [target_X | target_Y | target_Z]^T @ [X | Y | Z]
+            # Which is: columns of [X,Y,Z] become rows of R_new
+            R_new = np.array([X, Y, Z], dtype=np.float32)  # 3x3
+            print(f"  Full alignment from floor+wall normals")
+            state.status = f"Aligned floor+wall"
+
+        elif floor_n is not None:
+            # Only floor — align normal to Y-up
+            Y = floor_n / max(np.linalg.norm(floor_n), 1e-8)
+            # Pick an arbitrary X perpendicular to Y
+            if abs(Y[0]) < 0.9:
+                X = np.cross(Y, np.array([1, 0, 0], dtype=np.float32))
+            else:
+                X = np.cross(Y, np.array([0, 0, 1], dtype=np.float32))
+            X /= max(np.linalg.norm(X), 1e-8)
+            Z = np.cross(X, Y)
+            R_new = np.array([X, Y, Z], dtype=np.float32)
+            print(f"  Floor-only alignment")
+            state.status = f"Aligned floor — click wall to refine"
+
+        elif wall_n is not None:
+            # Only wall — align normal to Z-forward
+            Z = wall_n / max(np.linalg.norm(wall_n), 1e-8)
+            if abs(Z[1]) < 0.9:
+                Y = np.cross(Z, np.array([0, 1, 0], dtype=np.float32))
+                Y = np.cross(np.array([0, 1, 0], dtype=np.float32), Z)
+            else:
+                Y = np.cross(Z, np.array([1, 0, 0], dtype=np.float32))
+            Y /= max(np.linalg.norm(Y), 1e-8)
+            X = np.cross(Y, Z)
+            X /= max(np.linalg.norm(X), 1e-8)
+            R_new = np.array([X, Y, Z], dtype=np.float32)
+            print(f"  Wall-only alignment")
+            state.status = f"Aligned wall — click floor to refine"
+        else:
             return
 
-        axis = np.cross(normal_display, target)
-        axis /= max(np.linalg.norm(axis), 1e-8)
-        angle = float(np.arccos(dot))
-
-        K_mat = np.array([[0, -axis[2], axis[1]],
-                          [axis[2], 0, -axis[0]],
-                          [-axis[1], axis[0], 0]])
-        R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
-
-        # Combine: new = align_in_display_space @ existing
-        R_new = R_align @ R_scene
-
-        # Extract Euler XYZ
+        # Extract Euler XYZ from R_new
         sy = np.sqrt(R_new[0, 0] ** 2 + R_new[1, 0] ** 2)
         if sy > 1e-6:
             rx = np.arctan2(R_new[2, 1], R_new[2, 2])
@@ -1837,7 +1859,6 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         state.scene_rot_x = float(np.degrees(rx))
         state.scene_rot_y = float(np.degrees(ry))
         state.scene_rot_z = float(np.degrees(rz))
-        state.status = f"Aligned {mode}: {len(neighborhood)} surface points"
 
     except Exception as e:
         state.status = f"Alignment failed: {e}"
@@ -3796,8 +3817,14 @@ def main():
 
         # Scene orientation
         imgui.text("Orientation")
+        if state.align_floor_normal is not None:
+            imgui.same_line()
+            imgui.text_colored("F", 0.3, 1.0, 0.3)
+        if state.align_wall_normal is not None:
+            imgui.same_line()
+            imgui.text_colored("W", 0.3, 0.7, 1.0)
         if state.align_mode:
-            imgui.text_colored(f"Click on the {state.align_mode} to align (yellow = selected)", 1.0, 1.0, 0.3)
+            imgui.text_colored(f"Click on the {state.align_mode} to align", 1.0, 1.0, 0.3)
             if imgui.button("Cancel"):
                 state.align_mode = None
         else:
@@ -3812,6 +3839,8 @@ def main():
             imgui.same_line()
             if imgui.button("Reset"):
                 state.scene_rot_x = state.scene_rot_y = state.scene_rot_z = 0.0
+                state.align_floor_normal = None
+                state.align_wall_normal = None
         imgui.separator()
 
         # ── Export ──
