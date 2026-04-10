@@ -933,6 +933,7 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
                            '--PatchMatchStereo.depth_max', str(depth_max),
                            '--PatchMatchStereo.num_iterations', str(num_iterations),
                            '--PatchMatchStereo.window_radius', str(window_radius),
+                           '--PatchMatchStereo.filter', 'true',
                            '--PatchMatchStereo.filter_min_ncc', str(filter_min_ncc),
                            '--PatchMatchStereo.filter_min_num_consistent', str(min_consistent)]
                     if max_image_size > 0:
