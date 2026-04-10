@@ -978,8 +978,20 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
                 r = subprocess.run([colmap_exe, 'stereo_fusion',
                                    '--workspace_path', dense_dir,
                                    '--output_path', output_ply,
-                                   '--StereoFusion.min_num_pixels', str(min_consistent)],
+                                   '--StereoFusion.min_num_pixels', str(max(min_consistent, 2)),
+                                   '--StereoFusion.max_reproj_error', '2',
+                                   '--StereoFusion.max_depth_error', '0.05',
+                                   '--StereoFusion.max_normal_error', '20'],
                                   capture_output=True, text=True, timeout=600)
+                if r.stdout:
+                    # Print fusion summary
+                    for line in r.stdout.split('\n'):
+                        if any(k in line for k in ['Fusing', 'points', 'Number', 'Elapsed']):
+                            print(f"  {line.strip()}")
+                if r.stderr:
+                    for line in r.stderr.split('\n'):
+                        if any(k in line for k in ['Fusing', 'points', 'Number', 'Elapsed', 'Error', 'Warning']):
+                            print(f"  {line.strip()}")
                 if r.returncode != 0:
                     raise RuntimeError(f"stereo_fusion failed (code {r.returncode})")
         except Exception as e2:
