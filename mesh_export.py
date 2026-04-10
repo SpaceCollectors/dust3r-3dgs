@@ -904,11 +904,7 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
                                        '--PatchMatchStereo.geom_consistency', 'true',
                                        '--PatchMatchStereo.depth_min', str(depth_min),
                                        '--PatchMatchStereo.depth_max', str(depth_max)],
-                                      capture_output=True, text=True, timeout=1800)
-                    if r.stdout:
-                        print(r.stdout[-1000:])
-                    if r.stderr:
-                        print("  STDERR:", r.stderr[-1000:])
+                                      timeout=1800)
                     if r.returncode != 0:
                         raise RuntimeError(f"COLMAP patch_match_stereo failed (code {r.returncode})")
 
@@ -950,9 +946,9 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
                                    '--workspace_path', dense_dir,
                                    '--output_path', output_ply,
                                    '--StereoFusion.min_num_pixels', '3'],
-                                  capture_output=True, text=True, timeout=600)
+                                  timeout=600)
                 if r.returncode != 0:
-                    raise RuntimeError(f"stereo_fusion failed: {r.stderr[-500:]}")
+                    raise RuntimeError(f"stereo_fusion failed (code {r.returncode})")
         except Exception as e2:
             print(f"  Fusion error: {e2}")
             raise
