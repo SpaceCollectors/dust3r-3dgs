@@ -780,7 +780,9 @@ def _find_colmap_exe():
     return None
 
 
-def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
+def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
+                   max_image_size=-1, num_iterations=5, window_radius=5,
+                   min_consistent=2, geom_consistency=True, filter_min_ncc=0.1):
     """Dense MVS via COLMAP PatchMatch + stereo fusion.
 
     Creates a COLMAP workspace from known cameras, runs GPU PatchMatch
@@ -878,8 +880,13 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
 
         try:
             opts = pycolmap.PatchMatchOptions()
-            opts.num_iterations = 5
-            opts.geom_consistency = True
+            opts.num_iterations = num_iterations
+            opts.geom_consistency = geom_consistency
+            opts.window_radius = window_radius
+            opts.filter_min_ncc = filter_min_ncc
+            opts.filter_min_num_consistent = min_consistent
+            if max_image_size > 0:
+                opts.max_image_size = max_image_size
             pycolmap.patch_match_stereo(workspace_path=dense_dir, options=opts)
             print("  PatchMatch complete (pycolmap)")
         except (ValueError, RuntimeError) as e:
@@ -899,12 +906,19 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
                     depth_max = scene_extent * 100
                     print(f"  Depth range: {depth_min:.4f} - {depth_max:.4f}")
 
-                    r = subprocess.run([colmap_exe, 'patch_match_stereo',
-                                       '--workspace_path', dense_dir,
-                                       '--PatchMatchStereo.geom_consistency', 'true',
-                                       '--PatchMatchStereo.depth_min', str(depth_min),
-                                       '--PatchMatchStereo.depth_max', str(depth_max)],
-                                      timeout=1800)
+                    cmd = [colmap_exe, 'patch_match_stereo',
+                           '--workspace_path', dense_dir,
+                           '--PatchMatchStereo.geom_consistency', str(geom_consistency).lower(),
+                           '--PatchMatchStereo.depth_min', str(depth_min),
+                           '--PatchMatchStereo.depth_max', str(depth_max),
+                           '--PatchMatchStereo.num_iterations', str(num_iterations),
+                           '--PatchMatchStereo.window_radius', str(window_radius),
+                           '--PatchMatchStereo.filter_min_ncc', str(filter_min_ncc),
+                           '--PatchMatchStereo.filter_min_num_consistent', str(min_consistent)]
+                    if max_image_size > 0:
+                        cmd += ['--PatchMatchStereo.max_image_size', str(max_image_size)]
+                    print(f"  CMD: {' '.join(cmd[-8:])}")
+                    r = subprocess.run(cmd, timeout=1800)
                     if r.returncode != 0:
                         raise RuntimeError(f"COLMAP patch_match_stereo failed (code {r.returncode})")
 
@@ -934,7 +948,7 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
         try:
             if not used_exe:
                 fuse_opts = pycolmap.StereoFusionOptions()
-                fuse_opts.min_num_pixels = 3
+                fuse_opts.min_num_pixels = min_consistent
                 pycolmap.stereo_fusion(
                     output_path=output_ply,
                     workspace_path=dense_dir,
@@ -945,7 +959,7 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
                 r = subprocess.run([colmap_exe, 'stereo_fusion',
                                    '--workspace_path', dense_dir,
                                    '--output_path', output_ply,
-                                   '--StereoFusion.min_num_pixels', '3'],
+                                   '--StereoFusion.min_num_pixels', str(min_consistent)],
                                   timeout=600)
                 if r.returncode != 0:
                     raise RuntimeError(f"stereo_fusion failed (code {r.returncode})")

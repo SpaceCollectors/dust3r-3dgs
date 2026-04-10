@@ -760,6 +760,14 @@ class AppState:
         self.mask_before_recon = True  # mask images BEFORE reconstruction (better isolation)
         self.masked_image_paths = None  # paths to pre-masked images (temp dir)
 
+        # COLMAP PatchMatch options
+        self.pm_max_image_size = -1     # -1 = full resolution
+        self.pm_num_iterations = 5
+        self.pm_window_radius = 5       # matching patch = (2*r+1)^2
+        self.pm_min_consistent = 2      # min views that must agree
+        self.pm_geom_consistency = True
+        self.pm_filter_min_ncc = 0.1
+
         # Point cloud / Mesh
         self.has_points = False
         self.points_modified = False  # True after smooth/upscale (don't reset on conf change)
@@ -2058,8 +2066,15 @@ def run_densify_colmap(state, scene_gl):
         def progress(msg):
             state.refine_progress = msg
 
+        pm_opts = dict(
+            max_image_size=state.pm_max_image_size,
+            num_iterations=state.pm_num_iterations,
+            window_radius=state.pm_window_radius,
+            min_consistent=state.pm_min_consistent,
+            geom_consistency=state.pm_geom_consistency,
+            filter_min_ncc=state.pm_filter_min_ncc)
         dense_pts, dense_cols = densify_colmap(
-            state.image_paths, c2w_list, K_list, progress_fn=progress)
+            state.image_paths, c2w_list, K_list, progress_fn=progress, **pm_opts)
 
         if len(dense_pts) > 0:
             # Replace scene data with the dense cloud
@@ -3749,6 +3764,15 @@ def main():
 
         # ── Densify ──
         if state.has_points and state.scene is not None and not state.refining:
+            if imgui.tree_node("PatchMatch Options"):
+                _, state.pm_max_image_size = imgui.input_int("Max Image Size", state.pm_max_image_size, 100, 500)
+                _, state.pm_num_iterations = imgui.input_int("Iterations", state.pm_num_iterations, 1, 1)
+                _, state.pm_window_radius = imgui.input_int("Window Radius", state.pm_window_radius, 1, 1)
+                _, state.pm_min_consistent = imgui.input_int("Min Consistent Views", state.pm_min_consistent, 1, 1)
+                _, state.pm_geom_consistency = imgui.checkbox("Geometric Consistency", state.pm_geom_consistency)
+                _, state.pm_filter_min_ncc = imgui.input_float("Min NCC", state.pm_filter_min_ncc, 0.01, 0.05)
+                imgui.text_colored("(-1 = full resolution)", 0.5, 0.5, 0.5)
+                imgui.tree_pop()
             if imgui.button("Densify (COLMAP PatchMatch)", width=-1):
                 state.refining = True
                 state.refine_thread = threading.Thread(
