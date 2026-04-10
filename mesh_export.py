@@ -758,6 +758,28 @@ def densify_sgm(image_paths, c2w_list, K_list, existing_pts=None,
     return points, colors
 
 
+def _find_colmap_exe():
+    """Find COLMAP executable — check PATH, project folder, common locations."""
+    import shutil
+    # Check PATH
+    exe = shutil.which('colmap')
+    if exe:
+        return exe
+    # Check project subfolder
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for subdir in ['colmap', 'COLMAP', 'colmap/bin', 'COLMAP/bin']:
+        candidate = os.path.join(script_dir, subdir, 'colmap.exe')
+        if os.path.exists(candidate):
+            return candidate
+    # Check Program Files
+    for pf in [os.environ.get('ProgramFiles', ''), os.environ.get('ProgramFiles(x86)', '')]:
+        if pf:
+            candidate = os.path.join(pf, 'COLMAP', 'bin', 'colmap.exe')
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
 def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
     """Dense MVS via COLMAP PatchMatch + stereo fusion.
 
@@ -836,23 +858,69 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
         print("  Images undistorted")
 
         # Step 3: PatchMatch stereo (GPU)
+        # Try pycolmap first, fall back to COLMAP executable
         if progress_fn: progress_fn("PatchMatch stereo (GPU)...")
         print("  Running PatchMatch stereo...")
-        opts = pycolmap.PatchMatchOptions()
-        opts.num_iterations = 5
-        opts.geom_consistency = True
-        pycolmap.patch_match_stereo(workspace_path=dense_dir, options=opts)
-        print("  PatchMatch complete")
+
+        output_ply = os.path.join(dense_dir, "fused.ply")
+        used_exe = False
+
+        try:
+            opts = pycolmap.PatchMatchOptions()
+            opts.num_iterations = 5
+            opts.geom_consistency = True
+            pycolmap.patch_match_stereo(workspace_path=dense_dir, options=opts)
+            print("  PatchMatch complete (pycolmap)")
+        except (ValueError, RuntimeError) as e:
+            if 'CUDA' in str(e):
+                # pycolmap has no CUDA — try COLMAP executable
+                print("  pycolmap has no CUDA, trying COLMAP executable...")
+                colmap_exe = _find_colmap_exe()
+                if colmap_exe:
+                    used_exe = True
+                    import subprocess
+                    # PatchMatch
+                    if progress_fn: progress_fn("PatchMatch stereo (COLMAP exe)...")
+                    r = subprocess.run([colmap_exe, 'patch_match_stereo',
+                                       '--workspace_path', dense_dir,
+                                       '--PatchMatchStereo.geom_consistency', 'true'],
+                                      capture_output=True, text=True, timeout=1800)
+                    print(r.stdout[-500:] if r.stdout else "")
+                    if r.returncode != 0:
+                        raise RuntimeError(f"COLMAP patch_match_stereo failed: {r.stderr[-500:]}")
+                    print("  PatchMatch complete (COLMAP exe)")
+                else:
+                    raise RuntimeError(
+                        "No CUDA support. Install COLMAP with CUDA:\n"
+                        "  Download from: https://github.com/colmap/colmap/releases\n"
+                        "  Get: colmap-x64-windows-cuda.zip\n"
+                        "  Extract and add to PATH, or put in project folder as colmap/")
+            else:
+                raise
 
         # Step 4: Stereo fusion
         if progress_fn: progress_fn("Fusing depth maps...")
-        output_ply = os.path.join(dense_dir, "fused.ply")
-        fuse_opts = pycolmap.StereoFusionOptions()
-        fuse_opts.min_num_pixels = 3
-        pycolmap.stereo_fusion(
-            output_path=output_ply,
-            workspace_path=dense_dir,
-            options=fuse_opts)
+        try:
+            if not used_exe:
+                fuse_opts = pycolmap.StereoFusionOptions()
+                fuse_opts.min_num_pixels = 3
+                pycolmap.stereo_fusion(
+                    output_path=output_ply,
+                    workspace_path=dense_dir,
+                    options=fuse_opts)
+            else:
+                import subprocess
+                colmap_exe = _find_colmap_exe()
+                r = subprocess.run([colmap_exe, 'stereo_fusion',
+                                   '--workspace_path', dense_dir,
+                                   '--output_path', output_ply,
+                                   '--StereoFusion.min_num_pixels', '3'],
+                                  capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    raise RuntimeError(f"stereo_fusion failed: {r.stderr[-500:]}")
+        except Exception as e2:
+            print(f"  Fusion error: {e2}")
+            raise
         print(f"  Fused to {output_ply}")
 
         # Step 5: Load the fused point cloud
