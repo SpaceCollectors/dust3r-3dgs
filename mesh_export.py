@@ -782,7 +782,8 @@ def _find_colmap_exe():
 
 def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
                    max_image_size=-1, num_iterations=5, window_radius=5,
-                   min_consistent=2, geom_consistency=True, filter_min_ncc=0.1):
+                   min_consistent=2, geom_consistency=True, filter_min_ncc=0.1,
+                   existing_pts=None):
     """Dense MVS via COLMAP PatchMatch + stereo fusion.
 
     Creates a COLMAP workspace from known cameras, runs GPU PatchMatch
@@ -899,11 +900,30 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
                     import subprocess
                     # PatchMatch
                     if progress_fn: progress_fn("PatchMatch stereo (COLMAP exe)...")
-                    # Estimate depth range from camera positions
+                    # Estimate depth range from camera-to-point distances
                     cam_centers = np.array([c[:3, 3] for c in c2w_list])
                     scene_extent = np.linalg.norm(cam_centers.max(0) - cam_centers.min(0))
-                    depth_min = max(scene_extent * 0.01, 0.01)
-                    depth_max = scene_extent * 100
+
+                    # If we have existing points, compute actual depth range
+                    if existing_pts is not None and len(existing_pts) > 0:
+                        all_dists = []
+                        for ci in range(len(c2w_list)):
+                            w2c = np.linalg.inv(c2w_list[ci])
+                            pts_cam = (w2c[:3, :3] @ existing_pts.T).T + w2c[:3, 3]
+                            z = pts_cam[:, 2]
+                            z_valid = z[z > 0]
+                            if len(z_valid) > 0:
+                                all_dists.append(z_valid)
+                        if all_dists:
+                            all_z = np.concatenate(all_dists)
+                            depth_min = max(float(np.percentile(all_z, 1)) * 0.5, 0.001)
+                            depth_max = float(np.percentile(all_z, 99)) * 2.0
+                        else:
+                            depth_min = max(scene_extent * 0.1, 0.01)
+                            depth_max = scene_extent * 10
+                    else:
+                        depth_min = max(scene_extent * 0.1, 0.01)
+                        depth_max = scene_extent * 10
                     print(f"  Depth range: {depth_min:.4f} - {depth_max:.4f}")
 
                     cmd = [colmap_exe, 'patch_match_stereo',

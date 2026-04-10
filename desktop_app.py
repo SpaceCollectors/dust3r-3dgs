@@ -2066,13 +2066,21 @@ def run_densify_colmap(state, scene_gl):
         def progress(msg):
             state.refine_progress = msg
 
+        # Collect existing points for depth range estimation
+        existing = None
+        if pts3d_list:
+            all_p = [p.reshape(-1, 3) for p in pts3d_list if p is not None]
+            if all_p:
+                existing = np.concatenate(all_p, axis=0).astype(np.float32)
+
         pm_opts = dict(
             max_image_size=state.pm_max_image_size,
             num_iterations=state.pm_num_iterations,
             window_radius=state.pm_window_radius,
             min_consistent=state.pm_min_consistent,
             geom_consistency=state.pm_geom_consistency,
-            filter_min_ncc=state.pm_filter_min_ncc)
+            filter_min_ncc=state.pm_filter_min_ncc,
+            existing_pts=existing)
         dense_pts, dense_cols = densify_colmap(
             state.image_paths, c2w_list, K_list, progress_fn=progress, **pm_opts)
 
