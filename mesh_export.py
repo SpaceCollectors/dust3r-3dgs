@@ -857,6 +857,17 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
             image_path=img_dir)
         print("  Images undistorted")
 
+        # Override patch-match.cfg to list all images as sources for each
+        # (needed because our points3D.txt is empty so __auto__ finds nothing)
+        cfg_path = os.path.join(dense_dir, 'stereo', 'patch-match.cfg')
+        img_names = [os.path.basename(p) for p in image_paths]
+        with open(cfg_path, 'w') as f:
+            for name in img_names:
+                f.write(f"{name}\n")
+                sources = [n for n in img_names if n != name]
+                f.write(f"{', '.join(sources)}\n")
+        print(f"  Wrote patch-match.cfg: {n_imgs} images, all-vs-all")
+
         # Step 3: PatchMatch stereo (GPU)
         # Try pycolmap first, fall back to COLMAP executable
         if progress_fn: progress_fn("PatchMatch stereo (GPU)...")
