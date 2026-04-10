@@ -757,6 +757,8 @@ class AppState:
         self.mask_sky = False  # auto-detect and mask sky pixels
         self.mask_prompt = ""  # text prompt to isolate subject (empty = disabled)
         self.mask_prompt_mode = 0  # 0=keep subject, 1=remove subject
+        self.mask_before_recon = True  # mask images BEFORE reconstruction (better isolation)
+        self.masked_image_paths = None  # paths to pre-masked images (temp dir)
 
         # Point cloud / Mesh
         self.has_points = False
@@ -839,6 +841,22 @@ def run_reconstruction(state, scene_gl):
 
     try:
         backend = state.backends[state.backend_idx]
+
+        # Pre-masking: create masked images before reconstruction
+        original_paths = list(state.image_paths)
+        if state.mask_before_recon and (state.mask_prompt.strip() or state.mask_sky):
+            state.status = "Pre-masking images..."
+            try:
+                masked_paths, _ = _create_masked_images(
+                    state.image_paths,
+                    prompt=state.mask_prompt.strip() if state.mask_prompt.strip() else None,
+                    keep=(state.mask_prompt_mode == 0),
+                    mask_sky=state.mask_sky)
+                state.masked_image_paths = masked_paths
+                state.image_paths = masked_paths  # backends will use masked images
+                print(f"  Using pre-masked images from {os.path.dirname(masked_paths[0])}")
+            except Exception as e:
+                print(f"  Pre-masking failed: {e}, using original images")
 
         # Stack mode: run multiple backends and merge their point clouds
         if state.stack_backends:
@@ -1563,6 +1581,10 @@ print('SUCCESS')
         state.error_msg = str(e)
         state.status = f"Error: {e}"
         import traceback
+    finally:
+        # Restore original image paths (masked ones were just for reconstruction)
+        if 'original_paths' in dir() and original_paths:
+            state.image_paths = original_paths
         traceback.print_exc()
 
     state.reconstructing = False
@@ -1814,6 +1836,64 @@ def _detect_sky_masks(image_paths):
     except Exception as e:
         print(f"  Sky detection failed: {e}")
         return None
+
+
+def _create_masked_images(image_paths, prompt, keep=True, mask_sky=False, threshold=0.5):
+    """Create masked copies of images, blacking out non-subject pixels.
+    Returns list of new image paths in a temp directory."""
+    from PIL import Image as PILImage
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="masked_")
+    masks = []
+
+    # Get subject masks if prompt given
+    if prompt:
+        subject_masks = _detect_subject_masks(image_paths, prompt, keep=keep, threshold=threshold)
+    else:
+        subject_masks = None
+
+    # Get sky masks if requested
+    if mask_sky:
+        sky_masks = _detect_sky_masks(image_paths)
+    else:
+        sky_masks = None
+
+    new_paths = []
+    for i, path in enumerate(image_paths):
+        img = PILImage.open(path).convert('RGB')
+        img_np = np.array(img)
+
+        # Combine masks: start with all-keep
+        keep_mask = np.ones((img.height, img.width), dtype=bool)
+
+        if subject_masks is not None and i < len(subject_masks):
+            m = subject_masks[i]
+            if m.shape != keep_mask.shape:
+                m = np.array(PILImage.fromarray(m).resize(
+                    (img.width, img.height), PILImage.NEAREST))
+            keep_mask &= m
+
+        if sky_masks is not None and i < len(sky_masks):
+            m = sky_masks[i]
+            if m.shape != keep_mask.shape:
+                m = np.array(PILImage.fromarray(m).resize(
+                    (img.width, img.height), PILImage.NEAREST))
+            keep_mask &= ~m  # sky = remove
+
+        # Black out non-subject pixels
+        img_np[~keep_mask] = 0
+        masked_img = PILImage.fromarray(img_np)
+
+        new_path = os.path.join(tmpdir, os.path.basename(path))
+        masked_img.save(new_path, quality=95)
+        new_paths.append(new_path)
+
+        n_kept = keep_mask.sum()
+        print(f"    Image {i+1}: {n_kept:,d}/{keep_mask.size:,d} pixels kept ({n_kept * 100 // max(keep_mask.size, 1)}%)")
+
+    # Also save the masks for post-reconstruction confidence zeroing
+    return new_paths, masks if masks else None
 
 
 def _detect_subject_masks(image_paths, prompt, keep=True, threshold=0.5):
@@ -3424,8 +3504,11 @@ def main():
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
         _, state.mask_sky = imgui.checkbox("Mask Sky", state.mask_sky)
         _, state.mask_prompt = imgui.input_text("Isolate Subject", state.mask_prompt, 256)
-        if state.mask_prompt.strip():
-            _, state.mask_prompt_mode = imgui.combo("##mask_mode", state.mask_prompt_mode, ["Keep", "Remove"])
+        if state.mask_prompt.strip() or state.mask_sky:
+            if state.mask_prompt.strip():
+                imgui.same_line()
+                _, state.mask_prompt_mode = imgui.combo("##mask_mode", state.mask_prompt_mode, ["Keep", "Remove"])
+            _, state.mask_before_recon = imgui.checkbox("Mask before reconstruction", state.mask_before_recon)
 
         # Live-update point cloud when confidence threshold changes
         # (only if cloud hasn't been modified by smooth/upscale)
