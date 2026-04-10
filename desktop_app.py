@@ -1705,16 +1705,10 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         if len(all_pts) < 10:
             return
 
-        # Build scene rotation matrix
-        def _build_rot(rx, ry, rz):
-            cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
-            cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
-            cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
-            Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]], dtype=np.float32)
-            Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]], dtype=np.float32)
-            Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]], dtype=np.float32)
-            return Rx @ Ry @ Rz
-        R_scene = _build_rot(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
+        # Build scene rotation matrix (must match rendering)
+        from scipy.spatial.transform import Rotation as SciRot
+        R_scene = SciRot.from_euler('xyz', [state.scene_rot_x, state.scene_rot_y, state.scene_rot_z],
+                                     degrees=True).as_matrix().astype(np.float32)
 
         # Transform points to display space (same as shader)
         pts_display = (R_scene @ all_pts.T).T
@@ -1854,20 +1848,11 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         else:
             return
 
-        # Extract Euler XYZ from R_new
-        sy = np.sqrt(R_new[0, 0] ** 2 + R_new[1, 0] ** 2)
-        if sy > 1e-6:
-            rx = np.arctan2(R_new[2, 1], R_new[2, 2])
-            ry = np.arctan2(-R_new[2, 0], sy)
-            rz = np.arctan2(R_new[1, 0], R_new[0, 0])
-        else:
-            rx = np.arctan2(-R_new[1, 2], R_new[1, 1])
-            ry = np.arctan2(-R_new[2, 0], sy)
-            rz = 0
-
-        state.scene_rot_x = float(np.degrees(rx))
-        state.scene_rot_y = float(np.degrees(ry))
-        state.scene_rot_z = float(np.degrees(rz))
+        # Extract Euler XYZ (must match rendering convention)
+        euler = SciRot.from_matrix(R_new.astype(np.float64)).as_euler('xyz', degrees=True)
+        state.scene_rot_x = float(euler[0])
+        state.scene_rot_y = float(euler[1])
+        state.scene_rot_z = float(euler[2])
 
     except Exception as e:
         state.status = f"Alignment failed: {e}"
