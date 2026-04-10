@@ -3173,6 +3173,11 @@ def run_texture(state, scene_gl):
             output_dir=export_dir, min_conf_thr=state.min_conf)
 
         views = load_cameras(export_dir)
+        # Pass COLMAP workspace path for COLMAP mesh_texturer
+        colmap_wd = getattr(state, '_colmap_workdir', None)
+        if colmap_wd:
+            for v in views:
+                v['_colmap_workdir'] = colmap_wd
         verts, faces, colors = state.mesh_data
 
         output_dir = os.path.join(tmpdir, 'textured')

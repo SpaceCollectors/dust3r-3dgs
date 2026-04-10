@@ -14,19 +14,33 @@ def create_textured_mesh(verts, faces, colors, views, output_dir,
                          texture_size=4096, return_data=False):
     os.makedirs(output_dir, exist_ok=True)
 
-    # Try PyMeshLab texturing first (much better quality)
+    # Try COLMAP mesh_texturer first (uses correct cameras from dense workspace)
+    colmap_workdir = views[0].get('_colmap_workdir') if views else None
+    if colmap_workdir:
+        try:
+            result = _texture_colmap(verts, faces, colmap_workdir, output_dir)
+            if result is not None:
+                if return_data:
+                    try:
+                        tex_img = np.array(Image.open(os.path.join(output_dir, 'texture.png')))
+                        return result, None, None, tex_img
+                    except Exception:
+                        return result, None, None, None
+                return result
+        except Exception as e:
+            print(f"  COLMAP texturing failed: {e}, falling back to custom")
+
+    # Try PyMeshLab texturing
     try:
         result = _texture_pymeshlab(verts, faces, views, output_dir, texture_size)
         if result is not None:
-            obj_path = result
             if return_data:
-                # Load back for viewport display
                 try:
                     tex_img = np.array(Image.open(os.path.join(output_dir, 'texture.png')))
-                    return obj_path, None, None, tex_img
+                    return result, None, None, tex_img
                 except Exception:
-                    return obj_path, None, None, None
-            return obj_path
+                    return result, None, None, None
+            return result
     except Exception as e:
         print(f"  PyMeshLab texturing failed: {e}, falling back to custom")
         import traceback; traceback.print_exc()
@@ -314,6 +328,53 @@ def _compute_color_correction(verts, faces, face_best_cam, views, n_cams):
     print(f"  Color correction: {n_corrected} cameras normalized to camera {ref_cam}")
     return cam_color_scale, cam_color_offset
 
+
+
+def _texture_colmap(verts, faces, colmap_workdir, output_dir):
+    """Texture mesh using COLMAP's mesh_texturer (uses dense workspace cameras)."""
+    import subprocess
+    from mesh_export import _find_colmap_exe, save_mesh_ply
+
+    colmap_exe = _find_colmap_exe()
+    if not colmap_exe:
+        return None
+
+    # Check for dense workspace
+    dense_dir = os.path.join(colmap_workdir, 'dense')
+    if not os.path.isdir(dense_dir):
+        dense_dir = colmap_workdir
+
+    # Save mesh as PLY
+    mesh_ply = os.path.join(output_dir, 'mesh_for_tex.ply')
+    dummy_colors = np.full((len(verts), 3), 180, dtype=np.uint8)
+    save_mesh_ply(mesh_ply, verts, faces, dummy_colors)
+
+    print(f"  COLMAP mesh_texturer: workspace={dense_dir}")
+    r = subprocess.run([colmap_exe, 'mesh_texturer',
+                       '--workspace_path', dense_dir,
+                       '--input_path', mesh_ply,
+                       '--output_path', output_dir],
+                      capture_output=True, text=True, timeout=600)
+    if r.stderr:
+        for line in r.stderr.split('\n'):
+            if line.strip():
+                print(f"    {line.strip()}")
+
+    # Find output files
+    for f in os.listdir(output_dir):
+        if f.endswith('.ply') and 'textured' in f.lower():
+            print(f"  COLMAP textured mesh: {f}")
+            return os.path.join(output_dir, f)
+        if f.endswith('.obj'):
+            print(f"  COLMAP textured mesh: {f}")
+            return os.path.join(output_dir, f)
+
+    # Check if mesh_for_tex was modified in-place
+    if r.returncode == 0:
+        print("  COLMAP texturing completed")
+        return mesh_ply
+
+    return None
 
 
 def _texture_pymeshlab(verts, faces, views, output_dir, texture_size=4096):
