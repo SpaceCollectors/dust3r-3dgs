@@ -116,9 +116,10 @@ def load_cameras(data_dir):
         w2c[:3, 3] = [tx, ty, tz]
         K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
 
-        img = np.array(Image.open(os.path.join(images_dir, p[9])).convert('RGB'),
+        img_path = os.path.join(images_dir, p[9])
+        img = np.array(Image.open(img_path).convert('RGB'),
                        dtype=np.float32) / 255.0
-        views.append({'w2c': w2c, 'K': K, 'W': W, 'H': H, 'pixels': img})
+        views.append({'w2c': w2c, 'K': K, 'W': W, 'H': H, 'pixels': img, 'path': img_path})
     return views
 
 

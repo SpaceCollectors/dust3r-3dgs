@@ -13,6 +13,23 @@ from PIL import Image, ImageDraw
 def create_textured_mesh(verts, faces, colors, views, output_dir,
                          texture_size=4096, return_data=False):
     os.makedirs(output_dir, exist_ok=True)
+
+    # Try PyMeshLab texturing first (much better quality)
+    try:
+        result = _texture_pymeshlab(verts, faces, views, output_dir, texture_size)
+        if result is not None:
+            obj_path = result
+            if return_data:
+                # Load back for viewport display
+                try:
+                    tex_img = np.array(Image.open(os.path.join(output_dir, 'texture.png')))
+                    return obj_path, None, None, tex_img
+                except Exception:
+                    return obj_path, None, None, None
+            return obj_path
+    except Exception as e:
+        print(f"  PyMeshLab texturing failed: {e}, falling back to custom")
+        import traceback; traceback.print_exc()
     V, F = len(verts), len(faces)
     print(f"  Creating texture for {V:,d} verts, {F:,d} faces, {texture_size}px")
 
@@ -297,6 +314,119 @@ def _compute_color_correction(verts, faces, face_best_cam, views, n_cams):
     print(f"  Color correction: {n_corrected} cameras normalized to camera {ref_cam}")
     return cam_color_scale, cam_color_offset
 
+
+
+def _texture_pymeshlab(verts, faces, views, output_dir, texture_size=4096):
+    """Texture a mesh using PyMeshLab's registered raster texturing.
+    Writes an MLP project file with camera poses, then calls the texturing filter."""
+    import pymeshlab
+    import tempfile
+
+    n_views = len(views)
+    if n_views == 0:
+        return None
+
+    print(f"  PyMeshLab texturing: {len(verts):,d} verts, {len(faces):,d} faces, {n_views} cameras")
+
+    # Save mesh as PLY
+    mesh_path = os.path.join(output_dir, 'mesh_for_tex.ply')
+    from mesh_export import save_mesh_ply
+    dummy_colors = np.full((len(verts), 3), 180, dtype=np.uint8)
+    save_mesh_ply(mesh_path, verts, faces, dummy_colors)
+
+    # Copy images to output dir and build camera data
+    image_entries = []
+    for ci, view in enumerate(views):
+        w2c = view['w2c']
+        K = view['K']
+        W_img, H_img = int(view['W']), int(view['H'])
+
+        # Copy image
+        src_path = view.get('path', '')
+        if src_path and os.path.exists(src_path):
+            import shutil
+            dst = os.path.join(output_dir, f"cam_{ci:04d}.jpg")
+            shutil.copy2(src_path, dst)
+            img_name = os.path.basename(dst)
+        else:
+            # Save from pixels array
+            pixels = view.get('pixels', None)
+            if pixels is None:
+                continue
+            img_name = f"cam_{ci:04d}.jpg"
+            dst = os.path.join(output_dir, img_name)
+            img_arr = (np.clip(pixels, 0, 1) * 255).astype(np.uint8)
+            Image.fromarray(img_arr).save(dst, quality=95)
+
+        # VCG camera format: world-to-camera [R|t]
+        R = w2c[:3, :3]
+        t = w2c[:3, 3]
+
+        # Intrinsics: FocalMm = fx (with PixelSizeMm = 1.0)
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = int(round(K[0, 2]))
+        cy = int(round(K[1, 2]))
+
+        rot_str = f"{R[0,0]} {R[0,1]} {R[0,2]} 0 {R[1,0]} {R[1,1]} {R[1,2]} 0 {R[2,0]} {R[2,1]} {R[2,2]} 0 0 0 0 1"
+        t_str = f"{t[0]} {t[1]} {t[2]} 1"
+
+        image_entries.append((img_name, rot_str, t_str, fx, W_img, H_img, cx, cy))
+
+    if not image_entries:
+        return None
+
+    # Write MLP project file
+    mlp_path = os.path.join(output_dir, 'project.mlp')
+    mesh_name = os.path.basename(mesh_path)
+
+    rasters = ""
+    for img_name, rot_str, t_str, fx, W, H, cx, cy in image_entries:
+        rasters += f'''  <MLRaster label="{img_name}">
+   <VCGCamera TranslationVector="{t_str}" RotationMatrix="{rot_str}" FocalMm="{fx}" ViewportPx="{W} {H}" PixelSizeMm="1 1" CenterPx="{cx} {cy}" LensDistortion="0 0" CameraType="0" BinaryData="0"/>
+   <Plane semantic="1" fileName="{img_name}"/>
+  </MLRaster>
+'''
+
+    mlp_content = f'''<!DOCTYPE MeshLabDocument>
+<MeshLabProject>
+ <MeshGroup>
+  <MLMesh visible="1" label="{mesh_name}" filename="{mesh_name}">
+   <MLMatrix44>
+1 0 0 0
+0 1 0 0
+0 0 1 0
+0 0 0 1
+</MLMatrix44>
+  </MLMesh>
+ </MeshGroup>
+ <RasterGroup>
+{rasters} </RasterGroup>
+</MeshLabProject>'''
+
+    with open(mlp_path, 'w') as f:
+        f.write(mlp_content)
+    print(f"  Wrote MLP project: {len(image_entries)} cameras")
+
+    # Load project and run texturing
+    ms = pymeshlab.MeshSet()
+    ms.load_project(mlp_path)
+    print(f"  Loaded: {ms.mesh_number()} meshes, {ms.raster_number()} rasters")
+
+    ms.compute_texcoord_parametrization_and_texture_from_registered_rasters(
+        texturesize=texture_size,
+        texturename='texture.png',
+        colorcorrection=True,
+        usedistanceweight=True,
+        useimgborderweight=True,
+        cleanisolatedtriangles=True,
+        texturegutter=4)
+
+    # Save textured mesh
+    obj_path = os.path.join(output_dir, 'mesh.obj')
+    ms.save_current_mesh(obj_path)
+    print(f"  Saved textured mesh: {obj_path}")
+    return obj_path
 
 
 def _unwrap_uvs(verts, faces):

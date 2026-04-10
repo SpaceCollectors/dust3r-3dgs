@@ -15,7 +15,8 @@ import struct
 def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
                       intrinsics_list=None, min_conf=2.0,
                       poisson_depth=8, normal_radius=0.03, trim_percentile=5,
-                      mode='reprojected', hole_cap_size=50, dense_colors=None):
+                      mode='reprojected', hole_cap_size=50, dense_colors=None,
+                      bp_radius_mult=4.0):
     """Create mesh from multi-view point clouds.
 
     mode='reprojected': Voxel-merge all points, shared vertex grid triangulation.
@@ -89,7 +90,8 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
                                           cam2world_list, min_conf)
     else:
         v, f, c = _mesh_ball_pivot(imgs, pts3d_list, confs_list,
-                                    cam2world_list, min_conf, dense_colors=dense_colors)
+                                    cam2world_list, min_conf, dense_colors=dense_colors,
+                                    radius_mult=bp_radius_mult)
 
     # Close holes using PyMeshLab
     if hole_cap_size > 0 and len(f) > 0:
@@ -533,7 +535,7 @@ def _mesh_ball_pivot_from_cloud(points, colors, cam_center=None):
     return out_v, out_f, out_c
 
 
-def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf, dense_colors=None):
+def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf, dense_colors=None, radius_mult=4.0):
     """Voxel-dedup all points, then ball-pivot into a single mesh."""
     import open3d as o3d
 
@@ -570,11 +572,13 @@ def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf, den
     else:
         pcd.orient_normals_consistent_tangent_plane(k=15)
 
-    # Ball-pivoting with wide radii range
+    # Ball-pivoting with user-controlled max radius
     dists = np.asarray(pcd.compute_nearest_neighbor_distance())
     avg_dist = np.mean(dists)
-    radii = [avg_dist * 1.0, avg_dist * 2.0, avg_dist * 4.0, avg_dist * 8.0]
-    print(f"  Ball-pivoting (radii={[f'{r:.5f}' for r in radii]})...")
+    max_r = avg_dist * radius_mult
+    radii = sorted(set([avg_dist, avg_dist * 2, max_r * 0.5, max_r]))
+    radii = [r for r in radii if r > 0]
+    print(f"  Ball-pivoting (radii={[f'{r:.6f}' for r in radii]}, avg_dist={avg_dist:.6f})...")
 
     mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
         pcd, o3d.utility.DoubleVector(radii))

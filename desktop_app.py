@@ -829,6 +829,7 @@ class AppState:
         self.smooth_radius = 2.0   # neighbor merge radius multiplier
         self.poisson_depth_val = 10  # Poisson octree depth (higher = more detail)
         self.poisson_trim = 5.0      # trim percentile for low-density regions
+        self.bp_radius_mult = 4.0    # ball pivot max radius multiplier (1=tight, 8=fill gaps)
         self.use_smoothing = False # whether to smooth before meshing
         self.ai_depth_mix = 0.7  # 0=pure dust3r, 1=full AI detail
         self.ai_highpass_radius = 10.0  # high-pass sigma in pixels
@@ -2417,7 +2418,8 @@ def run_dense_mesh(state, scene_gl):
                 mode=mesh_mode, hole_cap_size=state.hole_cap_size,
                 poisson_depth=state.poisson_depth_val,
                 trim_percentile=state.poisson_trim,
-                dense_colors=getattr(state, '_dense_colors', None))
+                dense_colors=getattr(state, '_dense_colors', None),
+                bp_radius_mult=state.bp_radius_mult)
 
         if len(faces) > 0:
             state.mesh_data = (verts, faces, colors)
@@ -3790,6 +3792,10 @@ def main():
         if state.mesh_modes[state.mesh_mode_idx] == 'poisson':
             _, state.poisson_depth_val = imgui.input_int("Octree Depth", state.poisson_depth_val, 1, 1)
             _, state.poisson_trim = imgui.input_float("Trim %", state.poisson_trim, 1.0, 5.0)
+        if state.mesh_modes[state.mesh_mode_idx] == 'ballpivot':
+            _, state.bp_radius_mult = imgui.input_float("Radius Mult", state.bp_radius_mult, 0.5, 1.0)
+            imgui.same_line()
+            imgui.text_colored("(1=tight, 8=fill gaps)", 0.5, 0.5, 0.5)
         changed_smooth, state.use_smoothing = imgui.checkbox("Smooth Points", state.use_smoothing)
         if state.use_smoothing:
             imgui.same_line()
