@@ -755,6 +755,8 @@ class AppState:
         self.recon_thread = None
 
         self.mask_sky = False  # auto-detect and mask sky pixels
+        self.mask_prompt = ""  # text prompt to isolate subject (empty = disabled)
+        self.mask_prompt_mode = 0  # 0=keep subject, 1=remove subject
 
         # Point cloud / Mesh
         self.has_points = False
@@ -1401,6 +1403,31 @@ print('SUCCESS')
             except Exception as e:
                 print(f"  Sky masking failed: {e}")
 
+        # Subject masking: keep or remove pixels matching text prompt
+        if state.mask_prompt.strip() and state.has_points:
+            try:
+                state.status = f"Detecting '{state.mask_prompt}'..."
+                keep = (state.mask_prompt_mode == 0)
+                subject_masks = _detect_subject_masks(
+                    state.image_paths, state.mask_prompt.strip(), keep=keep)
+                if subject_masks:
+                    pts3d_list, confs_list = _extract_scene_data(state)
+                    for i in range(min(len(subject_masks), len(confs_list))):
+                        mask = subject_masks[i]
+                        c = confs_list[i]
+                        if c is not None and c.ndim == 2:
+                            if mask.shape != c.shape:
+                                from PIL import Image as PILImage
+                                mask = np.array(PILImage.fromarray(mask).resize(
+                                    (c.shape[1], c.shape[0]), PILImage.NEAREST))
+                            # Zero confidence for pixels NOT in the keep mask
+                            c[~mask] = 0
+                            confs_list[i] = c
+                    state.confs_list = confs_list
+                    print(f"  Subject mask applied: '{state.mask_prompt}'")
+            except Exception as e:
+                print(f"  Subject masking failed: {e}")
+
         # Align to reference frame: if this is the first reconstruction, cache cameras.
         # If subsequent reconstruction, align to the cached cameras via Procrustes.
         if state.has_points and state.scene is not None:
@@ -1786,6 +1813,57 @@ def _detect_sky_masks(image_paths):
 
     except Exception as e:
         print(f"  Sky detection failed: {e}")
+        return None
+
+
+def _detect_subject_masks(image_paths, prompt, keep=True, threshold=0.5):
+    """Detect subject pixels matching a text prompt using CLIPSeg.
+    Returns list of (H, W) boolean masks where True = pixels to KEEP."""
+    try:
+        from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+        from PIL import Image as PILImage
+        import torch
+
+        print(f"  Loading CLIPSeg for prompt: '{prompt}'...")
+        processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
+        model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model = model.to(device)
+
+        masks = []
+        for i, path in enumerate(image_paths):
+            img = PILImage.open(path).convert('RGB')
+            inputs = processor(text=[prompt], images=[img], return_tensors="pt", padding=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+
+            # Sigmoid to get probability map, resize to image size
+            pred = torch.sigmoid(outputs.logits[0]).cpu().numpy()
+            # Resize prediction to image size
+            pred_resized = np.array(PILImage.fromarray(pred).resize(
+                (img.width, img.height), PILImage.BILINEAR))
+
+            if keep:
+                # Keep pixels matching the prompt
+                mask = pred_resized > threshold
+            else:
+                # Remove pixels matching the prompt
+                mask = pred_resized <= threshold
+
+            masks.append(mask)
+            n_selected = mask.sum()
+            print(f"    Image {i+1}: {n_selected:,d} pixels {'kept' if keep else 'removed'} ({n_selected * 100 // max(mask.size, 1)}%)")
+
+        del model, processor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return masks
+
+    except Exception as e:
+        print(f"  Subject detection failed: {e}")
+        import traceback; traceback.print_exc()
         return None
 
 
@@ -3345,6 +3423,9 @@ def main():
 
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
         _, state.mask_sky = imgui.checkbox("Mask Sky", state.mask_sky)
+        _, state.mask_prompt = imgui.input_text("Isolate Subject", state.mask_prompt, 256)
+        if state.mask_prompt.strip():
+            _, state.mask_prompt_mode = imgui.combo("##mask_mode", state.mask_prompt_mode, ["Keep", "Remove"])
 
         # Live-update point cloud when confidence threshold changes
         # (only if cloud hasn't been modified by smooth/upscale)
