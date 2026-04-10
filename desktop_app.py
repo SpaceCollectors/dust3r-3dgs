@@ -841,7 +841,7 @@ class AppState:
         # Scene orientation transform (applied in shader)
         self.scene_rot_x = 180.0  # degrees (DUSt3R convention: Y-down, flip to Y-up)
         self.align_mode = None  # None, 'floor', or 'wall' — waiting for click
-        self.align_radius = 0.5  # radius multiplier for point selection
+        self.align_radius = 20.0  # radius multiplier (Nx median local spacing)
         self.scene_rot_y = 0.0
         self.scene_rot_z = 0.0
         self.scene_flip_y = False
@@ -1754,15 +1754,34 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
 
         # Select neighborhood around hit point (in original space)
         point_dists = np.linalg.norm(all_pts - hit_pt, axis=-1)
-        # Auto radius: use 50x median of nearest 100 points
+        # Auto radius: use align_radius * median of nearest 100 points
         sorted_dists = np.sort(point_dists)
         median_local = float(np.median(sorted_dists[1:min(100, len(sorted_dists))]))
-        radius = median_local * 50
+        radius = median_local * state.align_radius
         mask = point_dists < radius
         neighborhood = all_pts[mask]
 
+        print(f"  Hit point: {hit_pt}, radius: {radius:.6f} ({state.align_radius}x), {mask.sum()} points selected")
+
+        # Visualize: show selected points in yellow, rest dimmed
+        dense_cols = getattr(state, '_dense_colors', None)
+        if dense_cols is not None and len(dense_cols) == len(all_pts):
+            vis_cols = (dense_cols * 0.3).astype(np.uint8)  # dim everything
+        else:
+            vis_cols = np.full((len(all_pts), 3), 60, dtype=np.uint8)
+        vis_cols[mask] = [255, 255, 0]  # yellow for selected
+        disp = all_pts
+        if len(disp) > 300000:
+            idx = np.random.choice(len(disp), 300000, replace=False)
+            # Make sure selected points are included
+            sel_idx = np.where(mask)[0]
+            if len(sel_idx) > 0:
+                idx = np.unique(np.concatenate([idx, sel_idx[:min(len(sel_idx), 50000)]]))
+            disp, vis_cols = all_pts[idx], vis_cols[idx]
+        scene_gl.set_points(disp, vis_cols)
+
         if len(neighborhood) < 10:
-            state.status = "Too few points at click location"
+            state.status = f"Too few points ({mask.sum()}) — try increasing radius"
             return
 
         # Fit plane via PCA on the neighborhood
@@ -3773,8 +3792,10 @@ def main():
 
         # Scene orientation
         imgui.text("Orientation")
+        _, state.align_radius = imgui.input_float("Align Radius", state.align_radius, 5.0, 10.0)
+        state.align_radius = max(5.0, state.align_radius)
         if state.align_mode:
-            imgui.text_colored(f"Click on the {state.align_mode} to align", 1.0, 1.0, 0.3)
+            imgui.text_colored(f"Click on the {state.align_mode} to align (yellow = selected)", 1.0, 1.0, 0.3)
             if imgui.button("Cancel"):
                 state.align_mode = None
         else:
