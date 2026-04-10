@@ -1692,9 +1692,8 @@ def run_depth_injection(state, scene_gl):
 
 
 def _handle_align_click(state, scene_gl, camera, mx, my, window):
-    """Handle click for floor/wall alignment.
-    Uses PCA on the full point cloud to find the dominant plane,
-    then aligns it. Click position is used to disambiguate orientation."""
+    """Align floor (Y-up at Y=0) or wall (XY plane at Z=0, centroid at origin).
+    Transforms the actual point data, not just the view rotation."""
     try:
         mode = state.align_mode
         state.align_mode = None
@@ -1702,76 +1701,85 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         pts3d_list = state.pts3d_list
         if pts3d_list is None:
             return
-        all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float32)
+        all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float64)
         if len(all_pts) < 10:
             return
 
-        # Subsample for speed
+        # Subsample for PCA
         if len(all_pts) > 50000:
             idx = np.random.choice(len(all_pts), 50000, replace=False)
             pts_sample = all_pts[idx]
         else:
             pts_sample = all_pts
 
-        # PCA on the point cloud — smallest eigenvector = dominant plane normal
+        # PCA — smallest eigenvector = dominant plane normal
         centroid = pts_sample.mean(axis=0)
         cov = (pts_sample - centroid).T @ (pts_sample - centroid)
         eigvals, eigvecs = np.linalg.eigh(cov)
-        normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue
+        normal = eigvecs[:, 0]  # plane normal
 
-        # Orient normal to point "up" relative to current scene rotation
-        def _build_rot(rx, ry, rz):
-            cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
-            cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
-            cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
-            Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]], dtype=np.float32)
-            Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]], dtype=np.float32)
-            Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]], dtype=np.float32)
-            return Rx @ Ry @ Rz
-        R_scene = _build_rot(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
-        normal_tf = R_scene @ normal
-        if normal_tf[1] < 0:
+        if mode == 'floor':
+            # Align normal to Y-up, centroid at Y=0
+            target = np.array([0, 1, 0], dtype=np.float64)
+        else:
+            # Wall: align normal to Z-forward (wall in XY plane at Z=0)
+            target = np.array([0, 0, 1], dtype=np.float64)
+
+        # Ensure normal points toward target hemisphere
+        if np.dot(normal, target) < 0:
             normal = -normal
 
-        print(f"  Align {mode}: normal={normal}, eigvals={eigvals}")
-
-        # Target direction
-        if mode == 'floor':
-            target = np.array([0, 1, 0], dtype=np.float32)
-        else:
-            target = np.array([0, 0, 1], dtype=np.float32)
-
         dot = np.clip(np.dot(normal, target), -1, 1)
-        if abs(dot) > 0.999:
-            state.status = f"Already aligned to {mode}"
-            return
-
-        axis = np.cross(normal, target)
-        axis /= max(np.linalg.norm(axis), 1e-8)
-        angle = float(np.arccos(dot))
-
-        K_mat = np.array([[0, -axis[2], axis[1]],
-                          [axis[2], 0, -axis[0]],
-                          [-axis[1], axis[0], 0]])
-        R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
-
-        R_existing = R_scene
-        R_new = R_align @ R_existing
-
-        sy = np.sqrt(R_new[0, 0] ** 2 + R_new[1, 0] ** 2)
-        if sy > 1e-6:
-            rx = np.arctan2(R_new[2, 1], R_new[2, 2])
-            ry = np.arctan2(-R_new[2, 0], sy)
-            rz = np.arctan2(R_new[1, 0], R_new[0, 0])
+        if abs(dot) < 0.9999:
+            axis = np.cross(normal, target)
+            axis /= max(np.linalg.norm(axis), 1e-12)
+            angle = np.arccos(dot)
+            K_mat = np.array([[0, -axis[2], axis[1]],
+                              [axis[2], 0, -axis[0]],
+                              [-axis[1], axis[0], 0]])
+            R = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
         else:
-            rx = np.arctan2(-R_new[1, 2], R_new[1, 1])
-            ry = np.arctan2(-R_new[2, 0], sy)
-            rz = 0
+            R = np.eye(3)
 
-        state.scene_rot_x = float(np.degrees(rx))
-        state.scene_rot_y = float(np.degrees(ry))
-        state.scene_rot_z = float(np.degrees(rz))
-        state.status = f"Aligned {mode}"
+        # Transform all points: rotate, then translate centroid to origin
+        rotated_centroid = R @ centroid
+        for i in range(len(pts3d_list)):
+            shape_orig = pts3d_list[i].shape
+            flat = pts3d_list[i].reshape(-1, 3).astype(np.float64)
+            flat = (R @ flat.T).T - rotated_centroid
+            pts3d_list[i] = flat.reshape(shape_orig).astype(np.float32)
+
+        state.pts3d_list = pts3d_list
+
+        # Reset scene rotation (alignment is baked into the data now)
+        state.scene_rot_x = 0.0
+        state.scene_rot_y = 0.0
+        state.scene_rot_z = 0.0
+
+        # Update display
+        all_pts_new = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0)
+        dense_cols = getattr(state, '_dense_colors', None)
+        if dense_cols is not None and len(dense_cols) == len(all_pts_new):
+            disp_cols = dense_cols
+        else:
+            disp_cols = np.full((len(all_pts_new), 3), 180, dtype=np.uint8)
+        if len(all_pts_new) > 300000:
+            idx = np.random.choice(len(all_pts_new), 300000, replace=False)
+            all_pts_new, disp_cols = all_pts_new[idx], disp_cols[idx]
+        scene_gl.set_points(all_pts_new.astype(np.float32), disp_cols)
+        state.needs_recenter = True
+        if hasattr(state, '_ever_centered'):
+            del state._ever_centered
+
+        # Also update mesh if present
+        if state.mesh_data is not None:
+            v, f, c = state.mesh_data
+            v = (R @ v.astype(np.float64).T).T - rotated_centroid
+            state.mesh_data = (v.astype(np.float32), f, c)
+            scene_gl.set_mesh(v.astype(np.float32), f, c)
+
+        print(f"  Aligned {mode}: normal={normal}, centroid at origin")
+        state.status = f"Aligned {mode} — data transformed"
 
     except Exception as e:
         state.status = f"Alignment failed: {e}"
