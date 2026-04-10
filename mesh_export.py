@@ -845,6 +845,56 @@ def _find_colmap_exe():
     return None
 
 
+def _write_colmap_sparse_model(sparse_dir, image_paths, c2w_list, K_list):
+    """Write a COLMAP sparse model in text format from known cameras.
+    Also creates dummy 3D points from triangulation of camera centers
+    so that COLMAP's tools recognize images as connected."""
+    from scipy.spatial.transform import Rotation
+    from PIL import Image as PILImage
+
+    os.makedirs(sparse_dir, exist_ok=True)
+    n = min(len(image_paths), len(c2w_list), len(K_list))
+
+    # cameras.txt
+    with open(os.path.join(sparse_dir, 'cameras.txt'), 'w') as f:
+        f.write("# Camera list\n# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        for i in range(n):
+            img = PILImage.open(image_paths[i])
+            W, H = img.size
+            K = K_list[i]
+            f.write(f"{i+1} PINHOLE {W} {H} {K[0,0]:.6f} {K[1,1]:.6f} {K[0,2]:.6f} {K[1,2]:.6f}\n")
+
+    # images.txt
+    with open(os.path.join(sparse_dir, 'images.txt'), 'w') as f:
+        f.write("# Image list\n# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        for i in range(n):
+            c2w = c2w_list[i].astype(np.float64)
+            w2c = np.linalg.inv(c2w)
+            R = w2c[:3, :3]
+            t = w2c[:3, 3]
+            rot = Rotation.from_matrix(R)
+            quat = rot.as_quat()  # (x, y, z, w)
+            qw, qx, qy, qz = float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2])
+            name = os.path.basename(image_paths[i])
+            f.write(f"{i+1} {qw:.10f} {qx:.10f} {qy:.10f} {qz:.10f} {t[0]:.10f} {t[1]:.10f} {t[2]:.10f} {i+1} {name}\n")
+            f.write("\n")
+
+    # points3D.txt — create some dummy points at camera centers so images appear connected
+    with open(os.path.join(sparse_dir, 'points3D.txt'), 'w') as f:
+        f.write("# 3D point list\n")
+        pid = 1
+        for i in range(n):
+            center = c2w_list[i][:3, 3]
+            # Each point "seen" by this image and one neighbor
+            j = (i + 1) % n
+            f.write(f"{pid} {center[0]:.6f} {center[1]:.6f} {center[2]:.6f} 128 128 128 0.5 "
+                    f"{i+1} 1 {j+1} 1\n")
+            pid += 1
+
+    print(f"  Wrote COLMAP sparse model: {n} cameras, {n} points")
+    return n
+
+
 def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                    max_image_size=-1, num_iterations=5, window_radius=5,
                    min_consistent=2, geom_consistency=True, filter_min_ncc=0.1,
@@ -917,23 +967,60 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                           capture_output=True, timeout=600)
 
             # Step 3: Sparse reconstruction
-            if progress_fn: progress_fn("COLMAP: sparse reconstruction...")
-            print("  Sparse reconstruction...")
-            subprocess.run([colmap_exe, 'mapper',
-                           '--database_path', db_path,
-                           '--image_path', img_dir,
-                           '--output_path', sparse_dir],
-                          capture_output=True, timeout=600)
+            # If we have prior cameras (from DUSt3R etc.), use them as initialization
+            # Run point_triangulator + bundle_adjuster instead of full mapper
+            if c2w_list is not None and K_list is not None and len(c2w_list) == n_imgs:
+                if progress_fn: progress_fn("COLMAP: triangulating with prior cameras...")
+                print("  Using prior cameras for initialization...")
+                prior_dir = os.path.join(sparse_dir, '0')
+                _write_colmap_sparse_model(prior_dir, image_paths, c2w_list, K_list)
 
-            # Find the reconstruction (usually in sparse/0/)
-            sparse_sub = os.path.join(sparse_dir, '0')
-            if not os.path.isdir(sparse_sub):
-                for d in os.listdir(sparse_dir):
-                    if os.path.isdir(os.path.join(sparse_dir, d)):
-                        sparse_sub = os.path.join(sparse_dir, d)
-                        break
+                # Triangulate points using prior cameras + matched features
+                print("  Point triangulation...")
+                subprocess.run([colmap_exe, 'point_triangulator',
+                               '--database_path', db_path,
+                               '--image_path', img_dir,
+                               '--input_path', prior_dir,
+                               '--output_path', prior_dir],
+                              capture_output=True, timeout=600)
+
+                # Refine cameras via bundle adjustment
+                if progress_fn: progress_fn("COLMAP: bundle adjustment (refining cameras)...")
+                print("  Bundle adjustment...")
+                refined_dir = os.path.join(sparse_dir, 'refined')
+                os.makedirs(refined_dir, exist_ok=True)
+                subprocess.run([colmap_exe, 'bundle_adjuster',
+                               '--input_path', prior_dir,
+                               '--output_path', refined_dir],
+                              capture_output=True, timeout=600)
+
+                # Use refined if it exists, else fall back to prior
+                if os.path.exists(os.path.join(refined_dir, 'cameras.bin')) or \
+                   os.path.exists(os.path.join(refined_dir, 'cameras.txt')):
+                    sparse_sub = refined_dir
+                    print("  Using bundle-adjusted cameras")
                 else:
-                    raise RuntimeError("COLMAP sparse reconstruction failed — no model produced")
+                    sparse_sub = prior_dir
+                    print("  Bundle adjustment failed, using prior cameras")
+            else:
+                # Full COLMAP mapper (no prior cameras)
+                if progress_fn: progress_fn("COLMAP: sparse reconstruction...")
+                print("  Sparse reconstruction (full mapper)...")
+                subprocess.run([colmap_exe, 'mapper',
+                               '--database_path', db_path,
+                               '--image_path', img_dir,
+                               '--output_path', sparse_dir],
+                              capture_output=True, timeout=600)
+
+                # Find the reconstruction
+                sparse_sub = os.path.join(sparse_dir, '0')
+                if not os.path.isdir(sparse_sub):
+                    for d in os.listdir(sparse_dir):
+                        if os.path.isdir(os.path.join(sparse_dir, d)):
+                            sparse_sub = os.path.join(sparse_dir, d)
+                            break
+                    else:
+                        raise RuntimeError("COLMAP sparse reconstruction failed")
 
             print(f"  Sparse model: {sparse_sub}")
 
