@@ -98,22 +98,31 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
     return v, f, c
 
 
-def _collect_points(imgs, pts3d_list, confs_list, min_conf):
+def _collect_points(imgs, pts3d_list, confs_list, min_conf, dense_colors=None):
     """Gather all confidence-filtered points + colors from all views."""
     all_pts, all_colors = [], []
-    for i in range(len(imgs)):
+    for i in range(len(pts3d_list)):  # iterate ALL entries, not just len(imgs)
         pts = pts3d_list[i]
-        conf = confs_list[i]
-        img = imgs[i]
-        if pts.ndim == 2:
-            mask = conf.ravel() > min_conf if conf is not None else np.ones(len(pts), dtype=bool)
-            all_pts.append(pts[mask])
-            all_colors.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+        conf = confs_list[i] if i < len(confs_list) else None
+        img = imgs[i] if i < len(imgs) else None
+        if pts.ndim == 2 or (pts.ndim == 1 and len(pts) > 0):
+            flat = pts.reshape(-1, 3)
+            mask = conf.ravel() > min_conf if conf is not None else np.ones(len(flat), dtype=bool)
+            all_pts.append(flat[mask])
+            if img is not None and len(img.reshape(-1, 3)) == len(flat):
+                all_colors.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+            elif dense_colors is not None and i >= len(imgs) and len(dense_colors) == len(flat):
+                all_colors.append(dense_colors[mask])
+            else:
+                all_colors.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
         else:
             H, W = pts.shape[:2]
             mask = conf.reshape(H, W) > min_conf if conf is not None else np.ones((H, W), dtype=bool)
             all_pts.append(pts[mask])
-            all_colors.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+            if img is not None and img.shape[:2] == (H, W):
+                all_colors.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+            else:
+                all_colors.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
     if not all_pts:
         return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
     return (np.concatenate(all_pts, axis=0).astype(np.float32),
