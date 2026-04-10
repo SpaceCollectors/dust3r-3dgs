@@ -780,244 +780,136 @@ def _find_colmap_exe():
     return None
 
 
-def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
+def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                    max_image_size=-1, num_iterations=5, window_radius=5,
                    min_consistent=2, geom_consistency=True, filter_min_ncc=0.1,
                    existing_pts=None):
-    """Dense MVS via COLMAP PatchMatch + stereo fusion.
+    """Dense MVS via full COLMAP pipeline (SfM + PatchMatch + fusion).
 
-    Creates a COLMAP workspace from known cameras, runs GPU PatchMatch
-    for per-pixel depth maps, then fuses into a dense point cloud.
+    Runs COLMAP's own SfM to get reliable cameras, then PatchMatch dense stereo.
+    This avoids issues with mixing DUSt3R cameras with COLMAP's fusion.
     """
-    import pycolmap
     import tempfile, shutil
     from PIL import Image as PILImage
-    from scipy.spatial.transform import Rotation
+
+    colmap_exe = _find_colmap_exe()
+    if not colmap_exe:
+        raise RuntimeError(
+            "COLMAP executable not found. Download from:\n"
+            "  https://github.com/colmap/colmap/releases\n"
+            "  Get: colmap-x64-windows-cuda.zip\n"
+            "  Extract to project folder as colmap/")
 
     workdir = tempfile.mkdtemp(prefix="colmap_dense_")
     n_imgs = len(image_paths)
+    import subprocess, re
 
     try:
-        # Step 1: Build COLMAP reconstruction from known cameras
-        if progress_fn: progress_fn("Building COLMAP workspace...")
-        print(f"  Building COLMAP workspace in {workdir}")
-
-        # Create image directory with copies
+        # Copy images
         img_dir = os.path.join(workdir, "images")
         os.makedirs(img_dir, exist_ok=True)
         for p in image_paths:
             shutil.copy2(p, os.path.join(img_dir, os.path.basename(p)))
 
-        # Create sparse reconstruction
+        db_path = os.path.join(workdir, "database.db")
         sparse_dir = os.path.join(workdir, "sparse")
         os.makedirs(sparse_dir, exist_ok=True)
 
-        # Write COLMAP text files directly (avoids read-only API issues)
-        os.makedirs(os.path.join(sparse_dir, '0'), exist_ok=True)
+        # Step 1: Feature extraction
+        if progress_fn: progress_fn("COLMAP: extracting features...")
+        print("  Feature extraction...")
+        subprocess.run([colmap_exe, 'feature_extractor',
+                       '--database_path', db_path,
+                       '--image_path', img_dir],
+                      capture_output=True, timeout=600)
+
+        # Step 2: Feature matching
+        if progress_fn: progress_fn("COLMAP: matching features...")
+        print("  Feature matching...")
+        subprocess.run([colmap_exe, 'exhaustive_matcher',
+                       '--database_path', db_path],
+                      capture_output=True, timeout=600)
+
+        # Step 3: Sparse reconstruction
+        if progress_fn: progress_fn("COLMAP: sparse reconstruction...")
+        print("  Sparse reconstruction...")
+        subprocess.run([colmap_exe, 'mapper',
+                       '--database_path', db_path,
+                       '--image_path', img_dir,
+                       '--output_path', sparse_dir],
+                      capture_output=True, timeout=600)
+
+        # Find the reconstruction (usually in sparse/0/)
         sparse_sub = os.path.join(sparse_dir, '0')
+        if not os.path.isdir(sparse_sub):
+            # Try to find any reconstruction
+            for d in os.listdir(sparse_dir):
+                if os.path.isdir(os.path.join(sparse_dir, d)):
+                    sparse_sub = os.path.join(sparse_dir, d)
+                    break
+            else:
+                raise RuntimeError("COLMAP sparse reconstruction failed — no model produced")
 
-        # cameras.txt
-        with open(os.path.join(sparse_sub, 'cameras.txt'), 'w') as f:
-            f.write("# Camera list with one line of data per camera:\n")
-            f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-            for i in range(n_imgs):
-                img_pil = PILImage.open(image_paths[i])
-                W, H = img_pil.size
-                K = K_list[i]
-                f.write(f"{i+1} PINHOLE {W} {H} {K[0,0]:.6f} {K[1,1]:.6f} {K[0,2]:.6f} {K[1,2]:.6f}\n")
+        print(f"  Sparse model: {sparse_sub}")
 
-        # images.txt
-        with open(os.path.join(sparse_sub, 'images.txt'), 'w') as f:
-            f.write("# Image list with two lines of data per image:\n")
-            f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-            for i in range(n_imgs):
-                c2w = c2w_list[i].astype(np.float64)
-                w2c = np.linalg.inv(c2w)
-                R = w2c[:3, :3]
-                t = w2c[:3, 3]
-                rot = Rotation.from_matrix(R)
-                quat = rot.as_quat()  # (x, y, z, w)
-                qw, qx, qy, qz = float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2])
-                name = os.path.basename(image_paths[i])
-                f.write(f"{i+1} {qw:.10f} {qx:.10f} {qy:.10f} {qz:.10f} {t[0]:.10f} {t[1]:.10f} {t[2]:.10f} {i+1} {name}\n")
-                f.write("\n")  # empty line for 2D points (none)
-
-        # points3D.txt (empty — we only need cameras for MVS)
-        with open(os.path.join(sparse_sub, 'points3D.txt'), 'w') as f:
-            f.write("# 3D point list (empty for dense-only reconstruction)\n")
-
-        print(f"  Wrote sparse model: {n_imgs} cameras")
-        print(f"  Wrote sparse reconstruction: {n_imgs} images")
-
-        # Step 2: Undistort images into a dense workspace
-        if progress_fn: progress_fn("Undistorting images...")
+        # Step 4: Undistort
+        if progress_fn: progress_fn("COLMAP: undistorting images...")
         dense_dir = os.path.join(workdir, "dense")
         os.makedirs(dense_dir, exist_ok=True)
-        sparse_sub = os.path.join(sparse_dir, '0')
-        pycolmap.undistort_images(
-            output_path=dense_dir,
-            input_path=sparse_sub,
-            image_path=img_dir)
+        subprocess.run([colmap_exe, 'image_undistorter',
+                       '--image_path', img_dir,
+                       '--input_path', sparse_sub,
+                       '--output_path', dense_dir,
+                       '--output_type', 'COLMAP'],
+                      capture_output=True, timeout=600)
         print("  Images undistorted")
 
-        # Override patch-match.cfg to list all images as sources for each
-        # (needed because our points3D.txt is empty so __auto__ finds nothing)
-        cfg_path = os.path.join(dense_dir, 'stereo', 'patch-match.cfg')
-        img_names = [os.path.basename(p) for p in image_paths]
-        with open(cfg_path, 'w') as f:
-            for name in img_names:
-                f.write(f"{name}\n")
-                sources = [n for n in img_names if n != name]
-                f.write(f"{', '.join(sources)}\n")
-        print(f"  Wrote patch-match.cfg: {n_imgs} images, all-vs-all")
-
-        # Step 3: PatchMatch stereo (GPU)
-        # Try pycolmap first, fall back to COLMAP executable
-        if progress_fn: progress_fn("PatchMatch stereo (GPU)...")
+        # Step 5: PatchMatch stereo
+        if progress_fn: progress_fn("COLMAP: PatchMatch stereo...")
         print("  Running PatchMatch stereo...")
 
+        cmd = [colmap_exe, 'patch_match_stereo',
+               '--workspace_path', dense_dir,
+               '--PatchMatchStereo.geom_consistency', '1' if geom_consistency else '0',
+               '--PatchMatchStereo.filter', '1',
+               '--PatchMatchStereo.num_iterations', str(num_iterations),
+               '--PatchMatchStereo.window_radius', str(window_radius),
+               '--PatchMatchStereo.filter_min_ncc', str(filter_min_ncc),
+               '--PatchMatchStereo.filter_min_num_consistent', str(min_consistent)]
+        if max_image_size > 0:
+            cmd += ['--PatchMatchStereo.max_image_size', str(max_image_size)]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.strip()
+            m = re.search(r'Processing view (\d+) / (\d+) for (.+)', line)
+            if m:
+                cur, total, name = int(m.group(1)), int(m.group(2)), m.group(3)
+                if progress_fn:
+                    progress_fn(f"PatchMatch {cur}/{total}: {name}")
+                print(f"  PatchMatch view {cur}/{total}: {name}")
+            elif 'Total:' in line:
+                t = re.search(r'Total: ([\d.]+)s', line)
+                if t:
+                    print(f"    {t.group(1)}s")
+        proc.wait(timeout=1800)
+        if proc.returncode != 0:
+            raise RuntimeError(f"PatchMatch failed (code {proc.returncode})")
+
+        # Step 6: Stereo fusion
         output_ply = os.path.join(dense_dir, "fused.ply")
-        used_exe = False
-
-        try:
-            opts = pycolmap.PatchMatchOptions()
-            opts.num_iterations = num_iterations
-            opts.geom_consistency = geom_consistency
-            opts.window_radius = window_radius
-            opts.filter_min_ncc = filter_min_ncc
-            opts.filter_min_num_consistent = min_consistent
-            if max_image_size > 0:
-                opts.max_image_size = max_image_size
-            pycolmap.patch_match_stereo(workspace_path=dense_dir, options=opts)
-            print("  PatchMatch complete (pycolmap)")
-        except (ValueError, RuntimeError) as e:
-            if 'CUDA' in str(e):
-                # pycolmap has no CUDA — try COLMAP executable
-                print("  pycolmap has no CUDA, trying COLMAP executable...")
-                colmap_exe = _find_colmap_exe()
-                if colmap_exe:
-                    used_exe = True
-                    import subprocess
-                    # PatchMatch
-                    if progress_fn: progress_fn("PatchMatch stereo (COLMAP exe)...")
-                    # Estimate depth range from camera-to-point distances
-                    cam_centers = np.array([c[:3, 3] for c in c2w_list])
-                    scene_extent = np.linalg.norm(cam_centers.max(0) - cam_centers.min(0))
-
-                    # If we have existing points, compute actual depth range
-                    if existing_pts is not None and len(existing_pts) > 0:
-                        all_dists = []
-                        for ci in range(len(c2w_list)):
-                            w2c = np.linalg.inv(c2w_list[ci])
-                            pts_cam = (w2c[:3, :3] @ existing_pts.T).T + w2c[:3, 3]
-                            z = pts_cam[:, 2]
-                            z_valid = z[z > 0]
-                            if len(z_valid) > 0:
-                                all_dists.append(z_valid)
-                        if all_dists:
-                            all_z = np.concatenate(all_dists)
-                            depth_min = max(float(np.percentile(all_z, 1)) * 0.5, 0.001)
-                            depth_max = float(np.percentile(all_z, 99)) * 2.0
-                        else:
-                            depth_min = max(scene_extent * 0.1, 0.01)
-                            depth_max = scene_extent * 10
-                    else:
-                        depth_min = max(scene_extent * 0.1, 0.01)
-                        depth_max = scene_extent * 10
-                    print(f"  Depth range: {depth_min:.4f} - {depth_max:.4f}")
-
-                    cmd = [colmap_exe, 'patch_match_stereo',
+        if progress_fn: progress_fn("COLMAP: fusing depth maps...")
+        print("  Fusing...")
+        r = subprocess.run([colmap_exe, 'stereo_fusion',
                            '--workspace_path', dense_dir,
-                           '--PatchMatchStereo.geom_consistency', '1' if geom_consistency else '0',
-                           '--PatchMatchStereo.depth_min', str(depth_min),
-                           '--PatchMatchStereo.depth_max', str(depth_max),
-                           '--PatchMatchStereo.num_iterations', str(num_iterations),
-                           '--PatchMatchStereo.window_radius', str(window_radius),
-                           '--PatchMatchStereo.filter', '1',
-                           '--PatchMatchStereo.filter_min_ncc', str(filter_min_ncc),
-                           '--PatchMatchStereo.filter_min_num_consistent', str(min_consistent)]
-                    if max_image_size > 0:
-                        cmd += ['--PatchMatchStereo.max_image_size', str(max_image_size)]
-                    # Run with live progress parsing
-                    import re
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           text=True, bufsize=1)
-                    for line in proc.stdout:
-                        line = line.strip()
-                        # Parse "Processing view X / Y" for progress
-                        m = re.search(r'Processing view (\d+) / (\d+) for (.+)', line)
-                        if m:
-                            cur, total, name = int(m.group(1)), int(m.group(2)), m.group(3)
-                            if progress_fn:
-                                progress_fn(f"PatchMatch {cur}/{total}: {name}")
-                            print(f"  PatchMatch view {cur}/{total}: {name}")
-                        elif 'Total:' in line:
-                            # View finished
-                            t = re.search(r'Total: ([\d.]+)s', line)
-                            if t:
-                                print(f"    {t.group(1)}s")
-                    proc.wait(timeout=1800)
-                    r = proc
-                    if r.returncode != 0:
-                        raise RuntimeError(f"COLMAP patch_match_stereo failed (code {r.returncode})")
-
-                    # Check if depth maps were created
-                    stereo_dir = os.path.join(dense_dir, 'stereo', 'depth_maps')
-                    if os.path.isdir(stereo_dir):
-                        depth_files = [f for f in os.listdir(stereo_dir) if f.endswith('.bin')]
-                        print(f"  PatchMatch complete: {len(depth_files)} depth maps")
-                    else:
-                        print("  WARNING: no depth_maps directory created")
-                        # List what's in stereo/
-                        stereo_base = os.path.join(dense_dir, 'stereo')
-                        if os.path.isdir(stereo_base):
-                            for d in os.listdir(stereo_base):
-                                print(f"    stereo/{d}/: {os.listdir(os.path.join(stereo_base, d)) if os.path.isdir(os.path.join(stereo_base, d)) else 'file'}")
-                else:
-                    raise RuntimeError(
-                        "No CUDA support. Install COLMAP with CUDA:\n"
-                        "  Download from: https://github.com/colmap/colmap/releases\n"
-                        "  Get: colmap-x64-windows-cuda.zip\n"
-                        "  Extract and add to PATH, or put in project folder as colmap/")
-            else:
-                raise
-
-        # Step 4: Stereo fusion
-        if progress_fn: progress_fn("Fusing depth maps...")
-        try:
-            if not used_exe:
-                fuse_opts = pycolmap.StereoFusionOptions()
-                fuse_opts.min_num_pixels = min_consistent
-                pycolmap.stereo_fusion(
-                    output_path=output_ply,
-                    workspace_path=dense_dir,
-                    options=fuse_opts)
-            else:
-                import subprocess
-                colmap_exe = _find_colmap_exe()
-                if progress_fn: progress_fn("Fusing depth maps (COLMAP exe)...")
-                r = subprocess.run([colmap_exe, 'stereo_fusion',
-                                   '--workspace_path', dense_dir,
-                                   '--output_path', output_ply,
-                                   '--StereoFusion.min_num_pixels', str(max(min_consistent, 2)),
-                                   '--StereoFusion.max_reproj_error', '2',
-                                   '--StereoFusion.max_depth_error', '0.05',
-                                   '--StereoFusion.max_normal_error', '20'],
-                                  capture_output=True, text=True, timeout=600)
-                if r.stdout:
-                    # Print fusion summary
-                    for line in r.stdout.split('\n'):
-                        if any(k in line for k in ['Fusing', 'points', 'Number', 'Elapsed']):
-                            print(f"  {line.strip()}")
-                if r.stderr:
-                    for line in r.stderr.split('\n'):
-                        if any(k in line for k in ['Fusing', 'points', 'Number', 'Elapsed', 'Error', 'Warning']):
-                            print(f"  {line.strip()}")
-                if r.returncode != 0:
-                    raise RuntimeError(f"stereo_fusion failed (code {r.returncode})")
-        except Exception as e2:
-            print(f"  Fusion error: {e2}")
-            raise
+                           '--output_path', output_ply,
+                           '--StereoFusion.min_num_pixels', str(max(min_consistent, 2))],
+                          capture_output=True, text=True, timeout=600)
+        if r.stderr:
+            for line in r.stderr.split('\n'):
+                if any(k in line for k in ['Fusing', 'points', 'Number']):
+                    print(f"  {line.strip()}")
         print(f"  Fused to {output_ply}")
 
         # Step 5: Load the fused point cloud
