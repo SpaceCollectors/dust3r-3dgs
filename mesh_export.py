@@ -928,12 +928,12 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None,
 
                     cmd = [colmap_exe, 'patch_match_stereo',
                            '--workspace_path', dense_dir,
-                           '--PatchMatchStereo.geom_consistency', str(geom_consistency).lower(),
+                           '--PatchMatchStereo.geom_consistency', '1' if geom_consistency else '0',
                            '--PatchMatchStereo.depth_min', str(depth_min),
                            '--PatchMatchStereo.depth_max', str(depth_max),
                            '--PatchMatchStereo.num_iterations', str(num_iterations),
                            '--PatchMatchStereo.window_radius', str(window_radius),
-                           '--PatchMatchStereo.filter', 'true',
+                           '--PatchMatchStereo.filter', '1',
                            '--PatchMatchStereo.filter_min_ncc', str(filter_min_ncc),
                            '--PatchMatchStereo.filter_min_num_consistent', str(min_consistent)]
                     if max_image_size > 0:
