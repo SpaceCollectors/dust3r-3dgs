@@ -7,6 +7,7 @@ preserving every original 3D point as a mesh vertex. Long edges
 to background.
 """
 
+import os
 import numpy as np
 import struct
 
@@ -609,7 +610,7 @@ def densify_sgm(image_paths, c2w_list, K_list, existing_pts=None,
     import cv2
     from PIL import Image as PILImage
 
-    n_imgs = len(image_paths)
+    n_imgs = min(len(image_paths), len(c2w_list), len(K_list))
     all_pts, all_cols = [], []
 
     # Build pairs: select pairs with good baseline
