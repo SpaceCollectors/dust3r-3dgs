@@ -741,11 +741,6 @@ class AppState:
         self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap, 4=pow3r
         self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap', 'pow3r']
         self.cached_cameras = None  # reference cameras from first reconstruction (for alignment)
-        self.stack_backends = False  # run multiple backends and merge points
-        self.stack_dust3r = True
-        self.stack_mast3r = False
-        self.stack_vggt = True
-        self.stack_pow3r = False
 
         # Reconstruction
         self.scene = None
@@ -869,11 +864,6 @@ def run_reconstruction(state, scene_gl):
                 print(f"  Using pre-masked images from {os.path.dirname(masked_paths[0])}")
             except Exception as e:
                 print(f"  Pre-masking failed: {e}, using original images")
-
-        # Stack mode: run multiple backends and merge their point clouds
-        if state.stack_backends:
-            _run_stacked_reconstruction(state, scene_gl)
-            return
 
         if backend == 'vggt':
             from vggt.models.vggt import VGGT
@@ -1675,105 +1665,6 @@ def run_depth_injection(state, scene_gl):
         traceback.print_exc()
 
     state.reconstructing = False
-
-
-def _run_stacked_reconstruction(state, scene_gl):
-    """Run multiple backends and merge their point clouds.
-    First backend establishes the reference frame, others align to it via Procrustes."""
-    import torch
-
-    # Run each selected backend
-    stack_backends = []
-    if state.stack_dust3r: stack_backends.append('dust3r')
-    if state.stack_mast3r: stack_backends.append('mast3r')
-    if state.stack_vggt: stack_backends.append('vggt')
-    if state.stack_pow3r: stack_backends.append('pow3r')
-    if not stack_backends:
-        state.status = "No backends selected for stacking"
-        state.reconstructing = False
-        return
-    all_pts3d = []
-    all_confs = []
-    first_scene = None
-
-    for bi, bname in enumerate(stack_backends):
-        state.status = f"Stack: running {bname.upper()} ({bi+1}/{len(stack_backends)})..."
-        state.recon_frac = bi / len(stack_backends)
-        print(f"\n  === Stack: {bname} ===")
-
-        try:
-            # Temporarily set backend and run reconstruction
-            old_backend_idx = state.backend_idx
-            old_stack = state.stack_backends
-            state.backend_idx = state.backends.index(bname)
-            state.stack_backends = False  # prevent recursion
-            state.pts3d_list = None  # clear cache for fresh extraction
-            state.confs_list = None
-
-            run_reconstruction(state, scene_gl)
-
-            # Extract the points from this run
-            pts3d_list, confs_list = _extract_scene_data(state)
-            all_pts3d.extend(pts3d_list)
-            all_confs.extend(confs_list)
-
-            if first_scene is None:
-                first_scene = state.scene
-
-            state.backend_idx = old_backend_idx
-            state.stack_backends = old_stack
-            state.pts3d_list = None
-            state.confs_list = None
-
-        except Exception as e:
-            print(f"  {bname} failed: {e}")
-            import traceback; traceback.print_exc()
-            state.backend_idx = old_backend_idx
-            state.stack_backends = old_stack
-
-        torch.cuda.empty_cache()
-
-    if not all_pts3d:
-        state.status = "All backends failed"
-        state.reconstructing = False
-        return
-
-    # Merge all point clouds
-    state.scene = first_scene
-    state.pts3d_list = all_pts3d
-    state.confs_list = all_confs
-
-    # Display merged cloud
-    all_pts, all_cols = [], []
-    imgs = state.scene.imgs
-    for i in range(len(all_pts3d)):
-        p = all_pts3d[i]
-        c = all_confs[i]
-        if p.ndim == 3:
-            mask = c.reshape(p.shape[:2]) > state.min_conf if c is not None else np.ones(p.shape[:2], dtype=bool)
-            all_pts.append(p[mask])
-            if i < len(imgs):
-                all_cols.append((np.clip(imgs[i][mask], 0, 1) * 255).astype(np.uint8))
-            else:
-                all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
-        else:
-            mask = c.ravel() > state.min_conf if c is not None else np.ones(len(p), dtype=bool)
-            all_pts.append(p.reshape(-1, 3)[mask.ravel()] if p.ndim > 1 else p[mask])
-            all_cols.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
-
-    if all_pts:
-        points = np.concatenate(all_pts, axis=0)
-        colors = np.concatenate(all_cols, axis=0)
-        if len(points) > 300000:
-            idx = np.random.choice(len(points), 300000, replace=False)
-            points, colors = points[idx], colors[idx]
-        scene_gl.set_points(points, colors)
-        state.has_points = True
-        state.needs_recenter = True
-
-    state.status = f"Stacked: {len(all_pts3d)} views from {len(stack_backends)} backends, {sum(len(p.reshape(-1,3)) for p in all_pts3d):,d} total points"
-    state.reconstructing = False
-    state.recon_frac = 1.0
 
 
 def _handle_align_click(state, scene_gl, camera, mx, my, window):
@@ -3760,16 +3651,6 @@ def main():
         imgui.text("Reconstruction")
         _, state.backend_idx = imgui.combo("Backend",
             state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "COLMAP", "Pow3R"])
-        _, state.stack_backends = imgui.checkbox("Stack backends", state.stack_backends)
-        if state.stack_backends:
-            imgui.same_line()
-            _, state.stack_dust3r = imgui.checkbox("DUSt3R##stk", state.stack_dust3r)
-            imgui.same_line()
-            _, state.stack_mast3r = imgui.checkbox("MASt3R##stk", state.stack_mast3r)
-            imgui.same_line()
-            _, state.stack_vggt = imgui.checkbox("VGGT##stk", state.stack_vggt)
-            imgui.same_line()
-            _, state.stack_pow3r = imgui.checkbox("Pow3R##stk", state.stack_pow3r)
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
