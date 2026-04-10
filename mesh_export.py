@@ -787,60 +787,49 @@ def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
         sparse_dir = os.path.join(workdir, "sparse")
         os.makedirs(sparse_dir, exist_ok=True)
 
-        rec = pycolmap.Reconstruction()
+        # Write COLMAP text files directly (avoids read-only API issues)
+        os.makedirs(os.path.join(sparse_dir, '0'), exist_ok=True)
+        sparse_sub = os.path.join(sparse_dir, '0')
 
-        for i in range(n_imgs):
-            img_pil = PILImage.open(image_paths[i])
-            W, H = img_pil.size
-            K = K_list[i]
+        # cameras.txt
+        with open(os.path.join(sparse_sub, 'cameras.txt'), 'w') as f:
+            f.write("# Camera list with one line of data per camera:\n")
+            f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            for i in range(n_imgs):
+                img_pil = PILImage.open(image_paths[i])
+                W, H = img_pil.size
+                K = K_list[i]
+                f.write(f"{i+1} PINHOLE {W} {H} {K[0,0]:.6f} {K[1,1]:.6f} {K[0,2]:.6f} {K[1,2]:.6f}\n")
 
-            # Add camera
-            cam = pycolmap.Camera(
-                model='PINHOLE',
-                width=W, height=H,
-                params=[float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])])
-            cam.camera_id = i + 1
-            rec.add_camera(cam)
+        # images.txt
+        with open(os.path.join(sparse_sub, 'images.txt'), 'w') as f:
+            f.write("# Image list with two lines of data per image:\n")
+            f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            for i in range(n_imgs):
+                c2w = c2w_list[i].astype(np.float64)
+                w2c = np.linalg.inv(c2w)
+                R = w2c[:3, :3]
+                t = w2c[:3, 3]
+                rot = Rotation.from_matrix(R)
+                quat = rot.as_quat()  # (x, y, z, w)
+                qw, qx, qy, qz = float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2])
+                name = os.path.basename(image_paths[i])
+                f.write(f"{i+1} {qw:.10f} {qx:.10f} {qy:.10f} {qz:.10f} {t[0]:.10f} {t[1]:.10f} {t[2]:.10f} {i+1} {name}\n")
+                f.write("\n")  # empty line for 2D points (none)
 
-            # Add image with pose
-            c2w = c2w_list[i].astype(np.float64)
-            w2c = np.linalg.inv(c2w)
-            R = w2c[:3, :3]
-            t = w2c[:3, 3]
+        # points3D.txt (empty — we only need cameras for MVS)
+        with open(os.path.join(sparse_sub, 'points3D.txt'), 'w') as f:
+            f.write("# 3D point list (empty for dense-only reconstruction)\n")
 
-            # Convert rotation matrix to quaternion (w, x, y, z)
-            rot = Rotation.from_matrix(R)
-            quat = rot.as_quat()  # (x, y, z, w)
-            qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
-
-            image = pycolmap.Image(
-                image_id=i + 1,
-                name=os.path.basename(image_paths[i]),
-                camera_id=i + 1)
-            # Set pose after construction (cam_from_world is read-only in constructor)
-            try:
-                image.cam_from_world = pycolmap.Rigid3d(
-                    rotation=pycolmap.Rotation3d(np.array([qw, qx, qy, qz])),
-                    translation=t)
-            except (AttributeError, TypeError):
-                # Older pycolmap: set via quaternion + translation directly
-                try:
-                    image.qvec = np.array([qw, qx, qy, qz])
-                    image.tvec = t
-                except Exception:
-                    image.rotmat = R
-                    image.tvec = t
-            rec.add_image(image)
-            rec.register_image(i + 1)
-
-        rec.write(sparse_dir)
+        print(f"  Wrote sparse model: {n_imgs} cameras")
         print(f"  Wrote sparse reconstruction: {n_imgs} images")
 
         # Step 2: Undistort images
         if progress_fn: progress_fn("Undistorting images...")
+        sparse_sub = os.path.join(sparse_dir, '0')
         pycolmap.undistort_images(
             output_path=workdir,
-            input_path=sparse_dir,
+            input_path=sparse_sub,
             image_path=img_dir)
         print("  Images undistorted")
 
