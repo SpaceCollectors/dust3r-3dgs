@@ -1692,7 +1692,7 @@ def run_depth_injection(state, scene_gl):
 
 
 def _handle_align_click(state, scene_gl, camera, mx, my, window):
-    """Align floor/wall — display-only rotation, doesn't modify actual data."""
+    """Raycast from click, find surface points, fit plane, align display rotation."""
     try:
         mode = state.align_mode
         state.align_mode = None
@@ -1700,30 +1700,88 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         pts3d_list = state.pts3d_list
         if pts3d_list is None:
             return
-        all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float64)
+        all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float32)
         if len(all_pts) < 10:
             return
 
-        # Subsample for PCA
-        if len(all_pts) > 50000:
-            idx = np.random.choice(len(all_pts), 50000, replace=False)
-            pts_sample = all_pts[idx]
-        else:
-            pts_sample = all_pts
+        # Build scene rotation matrix
+        def _build_rot(rx, ry, rz):
+            cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
+            cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
+            cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
+            Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]], dtype=np.float32)
+            Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]], dtype=np.float32)
+            Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]], dtype=np.float32)
+            return Rx @ Ry @ Rz
+        R_scene = _build_rot(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
 
-        # PCA — smallest eigenvector = dominant plane normal
-        centroid = pts_sample.mean(axis=0)
-        cov = (pts_sample - centroid).T @ (pts_sample - centroid)
+        # Transform points to display space (same as shader)
+        pts_display = (R_scene @ all_pts.T).T
+
+        # Get viewport info
+        win_w, win_h = glfw.get_window_size(window)
+        vp_x = 400
+        vp_w = win_w - vp_x
+        vp_h = win_h
+        if vp_w <= 0 or vp_h <= 0:
+            return
+
+        # Unproject click to ray in display space
+        aspect = vp_w / max(vp_h, 1)
+        proj = camera.get_projection_matrix(aspect)
+        view = camera.get_view_matrix()
+        mvp = proj @ view
+        mvp_inv = np.linalg.inv(mvp.astype(np.float64))
+
+        # Normalize mouse to clip space [-1, 1]
+        nx = 2.0 * (mx - vp_x) / vp_w - 1.0
+        ny = 1.0 - 2.0 * my / vp_h
+
+        # Unproject near/far to get ray
+        near_h = mvp_inv @ np.array([nx, ny, -1, 1], dtype=np.float64)
+        far_h = mvp_inv @ np.array([nx, ny, 1, 1], dtype=np.float64)
+        near_pt = (near_h[:3] / near_h[3]).astype(np.float32)
+        far_pt = (far_h[:3] / far_h[3]).astype(np.float32)
+        ray_dir = far_pt - near_pt
+        ray_dir /= max(np.linalg.norm(ray_dir), 1e-8)
+
+        # Find nearest point to ray (in display space)
+        diff = pts_display - near_pt[None, :]
+        cross = np.cross(diff, ray_dir[None, :])
+        ray_dists = np.linalg.norm(cross, axis=-1)
+        nearest_idx = np.argmin(ray_dists)
+        hit_pt = all_pts[nearest_idx]  # in original space
+
+        # Select neighborhood around hit point (in original space)
+        point_dists = np.linalg.norm(all_pts - hit_pt, axis=-1)
+        # Auto radius: use 50x median of nearest 100 points
+        sorted_dists = np.sort(point_dists)
+        median_local = float(np.median(sorted_dists[1:min(100, len(sorted_dists))]))
+        radius = median_local * 50
+        mask = point_dists < radius
+        neighborhood = all_pts[mask]
+
+        if len(neighborhood) < 10:
+            state.status = "Too few points at click location"
+            return
+
+        # Fit plane via PCA on the neighborhood
+        centroid = neighborhood.mean(axis=0)
+        cov = (neighborhood - centroid).T @ (neighborhood - centroid)
         eigvals, eigvecs = np.linalg.eigh(cov)
-        normal = eigvecs[:, 0].astype(np.float32)
+        normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue = plane normal
 
+        # Target direction
         if mode == 'floor':
             target = np.array([0, 1, 0], dtype=np.float32)
         else:
             target = np.array([0, 0, 1], dtype=np.float32)
 
+        # Orient normal toward target hemisphere
         if np.dot(normal, target) < 0:
             normal = -normal
+
+        print(f"  Align {mode}: hit={hit_pt}, {len(neighborhood)} pts, normal={normal}")
 
         dot = np.clip(np.dot(normal, target), -1, 1)
         if abs(dot) > 0.999:
@@ -1739,19 +1797,10 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
                           [-axis[1], axis[0], 0]])
         R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
 
-        # Combine with existing scene rotation
-        def _build_rot(rx, ry, rz):
-            cx, sx = math.cos(math.radians(rx)), math.sin(math.radians(rx))
-            cy, sy = math.cos(math.radians(ry)), math.sin(math.radians(ry))
-            cz, sz = math.cos(math.radians(rz)), math.sin(math.radians(rz))
-            Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]], dtype=np.float32)
-            Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]], dtype=np.float32)
-            Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]], dtype=np.float32)
-            return Rx @ Ry @ Rz
-        R_existing = _build_rot(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
-        R_new = R_align @ R_existing
+        # Combine: new = align @ existing
+        R_new = R_align @ R_scene
 
-        # Extract Euler XYZ from combined rotation
+        # Extract Euler XYZ
         sy = np.sqrt(R_new[0, 0] ** 2 + R_new[1, 0] ** 2)
         if sy > 1e-6:
             rx = np.arctan2(R_new[2, 1], R_new[2, 2])
@@ -1765,7 +1814,7 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         state.scene_rot_x = float(np.degrees(rx))
         state.scene_rot_y = float(np.degrees(ry))
         state.scene_rot_z = float(np.degrees(rz))
-        state.status = f"Aligned {mode} (display only)"
+        state.status = f"Aligned {mode}: {len(neighborhood)} surface points"
 
     except Exception as e:
         state.status = f"Alignment failed: {e}"
