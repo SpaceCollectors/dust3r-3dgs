@@ -109,10 +109,11 @@ def _collect_points(imgs, pts3d_list, confs_list, min_conf, dense_colors=None):
             flat = pts.reshape(-1, 3)
             mask = conf.ravel() > min_conf if conf is not None else np.ones(len(flat), dtype=bool)
             all_pts.append(flat[mask])
-            if img is not None and len(img.reshape(-1, 3)) == len(flat):
-                all_colors.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
-            elif dense_colors is not None and i >= len(imgs) and len(dense_colors) == len(flat):
+            # Try dense_colors first (matches COLMAP dense cloud)
+            if dense_colors is not None and len(dense_colors) == len(flat):
                 all_colors.append(dense_colors[mask])
+            elif img is not None and len(img.reshape(-1, 3)) == len(flat):
+                all_colors.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
             else:
                 all_colors.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
         else:
