@@ -3285,6 +3285,7 @@ def main():
     glfw.set_scroll_callback(window, scroll_callback)
 
     while not glfw.window_should_close(window):
+      try:
         glfw.poll_events()
         impl.process_inputs()
 
@@ -3827,6 +3828,13 @@ def main():
         impl.render(imgui.get_draw_data())
 
         glfw.swap_buffers(window)
+      except Exception as _frame_err:
+        # Don't crash on a single bad frame — log and continue
+        print(f"  Frame error: {_frame_err}")
+        try:
+            glfw.swap_buffers(window)
+        except Exception:
+            pass
 
     impl.shutdown()
     glfw.terminate()
