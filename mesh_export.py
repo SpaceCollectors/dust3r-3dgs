@@ -89,7 +89,7 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
                                           cam2world_list, min_conf)
     else:
         v, f, c = _mesh_ball_pivot(imgs, pts3d_list, confs_list,
-                                    cam2world_list, min_conf)
+                                    cam2world_list, min_conf, dense_colors=dense_colors)
 
     # Close holes using PyMeshLab
     if hole_cap_size > 0 and len(f) > 0:
@@ -533,7 +533,7 @@ def _mesh_ball_pivot_from_cloud(points, colors, cam_center=None):
     return out_v, out_f, out_c
 
 
-def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf):
+def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf, dense_colors=None):
     """Voxel-dedup all points, then ball-pivot into a single mesh."""
     import open3d as o3d
 
