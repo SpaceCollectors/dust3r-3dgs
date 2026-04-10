@@ -2026,6 +2026,67 @@ def _run_smooth_preview(state, scene_gl):
         state.refine_progress = ""
 
 
+def run_densify_colmap(state, scene_gl):
+    """Densify point cloud using COLMAP PatchMatch stereo (GPU)."""
+    state.refine_progress = "Densifying with COLMAP PatchMatch..."
+    try:
+        from mesh_export import densify_colmap
+
+        # Get cameras
+        c2w_all = state.scene.get_im_poses().detach().cpu().numpy()
+        focals = state.scene.get_focals().detach().cpu().numpy()
+
+        c2w_list = [c2w_all[i].astype(np.float32) for i in range(len(c2w_all))]
+        K_list = []
+        pts3d_list, confs_list = _extract_scene_data(state)
+        for i in range(len(c2w_all)):
+            f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
+            # Scale focal to full-res image
+            from PIL import Image as PILImage
+            img_pil = PILImage.open(state.image_paths[i])
+            W_full, H_full = img_pil.size
+            if i < len(pts3d_list) and pts3d_list[i].ndim == 3:
+                W_model = pts3d_list[i].shape[1]
+            else:
+                W_model = 512
+            f_full = f * (W_full / W_model)
+            K = np.array([[f_full, 0, W_full / 2],
+                          [0, f_full, H_full / 2],
+                          [0, 0, 1]], dtype=np.float32)
+            K_list.append(K)
+
+        def progress(msg):
+            state.refine_progress = msg
+
+        dense_pts, dense_cols = densify_colmap(
+            state.image_paths, c2w_list, K_list, progress_fn=progress)
+
+        if len(dense_pts) > 0:
+            # Replace scene data with the dense cloud
+            state.pts3d_list = list(pts3d_list) + [dense_pts]
+            state.confs_list = list(confs_list) + [
+                np.ones(len(dense_pts), dtype=np.float32) * 10.0]
+
+            # Display the dense cloud
+            disp_pts, disp_cols = dense_pts, dense_cols
+            if len(disp_pts) > 500000:
+                idx = np.random.choice(len(disp_pts), 500000, replace=False)
+                disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
+            scene_gl.set_points(disp_pts, disp_cols)
+            state.has_points = True
+            state.points_modified = True
+            state.status = f"COLMAP dense: {len(dense_pts):,d} points"
+        else:
+            state.status = "COLMAP PatchMatch produced no points (CUDA required)"
+
+    except Exception as e:
+        state.status = f"COLMAP densify failed: {e}"
+        import traceback; traceback.print_exc()
+    finally:
+        state.refining = False
+        state.refine_progress = ""
+
+
 def run_densify_sgm(state, scene_gl):
     """Densify point cloud using OpenCV StereoSGBM on full-res image pairs."""
     state.refine_progress = "Densifying with stereo matching..."
@@ -3682,15 +3743,15 @@ def main():
 
         # ── Densify ──
         if state.has_points and state.scene is not None and not state.refining:
+            if imgui.button("Densify (COLMAP PatchMatch)", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=run_densify_colmap, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
             if imgui.button("Densify (Stereo Matching)", width=-1):
                 state.refining = True
                 state.refine_thread = threading.Thread(
                     target=run_densify_sgm, args=(state, scene_gl), daemon=True)
-                state.refine_thread.start()
-            if imgui.button("Densify (Mono Depth)", width=-1):
-                state.refining = True
-                state.refine_thread = threading.Thread(
-                    target=run_upscale_points, args=(state, scene_gl), daemon=True)
                 state.refine_thread.start()
 
         imgui.separator()

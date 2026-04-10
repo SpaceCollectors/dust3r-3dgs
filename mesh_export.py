@@ -757,6 +757,126 @@ def densify_sgm(image_paths, c2w_list, K_list, existing_pts=None,
     return points, colors
 
 
+def densify_colmap(image_paths, c2w_list, K_list, progress_fn=None):
+    """Dense MVS via COLMAP PatchMatch + stereo fusion.
+
+    Creates a COLMAP workspace from known cameras, runs GPU PatchMatch
+    for per-pixel depth maps, then fuses into a dense point cloud.
+    """
+    import pycolmap
+    import tempfile, shutil
+    from PIL import Image as PILImage
+    from scipy.spatial.transform import Rotation
+
+    workdir = tempfile.mkdtemp(prefix="colmap_dense_")
+    n_imgs = len(image_paths)
+
+    try:
+        # Step 1: Build COLMAP reconstruction from known cameras
+        if progress_fn: progress_fn("Building COLMAP workspace...")
+        print(f"  Building COLMAP workspace in {workdir}")
+
+        # Create image directory with copies
+        img_dir = os.path.join(workdir, "images")
+        os.makedirs(img_dir, exist_ok=True)
+        for p in image_paths:
+            shutil.copy2(p, os.path.join(img_dir, os.path.basename(p)))
+
+        # Create sparse reconstruction
+        sparse_dir = os.path.join(workdir, "sparse")
+        os.makedirs(sparse_dir, exist_ok=True)
+
+        rec = pycolmap.Reconstruction()
+
+        for i in range(n_imgs):
+            img_pil = PILImage.open(image_paths[i])
+            W, H = img_pil.size
+            K = K_list[i]
+
+            # Add camera
+            cam = pycolmap.Camera(
+                model='PINHOLE',
+                width=W, height=H,
+                params=[float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])])
+            cam.camera_id = i + 1
+            rec.add_camera(cam)
+
+            # Add image with pose
+            c2w = c2w_list[i].astype(np.float64)
+            w2c = np.linalg.inv(c2w)
+            R = w2c[:3, :3]
+            t = w2c[:3, 3]
+
+            # Convert rotation matrix to quaternion (w, x, y, z)
+            rot = Rotation.from_matrix(R)
+            quat = rot.as_quat()  # (x, y, z, w)
+            qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
+
+            image = pycolmap.Image(
+                image_id=i + 1,
+                name=os.path.basename(image_paths[i]),
+                camera_id=i + 1,
+                cam_from_world=pycolmap.Rigid3d(
+                    rotation=pycolmap.Rotation3d(np.array([qw, qx, qy, qz])),
+                    translation=t))
+            rec.add_image(image)
+            rec.register_image(i + 1)
+
+        rec.write(sparse_dir)
+        print(f"  Wrote sparse reconstruction: {n_imgs} images")
+
+        # Step 2: Undistort images
+        if progress_fn: progress_fn("Undistorting images...")
+        pycolmap.undistort_images(
+            output_path=workdir,
+            input_path=sparse_dir,
+            image_path=img_dir)
+        print("  Images undistorted")
+
+        # Step 3: PatchMatch stereo (GPU)
+        if progress_fn: progress_fn("PatchMatch stereo (GPU)...")
+        print("  Running PatchMatch stereo...")
+        opts = pycolmap.PatchMatchOptions()
+        opts.num_iterations = 5
+        opts.geom_consistency = True
+        pycolmap.patch_match_stereo(workspace_path=workdir, options=opts)
+        print("  PatchMatch complete")
+
+        # Step 4: Stereo fusion
+        if progress_fn: progress_fn("Fusing depth maps...")
+        output_ply = os.path.join(workdir, "fused.ply")
+        fuse_opts = pycolmap.StereoFusionOptions()
+        fuse_opts.min_num_pixels = 3
+        pycolmap.stereo_fusion(
+            output_path=output_ply,
+            workspace_path=workdir,
+            options=fuse_opts)
+        print(f"  Fused to {output_ply}")
+
+        # Step 5: Load the fused point cloud
+        if not os.path.exists(output_ply):
+            print("  ERROR: fused.ply not found")
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+
+        import open3d as o3d
+        pcd = o3d.io.read_point_cloud(output_ply)
+        pts = np.asarray(pcd.points, dtype=np.float32)
+        if pcd.has_colors():
+            cols = (np.asarray(pcd.colors) * 255).clip(0, 255).astype(np.uint8)
+        else:
+            cols = np.full((len(pts), 3), 180, dtype=np.uint8)
+
+        print(f"  Dense cloud: {len(pts):,d} points")
+        return pts, cols
+
+    except Exception as e:
+        print(f"  COLMAP dense failed: {e}")
+        import traceback; traceback.print_exc()
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def save_dense_ply(path, pts, colors):
     n = len(pts)
     header = f"ply\nformat binary_little_endian 1.0\nelement vertex {n}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
