@@ -537,13 +537,23 @@ def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf):
     pcd.colors = o3d.utility.Vector3dVector(all_colors.astype(np.float64) / 255.0)
 
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    extent = np.linalg.norm(np.asarray(pcd.points).max(0) - np.asarray(pcd.points).min(0))
-    voxel_size = extent / 800
-    pcd = pcd.voxel_down_sample(voxel_size)
-    print(f"  After dedup: {len(pcd.points):,d} (voxel={voxel_size:.6f})")
 
+    # Compute median spacing — only downsample if there are actual duplicates
+    dists_raw = np.asarray(pcd.compute_nearest_neighbor_distance())
+    median_spacing = float(np.median(dists_raw))
+    extent = np.linalg.norm(np.asarray(pcd.points).max(0) - np.asarray(pcd.points).min(0))
+    print(f"  Median spacing: {median_spacing:.6f}, extent: {extent:.4f}")
+
+    # Only voxel downsample to remove near-exact duplicates (0.5x median spacing)
+    voxel_size = median_spacing * 0.5
+    n_before = len(pcd.points)
+    pcd = pcd.voxel_down_sample(voxel_size)
+    print(f"  Dedup: {n_before:,d} -> {len(pcd.points):,d} (voxel={voxel_size:.6f})")
+
+    # Normal estimation at actual point scale
+    normal_radius = median_spacing * 4
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
-        radius=voxel_size * 4, max_nn=30))
+        radius=normal_radius, max_nn=30))
     if cam2world_list:
         cam_center = np.mean([c[:3, 3] for c in cam2world_list], axis=0)
         pcd.orient_normals_towards_camera_location(cam_center)
