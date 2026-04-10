@@ -1784,6 +1784,15 @@ def _handle_align_click(state, scene_gl, camera, mx, my, window):
         normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue = plane normal
         normal /= max(np.linalg.norm(normal), 1e-8)
 
+        # Orient normal toward camera (surface faces viewer)
+        cam_pos = camera.get_position()
+        # Camera position is in display space, need to undo scene rotation
+        R_scene_inv = R_scene.T  # orthogonal, so inv = transpose
+        cam_pos_orig = R_scene_inv @ cam_pos
+        to_cam = cam_pos_orig - centroid
+        if np.dot(normal, to_cam) < 0:
+            normal = -normal
+
         # Store the normal for this mode
         if mode == 'floor':
             state.align_floor_normal = normal.copy()
