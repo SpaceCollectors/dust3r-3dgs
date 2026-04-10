@@ -841,7 +841,7 @@ class AppState:
         # Scene orientation transform (applied in shader)
         self.scene_rot_x = 180.0  # degrees (DUSt3R convention: Y-down, flip to Y-up)
         self.align_mode = None  # None, 'floor', or 'wall' — waiting for click
-        self.align_radius = 20.0  # radius multiplier (Nx median local spacing)
+        self.align_radius = 2.0  # radius multiplier (Nx median local spacing)
         self.scene_rot_y = 0.0
         self.scene_rot_z = 0.0
         self.scene_flip_y = False
@@ -3793,7 +3793,7 @@ def main():
         # Scene orientation
         imgui.text("Orientation")
         _, state.align_radius = imgui.input_float("Align Radius", state.align_radius, 5.0, 10.0)
-        state.align_radius = max(5.0, state.align_radius)
+        state.align_radius = max(0.5, state.align_radius)
         if state.align_mode:
             imgui.text_colored(f"Click on the {state.align_mode} to align (yellow = selected)", 1.0, 1.0, 0.3)
             if imgui.button("Cancel"):
