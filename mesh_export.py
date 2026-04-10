@@ -848,7 +848,7 @@ def _find_colmap_exe():
 def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                    max_image_size=-1, num_iterations=5, window_radius=5,
                    min_consistent=2, geom_consistency=True, filter_min_ncc=0.1,
-                   existing_pts=None):
+                   existing_pts=None, colmap_workdir=None):
     """Dense MVS via full COLMAP pipeline (SfM + PatchMatch + fusion).
 
     Runs COLMAP's own SfM to get reliable cameras, then PatchMatch dense stereo.
@@ -865,57 +865,77 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             "  Get: colmap-x64-windows-cuda.zip\n"
             "  Extract to project folder as colmap/")
 
-    workdir = tempfile.mkdtemp(prefix="colmap_dense_")
     n_imgs = len(image_paths)
     import subprocess, re
 
+    # Reuse existing COLMAP workspace if available (same coordinate frame)
+    reuse = False
+    if colmap_workdir and os.path.isdir(colmap_workdir):
+        sparse_sub = None
+        for d in ['sparse/0', 'sparse/1', 'sparse']:
+            candidate = os.path.join(colmap_workdir, d)
+            if os.path.isdir(candidate) and (
+                os.path.exists(os.path.join(candidate, 'cameras.bin')) or
+                os.path.exists(os.path.join(candidate, 'cameras.txt'))):
+                sparse_sub = candidate
+                break
+        if sparse_sub:
+            workdir = colmap_workdir
+            img_dir = os.path.join(workdir, "images")
+            reuse = True
+            print(f"  Reusing COLMAP workspace: {workdir}")
+            print(f"  Sparse model: {sparse_sub}")
+
+    if not reuse:
+        workdir = tempfile.mkdtemp(prefix="colmap_dense_")
+
     try:
-        # Copy images
-        img_dir = os.path.join(workdir, "images")
-        os.makedirs(img_dir, exist_ok=True)
-        for p in image_paths:
-            shutil.copy2(p, os.path.join(img_dir, os.path.basename(p)))
+        if not reuse:
+            # Copy images
+            img_dir = os.path.join(workdir, "images")
+            os.makedirs(img_dir, exist_ok=True)
+            for p in image_paths:
+                shutil.copy2(p, os.path.join(img_dir, os.path.basename(p)))
 
-        db_path = os.path.join(workdir, "database.db")
-        sparse_dir = os.path.join(workdir, "sparse")
-        os.makedirs(sparse_dir, exist_ok=True)
+            db_path = os.path.join(workdir, "database.db")
+            sparse_dir = os.path.join(workdir, "sparse")
+            os.makedirs(sparse_dir, exist_ok=True)
 
-        # Step 1: Feature extraction
-        if progress_fn: progress_fn("COLMAP: extracting features...")
-        print("  Feature extraction...")
-        subprocess.run([colmap_exe, 'feature_extractor',
-                       '--database_path', db_path,
-                       '--image_path', img_dir],
-                      capture_output=True, timeout=600)
+            # Step 1: Feature extraction
+            if progress_fn: progress_fn("COLMAP: extracting features...")
+            print("  Feature extraction...")
+            subprocess.run([colmap_exe, 'feature_extractor',
+                           '--database_path', db_path,
+                           '--image_path', img_dir],
+                          capture_output=True, timeout=600)
 
-        # Step 2: Feature matching
-        if progress_fn: progress_fn("COLMAP: matching features...")
-        print("  Feature matching...")
-        subprocess.run([colmap_exe, 'exhaustive_matcher',
-                       '--database_path', db_path],
-                      capture_output=True, timeout=600)
+            # Step 2: Feature matching
+            if progress_fn: progress_fn("COLMAP: matching features...")
+            print("  Feature matching...")
+            subprocess.run([colmap_exe, 'exhaustive_matcher',
+                           '--database_path', db_path],
+                          capture_output=True, timeout=600)
 
-        # Step 3: Sparse reconstruction
-        if progress_fn: progress_fn("COLMAP: sparse reconstruction...")
-        print("  Sparse reconstruction...")
-        subprocess.run([colmap_exe, 'mapper',
-                       '--database_path', db_path,
-                       '--image_path', img_dir,
-                       '--output_path', sparse_dir],
-                      capture_output=True, timeout=600)
+            # Step 3: Sparse reconstruction
+            if progress_fn: progress_fn("COLMAP: sparse reconstruction...")
+            print("  Sparse reconstruction...")
+            subprocess.run([colmap_exe, 'mapper',
+                           '--database_path', db_path,
+                           '--image_path', img_dir,
+                           '--output_path', sparse_dir],
+                          capture_output=True, timeout=600)
 
-        # Find the reconstruction (usually in sparse/0/)
-        sparse_sub = os.path.join(sparse_dir, '0')
-        if not os.path.isdir(sparse_sub):
-            # Try to find any reconstruction
-            for d in os.listdir(sparse_dir):
-                if os.path.isdir(os.path.join(sparse_dir, d)):
-                    sparse_sub = os.path.join(sparse_dir, d)
-                    break
-            else:
-                raise RuntimeError("COLMAP sparse reconstruction failed — no model produced")
+            # Find the reconstruction (usually in sparse/0/)
+            sparse_sub = os.path.join(sparse_dir, '0')
+            if not os.path.isdir(sparse_sub):
+                for d in os.listdir(sparse_dir):
+                    if os.path.isdir(os.path.join(sparse_dir, d)):
+                        sparse_sub = os.path.join(sparse_dir, d)
+                        break
+                else:
+                    raise RuntimeError("COLMAP sparse reconstruction failed — no model produced")
 
-        print(f"  Sparse model: {sparse_sub}")
+            print(f"  Sparse model: {sparse_sub}")
 
         # Step 4: Undistort
         if progress_fn: progress_fn("COLMAP: undistorting images...")
@@ -998,7 +1018,8 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
         import traceback; traceback.print_exc()
         return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        if not reuse:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def save_dense_ply(path, pts, colors):

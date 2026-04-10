@@ -1128,6 +1128,7 @@ print('SUCCESS')
             from PIL import Image as PILImage
 
             workdir = Path(tempfile.mkdtemp(prefix="colmap_"))
+            state._colmap_workdir = str(workdir)  # save for densify reuse
             image_dir = workdir / "images"
             image_dir.mkdir()
 
@@ -2088,7 +2089,8 @@ def run_densify_colmap(state, scene_gl):
             min_consistent=state.pm_min_consistent,
             geom_consistency=state.pm_geom_consistency,
             filter_min_ncc=state.pm_filter_min_ncc,
-            existing_pts=existing)
+            existing_pts=existing,
+            colmap_workdir=getattr(state, '_colmap_workdir', None))
         dense_pts, dense_cols = densify_colmap(
             state.image_paths, c2w_list, K_list, progress_fn=progress, **pm_opts)
 
