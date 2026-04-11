@@ -853,8 +853,8 @@ class AppState:
         self.splat_step = 0
         self.splat_total = 0
         self.splat_data = None  # trained splats ParameterDict
-        self.splat_iterations = 3000
-        self.splat_n_samples = 50000
+        self.splat_iterations = 2000
+        self.splat_n_samples = 20000
         self.splat_anchor_weight = 0.1
 
         # Export

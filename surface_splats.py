@@ -5,6 +5,7 @@ Initialize splats on mesh surface, train with surface anchor loss
 to prevent floating. Yields progress for live viewport rendering.
 """
 
+import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -76,8 +77,8 @@ def sample_mesh_surface(verts, faces, colors, n_samples=50000):
 
 def init_surface_splats(points, normals, colors, device='cuda'):
     """Initialize splats from surface samples with normal-aligned orientations."""
-    from scipy.spatial.transform import Rotation
     N = len(points)
+    print(f"    Initializing {N:,d} splats...")
 
     means = torch.from_numpy(points).float().to(device)
 
@@ -87,31 +88,36 @@ def init_surface_splats(points, normals, colors, device='cuda'):
     scales = np.stack([scales_init, scales_init, scales_init], axis=-1)
     scales = torch.from_numpy(scales).float().to(device)
 
-    # Orient quaternions: align local Z with face normal
+    # Vectorized quaternion from Z-axis to normal (Rodrigues)
+    z = np.array([0, 0, 1], dtype=np.float32)
+    n = normals.copy()
+    n /= (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-8)
+
+    # cross(z, n) and dot(z, n)
+    axis = np.cross(z, n)  # (N, 3)
+    axis_len = np.linalg.norm(axis, axis=-1)  # (N,)
+    cos_angle = n[:, 2]  # dot([0,0,1], n) = n_z
+
+    # Half-angle quaternion: q = [cos(a/2), sin(a/2)*axis]
+    # Using: angle = arccos(cos_angle), half = angle/2
+    # But faster: cos(a/2) = sqrt((1+cos_a)/2), sin(a/2) = sqrt((1-cos_a)/2)
+    half_cos = np.sqrt(np.clip((1 + cos_angle) / 2, 0, 1))  # (N,)
+    half_sin = np.sqrt(np.clip((1 - cos_angle) / 2, 0, 1))  # (N,)
+
+    # Normalize axis (where valid)
+    valid = axis_len > 1e-6
+    axis[valid] /= axis_len[valid, None]
+    axis[~valid] = [1, 0, 0]  # arbitrary for aligned/anti-aligned
+
     quats_np = np.zeros((N, 4), dtype=np.float32)
-    z_axis = np.array([0, 0, 1], dtype=np.float32)
-    for i in range(N):
-        n = normals[i]
-        n_norm = np.linalg.norm(n)
-        if n_norm < 1e-6:
-            quats_np[i] = [1, 0, 0, 0]
-            continue
-        n = n / n_norm
-        # Rotation from Z to normal
-        axis = np.cross(z_axis, n)
-        axis_len = np.linalg.norm(axis)
-        if axis_len < 1e-6:
-            # Already aligned (or anti-aligned)
-            if np.dot(z_axis, n) > 0:
-                quats_np[i] = [1, 0, 0, 0]
-            else:
-                quats_np[i] = [0, 1, 0, 0]  # 180 deg around X
-        else:
-            axis /= axis_len
-            angle = np.arccos(np.clip(np.dot(z_axis, n), -1, 1))
-            r = Rotation.from_rotvec(axis * angle)
-            q = r.as_quat()  # (x, y, z, w)
-            quats_np[i] = [q[3], q[0], q[1], q[2]]  # (w, x, y, z)
+    quats_np[:, 0] = half_cos          # w
+    quats_np[:, 1] = half_sin * axis[:, 0]  # x
+    quats_np[:, 2] = half_sin * axis[:, 1]  # y
+    quats_np[:, 3] = half_sin * axis[:, 2]  # z
+
+    # Fix anti-aligned case (cos_angle ~ -1): 180 deg around X
+    anti = cos_angle < -0.999
+    quats_np[anti] = [0, 1, 0, 0]
 
     quats = torch.from_numpy(quats_np).float().to(device)
 
@@ -147,7 +153,7 @@ def surface_anchor_loss(means, anchor_tree, anchor_pts_t):
 
 def train_surface_splats(
     mesh_data=None, point_cloud=None, colmap_dir=None,
-    device='cuda', iterations=3000, max_resolution=512,
+    device='cuda', iterations=3000, max_resolution=256,
     n_samples=50000,
     anchor_weight_start=0.1, anchor_weight_end=0.001,
     depth_lambda=0.5, aniso_lambda=0.01, scale_lambda=0.001,
@@ -236,11 +242,24 @@ def train_surface_splats(
         img['K_t'] = torch.from_numpy(img['K']).float().to(device)
         img['w2c_t'] = torch.from_numpy(img['w2c'].astype(np.float32)).to(device)
 
-    CROP = 256
+    CROP = 128  # small crops for faster training with pure PyTorch rasterizer
     ssim_lambda = 0.2
     t0 = time.time()
 
+    # Yield initial state so viewport shows splats immediately
+    with torch.no_grad():
+        m = splats['means'].detach().cpu().numpy()
+        c = (splats['sh0'].squeeze(1).detach() * C0 + 0.5).clamp(0, 1).cpu().numpy()
+        s = torch.exp(splats['scales'].detach()).max(dim=-1).values.cpu().numpy()
+    yield {
+        'step': 0, 'total': iterations,
+        'loss': 0.0, 'n_splats': len(m),
+        'means': m, 'colors': c, 'scales': s,
+        'done': False,
+    }
+
     print(f"  Training for {iterations} iterations...")
+    import sys; sys.stdout.flush()
 
     for step in range(iterations):
         if stop_flag and stop_flag():
@@ -358,19 +377,20 @@ def train_surface_splats(
                     optimizers['means'],
                     gamma=0.01 ** (1.0 / max(1, iterations - step)))
 
-        # Yield progress every 50 steps
-        if step % 50 == 0 or step == iterations - 1:
+        # Yield progress every 50 steps (+ step 1 to confirm start)
+        if step <= 1 or step % 50 == 0 or step == iterations - 1:
+            loss_val = loss.item()
+            elapsed = time.time() - t0
+            n_gs = splats['means'].shape[0]
+            print(f"  [{step:5d}/{iterations}] loss={loss_val:.4f} "
+                  f"anchor={anchor_loss.item():.4f} #gs={n_gs:,d} "
+                  f"{elapsed:.1f}s ({elapsed/(step+1):.2f}s/it)")
+            sys.stdout.flush()
+
             with torch.no_grad():
                 m = splats['means'].detach().cpu().numpy()
                 c = (splats['sh0'].squeeze(1).detach() * C0 + 0.5).clamp(0, 1).cpu().numpy()
                 s = torch.exp(splats['scales'].detach()).max(dim=-1).values.cpu().numpy()
-
-            loss_val = loss.item()
-            elapsed = time.time() - t0
-            n_gs = splats['means'].shape[0]
-            if step % 100 == 0:
-                print(f"  [{step:5d}/{iterations}] loss={loss_val:.4f} "
-                      f"anchor={anchor_loss.item():.4f} #gs={n_gs:,d} {elapsed:.1f}s")
 
             yield {
                 'step': step, 'total': iterations,
