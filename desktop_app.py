@@ -917,7 +917,7 @@ class AppState:
         self.splat_data = None  # trained splats ParameterDict
         self.splat_iterations = 2000
         self.splat_n_samples = 20000
-        self.splat_target = 100000  # target splat count (0=no densification)
+        self.splat_target = 50000  # target splat count (0=no densification)
         self.splat_anchor_weight = 0.1
 
         # Export

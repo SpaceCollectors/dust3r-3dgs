@@ -166,6 +166,11 @@ def render_gaussians(means3d, scales, quats, opacities, colors,
             image[y_start:y_end] = bg_color.view(1, 1, 3)
             continue
 
+        # Cap per-band gaussians to prevent OOM (keep closest ones)
+        MAX_PER_BAND = 8192
+        if len(oidx) > MAX_PER_BAND:
+            oidx = oidx[:MAX_PER_BAND]  # already depth-sorted
+
         K_gs = len(oidx)
         m = means2d[oidx]          # (K, 2)
         ic = inv_cov[oidx]         # (K, 2, 2)
