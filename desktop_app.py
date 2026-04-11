@@ -917,6 +917,7 @@ class AppState:
         self.splat_data = None  # trained splats ParameterDict
         self.splat_iterations = 2000
         self.splat_n_samples = 20000
+        self.splat_target = 100000  # target splat count (0=no densification)
         self.splat_anchor_weight = 0.1
 
         # Export
@@ -3548,6 +3549,7 @@ def run_train_splats(state, scene_gl):
             colmap_dir=export_dir,
             iterations=state.splat_iterations,
             n_samples=state.splat_n_samples,
+            target_splats=state.splat_target,
             anchor_weight_start=state.splat_anchor_weight,
             stop_flag=lambda: state.stop_requested,
         )
@@ -4309,6 +4311,11 @@ def main():
                     "Iterations##splat", state.splat_iterations, 500, 10000)
                 _, state.splat_n_samples = imgui.slider_int(
                     "Samples##splat", state.splat_n_samples, 5000, 200000)
+                _, state.splat_target = imgui.slider_int(
+                    "Target Splats", state.splat_target, 0, 500000)
+                if state.splat_target == 0:
+                    imgui.same_line()
+                    imgui.text_colored("(no densify)", 0.5, 0.5, 0.5)
                 _, state.splat_anchor_weight = imgui.slider_float(
                     "Anchor##splat", state.splat_anchor_weight, 0.0, 1.0, "%.2f")
                 if imgui.button("Train Splats", width=-1):

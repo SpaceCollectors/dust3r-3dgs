@@ -341,20 +341,24 @@ def train_surface_splats(
             opt.zero_grad(set_to_none=True)
         means_scheduler.step()
 
-        # Densification & Pruning
-        if step > 0 and step % 500 == 0:
+        # Densification & Pruning (every 200 steps, first 75% of training)
+        if step > 0 and step % 200 == 0:
             target = target_splats
             with torch.no_grad():
                 cur_n = splats['means'].shape[0]
+
+                # Prune dead splats
                 alive = torch.sigmoid(splats['opacities'].data) > 0.005
                 if alive.sum() < cur_n:
                     n_pruned = cur_n - alive.sum().item()
                     for key in splats:
                         splats[key] = torch.nn.Parameter(splats[key].data[alive])
                     cur_n = splats['means'].shape[0]
+                    print(f"    Pruned {n_pruned} -> {cur_n:,d} splats")
 
+                # Densify: grow toward target by splitting large splats
                 if target > 0 and cur_n < target and step < iterations * 3 // 4:
-                    n_add = min(target - cur_n, cur_n // 4)
+                    n_add = min(target - cur_n, cur_n)  # up to 100% growth per step
                     if n_add > 0:
                         scale_mag = torch.exp(splats['scales'].data).max(dim=-1).values
                         probs = scale_mag / scale_mag.sum()
@@ -362,15 +366,31 @@ def train_surface_splats(
                         for key in splats:
                             new_data = splats[key].data[idx_s].clone()
                             if key == 'means':
-                                new_data += torch.randn_like(new_data) * 0.01 * scene_scale
+                                # Offset along random direction, scaled by splat size
+                                offset_scale = torch.exp(splats['scales'].data[idx_s]).max(dim=-1).values
+                                noise = torch.randn_like(new_data)
+                                noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8)
+                                new_data = new_data + noise * offset_scale[:, None] * 0.5
                             elif key == 'opacities':
                                 new_data -= 0.7
                                 splats[key].data[idx_s] -= 0.7
                             elif key == 'scales':
-                                new_data -= 0.5
-                                splats[key].data[idx_s] -= 0.5
+                                new_data -= 0.7  # shrink more aggressively
+                                splats[key].data[idx_s] -= 0.7
                             splats[key] = torch.nn.Parameter(
                                 torch.cat([splats[key].data, new_data], dim=0))
+                        print(f"    Densified +{n_add:,d} -> {splats['means'].shape[0]:,d} splats")
+
+                # Final trimming to hit target (last 25%)
+                if target > 0 and cur_n > target and step >= iterations * 3 // 4:
+                    n_remove = cur_n - target
+                    opa = torch.sigmoid(splats['opacities'].data)
+                    _, remove_idx = torch.topk(opa, n_remove, largest=False)
+                    keep = torch.ones(cur_n, dtype=torch.bool, device=device)
+                    keep[remove_idx] = False
+                    for key in splats:
+                        splats[key] = torch.nn.Parameter(splats[key].data[keep])
+                    print(f"    Trimmed -> {splats['means'].shape[0]:,d} splats")
 
                 optimizers = create_optimizers(splats, scene_scale)
                 means_scheduler = optim.lr_scheduler.ExponentialLR(
