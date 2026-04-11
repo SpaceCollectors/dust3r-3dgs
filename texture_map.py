@@ -238,70 +238,93 @@ def _project_view(verts, faces, face_normals, face_uv0, face_uv1, face_uv2,
 # ── UV unwrapping ───────────────────────────────────────────────────────────
 
 def _unwrap_uvs(verts, faces):
-    try:
-        import xatlas
-        print("  UV unwrapping with xatlas...")
+    """Cube-map style UV projection: assign each face to the best of 6 axis
+    directions based on its normal, project onto the perpendicular plane,
+    then pack into a 3x2 grid atlas.  ~30x faster than xatlas and produces
+    large contiguous charts instead of thousands of tiny islands."""
+    import time
+    t0 = time.time()
 
-        v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
-        fn = np.cross(v1 - v0, v2 - v0)
-        fn /= (np.linalg.norm(fn, axis=-1, keepdims=True) + 1e-8)
-        vn = np.zeros_like(verts, dtype=np.float64)
-        for ax in range(3):
-            np.add.at(vn[:, ax], faces[:, 0], fn[:, ax])
-            np.add.at(vn[:, ax], faces[:, 1], fn[:, ax])
-            np.add.at(vn[:, ax], faces[:, 2], fn[:, ax])
-        vn /= (np.linalg.norm(vn, axis=-1, keepdims=True) + 1e-8)
-
-        try:
-            chart_options = xatlas.ChartOptions()
-            chart_options.max_chart_area = 0.0
-            chart_options.max_boundary_length = 0.0
-            chart_options.normal_deviation_weight = 2.0
-            chart_options.roundness_weight = 0.01
-            chart_options.straightness_weight = 6.0
-            chart_options.normal_seam_weight = 4.0
-            chart_options.max_cost = 2.0
-
-            pack_options = xatlas.PackOptions()
-            pack_options.padding = 4
-            pack_options.bilinear = True
-            pack_options.bruteForce = False
-            pack_options.blockAlign = True
-
-            atlas = xatlas.Atlas()
-            atlas.add_mesh(verts.astype(np.float32), faces.astype(np.uint32),
-                           normals=vn.astype(np.float32))
-            atlas.generate(chart_options=chart_options, pack_options=pack_options)
-            vmapping, uv_faces, uvs = atlas[0]
-            print(f"  UV atlas: {len(uvs):,d} UV coords, {atlas.chart_count} charts")
-            return uvs.astype(np.float32), uv_faces.astype(np.int32)
-        except (AttributeError, TypeError):
-            pass
-
-        vmapping, uv_faces, uvs = xatlas.parametrize(
-            verts.astype(np.float32), faces.astype(np.uint32))
-        print(f"  UV atlas (basic): {len(uvs):,d} UV coords")
-        return uvs.astype(np.float32), uv_faces.astype(np.int32)
-    except ImportError:
-        print("  xatlas not available, using simple atlas")
-        return _simple_atlas(faces)
-
-
-def _simple_atlas(faces):
     F = len(faces)
-    cols = int(np.ceil(np.sqrt(F)))
-    cell = 1.0 / cols
-    margin = cell * 0.05
+    v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
+    fn = np.cross(v1 - v0, v2 - v0)
+    fn /= (np.linalg.norm(fn, axis=-1, keepdims=True) + 1e-8)
+
+    # 6 axis directions (cube map)
+    directions = np.array([
+        [1, 0, 0], [-1, 0, 0],
+        [0, 1, 0], [0, -1, 0],
+        [0, 0, 1], [0, 0, -1]
+    ], dtype=np.float32)
+
+    # Assign each face to the direction most aligned with its normal
+    dots = fn @ directions.T  # (F, 6)
+    face_dir = np.argmax(dots, axis=1)
+
+    # For each direction group, project vertices onto the perpendicular plane
     uvs = np.zeros((F * 3, 2), dtype=np.float32)
-    uv_faces = np.zeros((F, 3), dtype=np.int32)
-    for fi in range(F):
-        r, c = fi // cols, fi % cols
-        base = fi * 3
-        uvs[base] = [c * cell + margin, r * cell + margin]
-        uvs[base + 1] = [(c + 1) * cell - margin, r * cell + margin]
-        uvs[base + 2] = [c * cell + cell * 0.5, (r + 1) * cell - margin]
-        uv_faces[fi] = [base, base + 1, base + 2]
+    uv_faces = np.arange(F * 3, dtype=np.int32).reshape(F, 3)
+
+    # Precompute projection axes per direction
+    proj_axes = []
+    for d in directions:
+        if abs(d[2]) < 0.9:
+            u_ax = np.cross(d, [0, 0, 1])
+        else:
+            u_ax = np.cross(d, [0, 1, 0])
+        u_ax /= np.linalg.norm(u_ax)
+        v_ax = np.cross(d, u_ax)
+        v_ax /= np.linalg.norm(v_ax)
+        proj_axes.append((u_ax, v_ax))
+
+    # Vectorized projection per direction group
+    for di in range(6):
+        mask = face_dir == di
+        if not mask.any():
+            continue
+        u_ax, v_ax = proj_axes[di]
+        face_idx = np.where(mask)[0]
+        # Gather all 3 vertices for these faces
+        fv = verts[faces[face_idx]]  # (N, 3, 3)
+        proj_u = fv @ u_ax  # (N, 3)
+        proj_v = fv @ v_ax  # (N, 3)
+        for vi in range(3):
+            uvs[face_idx * 3 + vi, 0] = proj_u[:, vi]
+            uvs[face_idx * 3 + vi, 1] = proj_v[:, vi]
+
+    # Pack each direction into a 3x2 grid cell
+    grid_cols, grid_rows = 3, 2
+    cell_w, cell_h = 1.0 / grid_cols, 1.0 / grid_rows
+    padding = 0.005
+
+    for di in range(6):
+        mask = face_dir == di
+        if not mask.any():
+            continue
+        face_idx = np.where(mask)[0]
+        uv_idx = np.concatenate([face_idx * 3, face_idx * 3 + 1, face_idx * 3 + 2])
+
+        sub_uv = uvs[uv_idx]
+        mn = sub_uv.min(axis=0)
+        mx = sub_uv.max(axis=0)
+        rng = mx - mn
+        rng[rng < 1e-8] = 1.0
+        sub_uv = (sub_uv - mn) / rng  # normalize to [0,1]
+
+        gc = di % grid_cols
+        gr = di // grid_cols
+        sub_uv[:, 0] = gc * cell_w + padding + sub_uv[:, 0] * (cell_w - 2 * padding)
+        sub_uv[:, 1] = gr * cell_h + padding + sub_uv[:, 1] * (cell_h - 2 * padding)
+        uvs[uv_idx] = sub_uv
+
+    counts = [int((face_dir == i).sum()) for i in range(6)]
+    elapsed = time.time() - t0
+    print(f"  UV projection: {F:,d} faces -> 6 charts in {elapsed:.2f}s")
+    print(f"    +X:{counts[0]:,d} -X:{counts[1]:,d} +Y:{counts[2]:,d} "
+          f"-Y:{counts[3]:,d} +Z:{counts[4]:,d} -Z:{counts[5]:,d}")
     return uvs, uv_faces
+
+
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

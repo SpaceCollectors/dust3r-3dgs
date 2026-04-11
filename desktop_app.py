@@ -3317,34 +3317,14 @@ def run_texture(state, scene_gl):
         from texture_map import bake_texture
         texture_img = bake_texture(verts, faces, uvs, uv_faces, views)
 
+        # Store baked texture for export
+        state._baked_texture = texture_img
+
         # Upload to viewport
         state.refine_progress = "Uploading texture..."
         scene_gl.set_texture(texture_img, uvs, uv_faces, verts, faces, colors)
 
-        # Save to disk
-        output_dir = os.path.join(tmpdir, 'textured')
-        os.makedirs(output_dir, exist_ok=True)
-        from texture_map import _write_obj, _dilate_texture
-        from PIL import Image
-
-        tex_path = os.path.join(output_dir, 'texture.png')
-        Image.fromarray(texture_img).save(tex_path, quality=95)
-
-        mtl_path = os.path.join(output_dir, 'mesh.mtl')
-        with open(mtl_path, 'w') as f:
-            f.write("newmtl material0\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\n"
-                    "d 1\nillum 1\nmap_Kd texture.png\n")
-
-        uvs_obj = uvs.copy()
-        uvs_obj[:, 1] = 1.0 - uvs_obj[:, 1]
-        obj_path = os.path.join(output_dir, 'mesh.obj')
-        _write_obj(obj_path, verts, faces, uvs_obj, uv_faces)
-
-        state.status = f"Textured mesh saved to {output_dir}"
-        state.refine_progress = ""
-
-        import subprocess
-        subprocess.Popen(['explorer', output_dir.replace('/', '\\')])
+        state.status = f"Texture baked — use Export to save"
 
     except Exception as e:
         state.error_msg = str(e)
@@ -3353,6 +3333,55 @@ def run_texture(state, scene_gl):
 
     state.refining = False
     state.refine_progress = ""
+
+
+def _export_textured_obj(state, path):
+    """Export textured mesh to OBJ + MTL + PNG at user-chosen path."""
+    try:
+        from texture_map import _write_obj
+        from PIL import Image
+
+        verts, faces, colors = state.mesh_data
+        uvs, uv_faces = state.uv_data
+        texture_img = state._baked_texture
+
+        out_dir = os.path.dirname(path)
+        base = os.path.splitext(os.path.basename(path))[0]
+
+        # Save texture
+        tex_name = f"{base}.png"
+        tex_path = os.path.join(out_dir, tex_name)
+        Image.fromarray(texture_img).save(tex_path, quality=95)
+
+        # Save MTL
+        mtl_name = f"{base}.mtl"
+        mtl_path = os.path.join(out_dir, mtl_name)
+        with open(mtl_path, 'w') as f:
+            f.write(f"newmtl material0\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\n"
+                    f"d 1\nillum 1\nmap_Kd {tex_name}\n")
+
+        # Save OBJ (flip V for OBJ convention)
+        uvs_obj = uvs.copy()
+        uvs_obj[:, 1] = 1.0 - uvs_obj[:, 1]
+
+        # Write OBJ with correct MTL reference
+        with open(path, 'w') as f:
+            f.write(f"mtllib {mtl_name}\nusemtl material0\n")
+            for i in range(len(verts)):
+                f.write(f"v {verts[i,0]:.6f} {verts[i,1]:.6f} {verts[i,2]:.6f}\n")
+            for i in range(len(uvs_obj)):
+                f.write(f"vt {uvs_obj[i,0]:.6f} {uvs_obj[i,1]:.6f}\n")
+            for i in range(len(faces)):
+                a, b, c = faces[i] + 1
+                ua, ub, uc = uv_faces[i] + 1
+                f.write(f"f {a}/{ua} {b}/{ub} {c}/{uc}\n")
+
+        state.status = f"Exported: {path}"
+        print(f"  Exported textured mesh: {path}")
+    except Exception as e:
+        state.error_msg = str(e)
+        state.status = f"Export failed: {e}"
+        import traceback; traceback.print_exc()
 
 
 def _sample_vertex_colors_from_obj(obj_path):
@@ -4025,11 +4054,27 @@ def main():
 
         if (state.has_mesh and state.scene is not None and not state.refining
                 and getattr(state, 'uv_data', None) is not None):
-            if imgui.button("Bake Texture (.obj)", width=-1):
+            if imgui.button("Bake Texture", width=-1):
                 state.refining = True
                 state.refine_thread = threading.Thread(
                     target=run_texture, args=(state, scene_gl), daemon=True)
                 state.refine_thread.start()
+
+        # Export textured OBJ (only after baking)
+        if (state.has_mesh and not state.refining
+                and getattr(state, 'uv_data', None) is not None
+                and getattr(state, '_baked_texture', None) is not None):
+            if imgui.button("Export Textured Mesh (.obj)", width=-1):
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                path = filedialog.asksaveasfilename(
+                    title="Export Textured Mesh", defaultextension=".obj",
+                    filetypes=[("OBJ files", "*.obj")])
+                root.destroy()
+                if path:
+                    _export_textured_obj(state, path)
 
         imgui.separator()
 
