@@ -35,7 +35,16 @@ def create_dense_mesh(imgs, pts3d_list, confs_list, cam2world_list=None,
         pcd.colors = o3d.utility.Vector3dVector(all_colors.astype(np.float64) / 255.0)
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
-        # Compute and print median point spacing
+        # Voxel downsample to merge overlapping points from different views
+        # This prevents Poisson from creating double surfaces
+        dists = np.asarray(pcd.compute_nearest_neighbor_distance())
+        median_spacing = float(np.median(dists))
+        voxel_size = median_spacing * 2.0
+        n_before = len(pcd.points)
+        pcd = pcd.voxel_down_sample(voxel_size)
+        print(f"  Voxel merge: {n_before:,d} -> {len(pcd.points):,d} points (voxel={voxel_size:.6f})")
+
+        # Recompute spacing after merge
         dists = np.asarray(pcd.compute_nearest_neighbor_distance())
         median_spacing = float(np.median(dists))
         print(f"  Median point spacing: {median_spacing:.6f}")

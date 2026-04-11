@@ -14,10 +14,11 @@ from PIL import Image, ImageDraw
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def create_uvs(verts, faces):
+def create_uvs(verts, faces, views=None):
     """Create UV unwrap and return (uvs, uv_faces, debug_texture).
+    If views are provided, uses camera directions for projection.
     debug_texture is a checkerboard for visual verification."""
-    uvs, uv_faces = _unwrap_uvs(verts, faces)
+    uvs, uv_faces = _unwrap_uvs(verts, faces, views)
     debug = _make_debug_texture(1024)
     return uvs, uv_faces, debug
 
@@ -237,31 +238,86 @@ def _project_view(verts, faces, face_normals, face_uv0, face_uv1, face_uv2,
 
 # ── UV unwrapping ───────────────────────────────────────────────────────────
 
-def _unwrap_uvs(verts, faces):
-    """Cube-map style UV projection: assign each face to the best of 6 axis
-    directions based on its normal, project onto the perpendicular plane,
-    then pack into a 3x2 grid atlas.  ~30x faster than xatlas and produces
-    large contiguous charts instead of thousands of tiny islands."""
+def _unwrap_uvs(verts, faces, views=None):
+    """Project-based UV unwrap.
+
+    If views are provided, uses camera view directions as projection axes
+    (one chart per camera). Otherwise falls back to 6 cube-map axes.
+    Neighbor smoothing eliminates isolated 1-2 face islands.
+    """
     import time
     t0 = time.time()
-
     F = len(faces)
+
+    # Face normals
     v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
     fn = np.cross(v1 - v0, v2 - v0)
     fn /= (np.linalg.norm(fn, axis=-1, keepdims=True) + 1e-8)
+    face_centroids = (v0 + v1 + v2) / 3.0
 
-    # 6 axis directions (cube map)
-    directions = np.array([
-        [1, 0, 0], [-1, 0, 0],
-        [0, 1, 0], [0, -1, 0],
-        [0, 0, 1], [0, 0, -1]
-    ], dtype=np.float32)
+    # Build projection directions from views or cube-map
+    if views and len(views) > 0:
+        directions = []
+        for view in views:
+            c2w = np.linalg.inv(view['w2c'])
+            cam_dir = -c2w[:3, 2]  # camera looks along -Z
+            directions.append(cam_dir / (np.linalg.norm(cam_dir) + 1e-8))
+        directions = np.array(directions, dtype=np.float32)
+        label = f"{len(directions)} camera views"
+    else:
+        directions = np.array([
+            [1, 0, 0], [-1, 0, 0],
+            [0, 1, 0], [0, -1, 0],
+            [0, 0, 1], [0, 0, -1]
+        ], dtype=np.float32)
+        label = "6 cube-map axes"
 
-    # Assign each face to the direction most aligned with its normal
-    dots = fn @ directions.T  # (F, 6)
+    n_dirs = len(directions)
+
+    # Initial assignment: best-aligned direction per face normal
+    dots = fn @ directions.T  # (F, n_dirs)
     face_dir = np.argmax(dots, axis=1)
 
-    # For each direction group, project vertices onto the perpendicular plane
+    # ── Neighbor smoothing to remove isolated face islands ──
+    # Build face adjacency
+    from collections import defaultdict
+    edge_to_faces = defaultdict(list)
+    for fi in range(F):
+        f = faces[fi]
+        for j in range(3):
+            e = (min(f[j], f[(j+1) % 3]), max(f[j], f[(j+1) % 3]))
+            edge_to_faces[e].append(fi)
+
+    neighbors = [[] for _ in range(F)]
+    for flist in edge_to_faces.values():
+        if len(flist) == 2:
+            neighbors[flist[0]].append(flist[1])
+            neighbors[flist[1]].append(flist[0])
+
+    # Iterative majority vote: each face adopts the most common direction
+    # among itself + neighbors, unless its own normal strongly disagrees
+    for iteration in range(5):
+        new_dir = face_dir.copy()
+        changed = 0
+        for fi in range(F):
+            if not neighbors[fi]:
+                continue
+            # Count direction votes from neighbors
+            votes = np.zeros(n_dirs, dtype=np.int32)
+            votes[face_dir[fi]] += 2  # self gets double vote
+            for ni in neighbors[fi]:
+                votes[face_dir[ni]] += 1
+            winner = int(np.argmax(votes))
+            # Only switch if this face's normal is at least somewhat compatible
+            # (dot product > 0 means face roughly faces the direction)
+            if winner != face_dir[fi] and dots[fi, winner] > -0.1:
+                new_dir[fi] = winner
+                changed += 1
+        face_dir = new_dir
+        if changed == 0:
+            break
+
+    # ── Project UVs from assigned direction ──
     uvs = np.zeros((F * 3, 2), dtype=np.float32)
     uv_faces = np.arange(F * 3, dtype=np.int32).reshape(F, 3)
 
@@ -269,35 +325,35 @@ def _unwrap_uvs(verts, faces):
     proj_axes = []
     for d in directions:
         if abs(d[2]) < 0.9:
-            u_ax = np.cross(d, [0, 0, 1])
+            u_ax = np.cross(d, np.array([0, 0, 1], dtype=np.float32))
         else:
-            u_ax = np.cross(d, [0, 1, 0])
-        u_ax /= np.linalg.norm(u_ax)
+            u_ax = np.cross(d, np.array([0, 1, 0], dtype=np.float32))
+        u_ax = u_ax / (np.linalg.norm(u_ax) + 1e-8)
         v_ax = np.cross(d, u_ax)
-        v_ax /= np.linalg.norm(v_ax)
-        proj_axes.append((u_ax, v_ax))
+        v_ax = v_ax / (np.linalg.norm(v_ax) + 1e-8)
+        proj_axes.append((u_ax.astype(np.float32), v_ax.astype(np.float32)))
 
     # Vectorized projection per direction group
-    for di in range(6):
+    for di in range(n_dirs):
         mask = face_dir == di
         if not mask.any():
             continue
         u_ax, v_ax = proj_axes[di]
         face_idx = np.where(mask)[0]
-        # Gather all 3 vertices for these faces
         fv = verts[faces[face_idx]]  # (N, 3, 3)
-        proj_u = fv @ u_ax  # (N, 3)
-        proj_v = fv @ v_ax  # (N, 3)
+        proj_u = fv @ u_ax
+        proj_v = fv @ v_ax
         for vi in range(3):
             uvs[face_idx * 3 + vi, 0] = proj_u[:, vi]
             uvs[face_idx * 3 + vi, 1] = proj_v[:, vi]
 
-    # Pack each direction into a 3x2 grid cell
-    grid_cols, grid_rows = 3, 2
+    # Pack into grid atlas
+    grid_cols = int(np.ceil(np.sqrt(n_dirs)))
+    grid_rows = int(np.ceil(n_dirs / grid_cols))
     cell_w, cell_h = 1.0 / grid_cols, 1.0 / grid_rows
-    padding = 0.005
+    padding = 0.003
 
-    for di in range(6):
+    for di in range(n_dirs):
         mask = face_dir == di
         if not mask.any():
             continue
@@ -309,7 +365,7 @@ def _unwrap_uvs(verts, faces):
         mx = sub_uv.max(axis=0)
         rng = mx - mn
         rng[rng < 1e-8] = 1.0
-        sub_uv = (sub_uv - mn) / rng  # normalize to [0,1]
+        sub_uv = (sub_uv - mn) / rng
 
         gc = di % grid_cols
         gr = di // grid_cols
@@ -317,11 +373,12 @@ def _unwrap_uvs(verts, faces):
         sub_uv[:, 1] = gr * cell_h + padding + sub_uv[:, 1] * (cell_h - 2 * padding)
         uvs[uv_idx] = sub_uv
 
-    counts = [int((face_dir == i).sum()) for i in range(6)]
     elapsed = time.time() - t0
-    print(f"  UV projection: {F:,d} faces -> 6 charts in {elapsed:.2f}s")
-    print(f"    +X:{counts[0]:,d} -X:{counts[1]:,d} +Y:{counts[2]:,d} "
-          f"-Y:{counts[3]:,d} +Z:{counts[4]:,d} -Z:{counts[5]:,d}")
+    counts = [int((face_dir == i).sum()) for i in range(n_dirs)]
+    print(f"  UV projection: {F:,d} faces -> {n_dirs} charts ({label}) in {elapsed:.2f}s")
+    for di, c in enumerate(counts):
+        if c > 0:
+            print(f"    chart {di}: {c:,d} faces")
     return uvs, uv_faces
 
 

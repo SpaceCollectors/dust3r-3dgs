@@ -3273,12 +3273,34 @@ def run_recolor_mesh(state, scene_gl):
 
 
 def run_create_uvs(state, scene_gl):
-    """Create UV unwrap and show debug checkerboard texture."""
+    """Create UV unwrap using camera view directions and show debug texture."""
     state.refine_progress = "Creating UVs..."
     try:
+        import tempfile
         from texture_map import create_uvs
+        from colmap_export import export_scene_to_colmap
+        from refine_mesh import load_cameras
+
         verts, faces, colors = state.mesh_data
-        uvs, uv_faces, debug_tex = create_uvs(verts, faces)
+
+        # Load camera views for view-based UV projection
+        views = None
+        if state.scene is not None:
+            try:
+                state.refine_progress = "Loading cameras for UV projection..."
+                tmpdir = tempfile.mkdtemp()
+                export_dir = os.path.join(tmpdir, 'colmap')
+                export_scene_to_colmap(
+                    scene=state.scene, image_paths=state.image_paths,
+                    output_dir=export_dir, min_conf_thr=state.min_conf)
+                views = load_cameras(export_dir)
+                # Cache views for bake step
+                state._cached_views = views
+            except Exception:
+                pass
+
+        state.refine_progress = "UV unwrapping..."
+        uvs, uv_faces, debug_tex = create_uvs(verts, faces, views)
         state.uv_data = (uvs, uv_faces)
 
         scene_gl.set_texture(debug_tex, uvs, uv_faces, verts, faces, colors)
@@ -3302,15 +3324,16 @@ def run_texture(state, scene_gl):
         verts, faces, colors = state.mesh_data
         uvs, uv_faces = state.uv_data
 
-        # Export cameras
-        state.refine_progress = "Exporting cameras..."
-        tmpdir = tempfile.mkdtemp()
-        export_dir = os.path.join(tmpdir, 'colmap')
-        export_scene_to_colmap(
-            scene=state.scene, image_paths=state.image_paths,
-            output_dir=export_dir, min_conf_thr=state.min_conf)
-
-        views = load_cameras(export_dir)
+        # Reuse cached views from UV step, or load fresh
+        views = getattr(state, '_cached_views', None)
+        if views is None:
+            state.refine_progress = "Exporting cameras..."
+            tmpdir = tempfile.mkdtemp()
+            export_dir = os.path.join(tmpdir, 'colmap')
+            export_scene_to_colmap(
+                scene=state.scene, image_paths=state.image_paths,
+                output_dir=export_dir, min_conf_thr=state.min_conf)
+            views = load_cameras(export_dir)
 
         # Bake
         state.refine_progress = f"Baking {len(faces):,d} faces from {len(views)} cameras..."
