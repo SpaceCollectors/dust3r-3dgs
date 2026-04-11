@@ -119,6 +119,16 @@ def load_cameras(data_dir):
         img_path = os.path.join(images_dir, p[9])
         img = np.array(Image.open(img_path).convert('RGB'),
                        dtype=np.float32) / 255.0
+        # Use actual image dimensions (may differ from cameras.txt if image was resized)
+        actual_H, actual_W = img.shape[:2]
+        if actual_W != W or actual_H != H:
+            # Rescale intrinsics to match actual image size
+            K = K.copy()
+            K[0, 0] *= actual_W / W  # fx
+            K[1, 1] *= actual_H / H  # fy
+            K[0, 2] *= actual_W / W  # cx
+            K[1, 2] *= actual_H / H  # cy
+            W, H = actual_W, actual_H
         views.append({'w2c': w2c, 'K': K, 'W': W, 'H': H, 'pixels': img, 'path': img_path})
     return views
 

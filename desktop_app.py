@@ -790,6 +790,7 @@ class AppState:
         self.has_points = False
         self.points_modified = False  # True after smooth/upscale (don't reset on conf change)
         self.has_mesh = False
+        self.uv_data = None  # (uvs, uv_faces) after Create UVs
         self.draw_mode = 0  # 0=points, 1=mesh, 2=wireframe, 3=normals, 4=shaded
         self.draw_modes = ['points', 'mesh', 'wireframe', 'normals', 'shaded']
 
@@ -2504,6 +2505,7 @@ def run_dense_mesh(state, scene_gl):
 
         if len(faces) > 0:
             state.mesh_data = (verts, faces, colors)
+            state.uv_data = None  # invalidate UVs when mesh changes
             scene_gl.set_mesh(verts, faces, colors)
             state.has_mesh = True
             state.draw_mode = 1  # switch to mesh view
@@ -2553,29 +2555,55 @@ def run_decimate(state, scene_gl):
             try:
                 ms.meshing_decimation_quadric_edge_collapse(
                     targetfacenum=target,
-                    qualitythr=0.5,
+                    qualitythr=0.3,
                     preserveboundary=True,
                     preservenormal=True,
                     preservetopology=True,
                     optimalplacement=True,
                     autoclean=True)
             except TypeError:
-                # Older PyMeshLab versions may have different parameter names
                 ms.simplification_quadric_edge_collapse_decimation(
                     targetfacenum=target,
                     preserveboundary=True,
                     preservenormal=True,
                     optimalplacement=True)
 
+            # Topology cleanup: isotropic remeshing to fix star vertices
+            # Compute target edge length from the decimated mesh
+            state.refine_progress = "Fixing topology (isotropic remeshing)..."
+            mesh_dec = ms.current_mesh()
+            bbox = mesh_dec.bounding_box()
+            diag = bbox.diagonal()
+            n_faces_dec = mesh_dec.face_number()
+            # Target edge length: approximate from face count assuming equilateral triangles
+            # area ≈ n_faces * (sqrt(3)/4) * edge^2, total_area ≈ diag^2 * factor
+            import math
+            target_edge = diag * math.sqrt(2.0 / max(n_faces_dec, 1))
+            try:
+                ms.meshing_isotropic_explicit_remeshing(
+                    targetlen=pymeshlab.AbsoluteValue(target_edge),
+                    iterations=3,
+                    adaptive=True,
+                    checksurfdist=True,
+                    maxsurfdist=pymeshlab.AbsoluteValue(target_edge * 0.5))
+            except Exception as e_remesh:
+                print(f"  Isotropic remeshing skipped: {e_remesh}")
+
+            # Transfer vertex colors from original mesh via nearest-neighbor
             mesh_out = ms.current_mesh()
             verts_out = mesh_out.vertex_matrix().astype(np.float32)
             faces_out = mesh_out.face_matrix().astype(np.int32)
-            if mesh_out.has_vertex_color():
+
+            if mesh_out.has_vertex_color() and mesh_out.vertex_number() == len(verts_out):
                 vc = mesh_out.vertex_color_matrix()
                 colors_out = (vc[:, :3] * 255).clip(0, 255).astype(np.uint8)
             else:
-                colors_out = np.full((len(verts_out), 3), 128, dtype=np.uint8)
-            print(f"  Decimated with PyMeshLab: {len(faces_out):,d} faces")
+                # Remeshing added new vertices — transfer colors via nearest neighbor
+                from scipy.spatial import cKDTree
+                tree = cKDTree(verts)
+                _, idx = tree.query(verts_out)
+                colors_out = colors[idx].copy()
+            print(f"  Decimated with PyMeshLab: {len(faces_out):,d} faces (remeshed)")
 
         except Exception as e_pml:
             print(f"  PyMeshLab decimation failed ({e_pml}), using Open3D...")
@@ -2593,6 +2621,7 @@ def run_decimate(state, scene_gl):
             print(f"  Decimated with Open3D: {len(faces_out):,d} faces")
 
         state.mesh_data = (verts_out, faces_out, colors_out)
+        state.uv_data = None  # invalidate UVs after decimation
         scene_gl.set_mesh(verts_out, faces_out, colors_out)
         state.status = f"Decimated: {n_before:,d} -> {len(faces_out):,d} faces"
         print(f"  Done: {len(faces_out):,d} faces")
@@ -3243,51 +3272,75 @@ def run_recolor_mesh(state, scene_gl):
         state.refine_progress = ""
 
 
+def run_create_uvs(state, scene_gl):
+    """Create UV unwrap and show debug checkerboard texture."""
+    state.refine_progress = "Creating UVs..."
+    try:
+        from texture_map import create_uvs
+        verts, faces, colors = state.mesh_data
+        uvs, uv_faces, debug_tex = create_uvs(verts, faces)
+        state.uv_data = (uvs, uv_faces)
+
+        scene_gl.set_texture(debug_tex, uvs, uv_faces, verts, faces, colors)
+        state.status = f"UVs created: {len(uvs):,d} coords — verify checkerboard"
+    except Exception as e:
+        state.error_msg = str(e)
+        state.status = f"UV creation failed: {e}"
+        import traceback; traceback.print_exc()
+    state.refining = False
+    state.refine_progress = ""
+
+
 def run_texture(state, scene_gl):
-    """Generate UV-mapped textured mesh using PyMeshLab."""
-    state.refine_progress = "Generating texture..."
+    """Bake texture from camera images into UV map."""
+    state.refine_progress = "Baking texture..."
     try:
         import tempfile
         from colmap_export import export_scene_to_colmap
         from refine_mesh import load_cameras
 
+        verts, faces, colors = state.mesh_data
+        uvs, uv_faces = state.uv_data
+
+        # Export cameras
+        state.refine_progress = "Exporting cameras..."
         tmpdir = tempfile.mkdtemp()
         export_dir = os.path.join(tmpdir, 'colmap')
-
-        state.refine_progress = "Exporting cameras..."
         export_scene_to_colmap(
             scene=state.scene, image_paths=state.image_paths,
             output_dir=export_dir, min_conf_thr=state.min_conf)
 
         views = load_cameras(export_dir)
-        # Pass COLMAP workspace path for COLMAP mesh_texturer
-        colmap_wd = getattr(state, '_colmap_workdir', None)
-        if colmap_wd:
-            for v in views:
-                v['_colmap_workdir'] = colmap_wd
-        verts, faces, colors = state.mesh_data
 
+        # Bake
+        state.refine_progress = f"Baking {len(faces):,d} faces from {len(views)} cameras..."
+        from texture_map import bake_texture
+        texture_img = bake_texture(verts, faces, uvs, uv_faces, views)
+
+        # Upload to viewport
+        state.refine_progress = "Uploading texture..."
+        scene_gl.set_texture(texture_img, uvs, uv_faces, verts, faces, colors)
+
+        # Save to disk
         output_dir = os.path.join(tmpdir, 'textured')
         os.makedirs(output_dir, exist_ok=True)
+        from texture_map import _write_obj, _dilate_texture
+        from PIL import Image
 
-        state.refine_progress = f"UV unwrapping + projecting {len(faces):,d} faces..."
-        from texture_map import create_textured_mesh
-        obj_path, uvs, uv_faces, texture_img = create_textured_mesh(
-            verts, faces, colors, views, output_dir, return_data=True)
+        tex_path = os.path.join(output_dir, 'texture.png')
+        Image.fromarray(texture_img).save(tex_path, quality=95)
 
-        # Upload texture + UVs to viewport for live textured rendering
-        state.refine_progress = "Uploading texture to viewport..."
-        if texture_img is not None and uvs is not None:
-            scene_gl.set_texture(texture_img, uvs, uv_faces, verts, faces, colors)
-        else:
-            # Fallback: update vertex colors
-            new_colors = _recolor_from_cameras(verts, faces, views)
-            if new_colors is not None:
-                colors = new_colors
-            state.mesh_data = (verts, faces, colors)
-            scene_gl.set_mesh(verts, faces, colors)
+        mtl_path = os.path.join(output_dir, 'mesh.mtl')
+        with open(mtl_path, 'w') as f:
+            f.write("newmtl material0\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\n"
+                    "d 1\nillum 1\nmap_Kd texture.png\n")
 
-        state.status = f"Textured mesh saved to {output_dir} ({len(faces):,d} faces)"
+        uvs_obj = uvs.copy()
+        uvs_obj[:, 1] = 1.0 - uvs_obj[:, 1]
+        obj_path = os.path.join(output_dir, 'mesh.obj')
+        _write_obj(obj_path, verts, faces, uvs_obj, uv_faces)
+
+        state.status = f"Textured mesh saved to {output_dir}"
         state.refine_progress = ""
 
         import subprocess
@@ -3295,9 +3348,8 @@ def run_texture(state, scene_gl):
 
     except Exception as e:
         state.error_msg = str(e)
-        state.status = f"Texture failed: {e}"
-        import traceback
-        traceback.print_exc()
+        state.status = f"Texture bake failed: {e}"
+        import traceback; traceback.print_exc()
 
     state.refining = False
     state.refine_progress = ""
@@ -3964,8 +4016,16 @@ def main():
         imgui.separator()
 
         # ── Texture ──
-        if state.has_mesh and state.scene is not None and not state.refining:
-            if imgui.button("Generate Textured Mesh (.obj)", width=-1):
+        if state.has_mesh and not state.refining:
+            if imgui.button("Create UVs", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=run_create_uvs, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
+
+        if (state.has_mesh and state.scene is not None and not state.refining
+                and getattr(state, 'uv_data', None) is not None):
+            if imgui.button("Bake Texture (.obj)", width=-1):
                 state.refining = True
                 state.refine_thread = threading.Thread(
                     target=run_texture, args=(state, scene_gl), daemon=True)

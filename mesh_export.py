@@ -556,8 +556,9 @@ def _mesh_ball_pivot(imgs, pts3d_list, confs_list, cam2world_list, min_conf, den
     extent = np.linalg.norm(np.asarray(pcd.points).max(0) - np.asarray(pcd.points).min(0))
     print(f"  Median spacing: {median_spacing:.6f}, extent: {extent:.4f}")
 
-    # Only voxel downsample to remove near-exact duplicates (0.5x median spacing)
-    voxel_size = median_spacing * 0.5
+    # Voxel downsample to merge overlapping views into a single surface
+    # 1.0x median spacing merges near-duplicate points from different cameras
+    voxel_size = median_spacing * 1.0
     n_before = len(pcd.points)
     pcd = pcd.voxel_down_sample(voxel_size)
     print(f"  Dedup: {n_before:,d} -> {len(pcd.points):,d} (voxel={voxel_size:.6f})")
@@ -756,6 +757,10 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             "  Get: colmap-x64-windows-cuda.zip\n"
             "  Extract to project folder as colmap/")
 
+    # Prevent COLMAP/glog from trying to create log files (fails on Windows)
+    colmap_env = os.environ.copy()
+    colmap_env['GLOG_logtostderr'] = '1'
+
     n_imgs = len(image_paths)
     import subprocess, re
 
@@ -798,14 +803,16 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             subprocess.run([colmap_exe, 'feature_extractor',
                            '--database_path', db_path,
                            '--image_path', img_dir],
-                          capture_output=True, timeout=600)
+                          capture_output=True, timeout=600,
+                          env=colmap_env)
 
             # Step 2: Feature matching
             if progress_fn: progress_fn("COLMAP: matching features...")
             print("  Feature matching...")
             subprocess.run([colmap_exe, 'exhaustive_matcher',
                            '--database_path', db_path],
-                          capture_output=True, timeout=600)
+                          capture_output=True, timeout=600,
+                          env=colmap_env)
 
             # Step 3: Sparse reconstruction
             # If we have prior cameras (from DUSt3R etc.), use them as initialization
@@ -826,7 +833,8 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                                '--output_path', sparse_dir,
                                '--Mapper.ba_refine_focal_length', '1',
                                '--Mapper.ba_refine_extra_params', '0'],
-                              capture_output=True, text=True, timeout=600)
+                              capture_output=True, text=True, timeout=600,
+                              env=colmap_env)
                 if r.stderr:
                     for line in r.stderr.split('\n'):
                         if any(k in line for k in ['Registering', 'Bundle', 'points', 'images']):
@@ -848,7 +856,8 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                                    '--database_path', db_path,
                                    '--image_path', img_dir,
                                    '--output_path', sparse_dir],
-                                  capture_output=True, timeout=600)
+                                  capture_output=True, timeout=600,
+                                  env=colmap_env)
                     for d in ['0', '1', '2']:
                         candidate = os.path.join(sparse_dir, d)
                         if os.path.isdir(candidate):
@@ -866,7 +875,8 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                                '--database_path', db_path,
                                '--image_path', img_dir,
                                '--output_path', sparse_dir],
-                              capture_output=True, timeout=600)
+                              capture_output=True, timeout=600,
+                              env=colmap_env)
 
                 # Find the reconstruction
                 sparse_sub = os.path.join(sparse_dir, '0')
@@ -889,7 +899,8 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                        '--input_path', sparse_sub,
                        '--output_path', dense_dir,
                        '--output_type', 'COLMAP'],
-                      capture_output=True, timeout=600)
+                      capture_output=True, timeout=600,
+                      env=colmap_env)
         print("  Images undistorted")
 
         # Step 5: PatchMatch stereo
@@ -908,7 +919,7 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             cmd += ['--PatchMatchStereo.max_image_size', str(max_image_size)]
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, bufsize=1)
+                               text=True, bufsize=1, env=colmap_env)
         for line in proc.stdout:
             line = line.strip()
             m = re.search(r'Processing view (\d+) / (\d+) for (.+)', line)
@@ -935,7 +946,8 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                            '--workspace_path', dense_dir,
                            '--output_path', output_ply,
                            '--StereoFusion.min_num_pixels', str(max(min_consistent, 2))],
-                          capture_output=True, text=True, timeout=600)
+                          capture_output=True, text=True, timeout=600,
+                          env=colmap_env)
         if r.stderr:
             for line in r.stderr.split('\n'):
                 if any(k in line for k in ['Fusing', 'points', 'Number']):
