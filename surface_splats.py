@@ -391,11 +391,16 @@ def train_surface_splats(
                 m = splats['means'].detach().cpu().numpy()
                 c = (splats['sh0'].squeeze(1).detach() * C0 + 0.5).clamp(0, 1).cpu().numpy()
                 s = torch.exp(splats['scales'].detach()).max(dim=-1).values.cpu().numpy()
+                q = splats['quats'].detach().cpu().numpy()
+                sc = splats['scales'].detach().cpu().numpy()
+                op = splats['opacities'].detach().cpu().numpy()
+                sh = splats['sh0'].detach().cpu().numpy()
 
             yield {
                 'step': step, 'total': iterations,
                 'loss': loss_val, 'n_splats': n_gs,
                 'means': m, 'colors': c, 'scales': s,
+                'quats': q, 'scales_log': sc, 'opacities_logit': op, 'sh0': sh,
                 'done': False,
             }
 

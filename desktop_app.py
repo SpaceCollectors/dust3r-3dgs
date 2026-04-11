@@ -360,10 +360,13 @@ class GLScene:
         self.grid_vao = None
         self.grid_vbo = None
         self.grid_line_count = 0
-        # Splat display buffers
+        # Splat display buffers (point sprite fallback)
         self.splat_vao = None
         self.splat_vbo = None
         self.splat_count = 0
+        # Proper gaussian splat renderer
+        self._splat_renderer = None
+        self._pending_splat_params = None  # (means, quats, scales, opacities, sh0)
         # Pending uploads from background threads
         self._pending_points = None
         self._pending_mesh = None
@@ -395,12 +398,17 @@ class GLScene:
         with self._lock:
             self._pending_points = (points.copy(), colors.copy())
 
-    def set_splats(self, positions, colors_f, sizes):
-        """Queue splat point cloud for viewport display (thread-safe).
-        positions: (N,3) float32, colors_f: (N,3) float32 [0,1], sizes: (N,) float32."""
+    def set_splats(self, positions, colors_f, sizes,
+                   quats=None, scales_log=None, opacities_logit=None, sh0=None):
+        """Queue splat data for viewport display (thread-safe).
+        If full params provided, renders as proper gaussians. Otherwise point sprites."""
         colors_u8 = (np.clip(colors_f, 0, 1) * 255).astype(np.uint8)
         with self._lock:
             self._pending_splats = (positions.copy(), colors_u8)
+            if quats is not None and scales_log is not None:
+                self._pending_splat_params = (
+                    positions.copy(), quats.copy(), scales_log.copy(),
+                    opacities_logit.copy(), sh0.copy())
 
     def set_mesh(self, verts, faces, colors):
         """Queue mesh for upload (thread-safe). Also computes normals/shading."""
@@ -480,6 +488,24 @@ class GLScene:
         gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, False, 24, gl.ctypes.c_void_p(12))
         gl.glBindVertexArray(0)
         self.splat_count = len(positions)
+
+    def _upload_splat_renderer(self, means, quats, scales_log, opacities_logit, sh0):
+        """Initialize/update the proper gaussian splat renderer."""
+        try:
+            from splat_renderer import SplatRenderer, pack_splat_data_fast, sort_splats_by_depth
+            if self._splat_renderer is None:
+                self._splat_renderer = SplatRenderer()
+            # Pack data and create initial sort (will be re-sorted each frame)
+            data, sh_dim = pack_splat_data_fast(means, quats, scales_log, opacities_logit, sh0)
+            self._splat_renderer.sh_dim = sh_dim
+            self._splat_means = means.copy()
+            # Identity sort for now (proper sort happens in draw)
+            indices = np.arange(len(means), dtype=np.int32)
+            self._splat_renderer.update_splats(data, indices)
+            self._splat_data_packed = data
+        except Exception as e:
+            print(f"  Splat renderer init failed: {e}")
+            import traceback; traceback.print_exc()
 
     def _upload_mesh(self, verts, faces, colors, uvs=None):
         if len(verts) == 0 or len(faces) == 0:
@@ -626,10 +652,42 @@ class GLScene:
                               gl.GL_UNSIGNED_INT, None)
             gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
-        if draw_mode == 'splats' and self.splat_count > 0:
-            gl.glBindVertexArray(self.splat_vao)
-            gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
-            gl.glDrawArrays(gl.GL_POINTS, 0, self.splat_count)
+        if draw_mode == 'splats':
+            # Try proper gaussian renderer first, fall back to point sprites
+            if self._splat_renderer is not None and self._splat_renderer.num_splats > 0:
+                try:
+                    from splat_renderer import sort_splats_by_depth
+                    view_mat = mvp_scene  # reuse scene MVP as approx view
+                    # Re-sort by depth for current camera
+                    if hasattr(self, '_splat_means'):
+                        # Extract view matrix from camera_pos if available
+                        indices = sort_splats_by_depth(
+                            self._splat_means, mvp_scene[:4, :4])
+                        self._splat_renderer.update_splats(
+                            self._splat_data_packed, indices)
+
+                    # We need separate view and proj matrices for the splat renderer
+                    # For now use the combined MVP and identity proj (approximate)
+                    import math
+                    fov_y = math.radians(45)
+                    fov_x = fov_y  # approximate
+                    focal = 500.0  # approximate
+                    cam_p = camera_pos if camera_pos is not None else np.zeros(3)
+                    self._splat_renderer.draw(
+                        mvp_scene, np.eye(4, dtype=np.float32),
+                        cam_p, fov_x, fov_y, focal)
+                    # Restore program for subsequent draws
+                    gl.glUseProgram(self.program)
+                except Exception:
+                    # Fall back to point sprites
+                    if self.splat_count > 0:
+                        gl.glBindVertexArray(self.splat_vao)
+                        gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+                        gl.glDrawArrays(gl.GL_POINTS, 0, self.splat_count)
+            elif self.splat_count > 0:
+                gl.glBindVertexArray(self.splat_vao)
+                gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+                gl.glDrawArrays(gl.GL_POINTS, 0, self.splat_count)
 
         # Cameras: same rotation as scene
         if self.cam_line_count > 0:
@@ -679,11 +737,13 @@ class GLScene:
             cams = getattr(self, '_pending_cams', None)
             tex = getattr(self, '_pending_texture', None)
             splats = self._pending_splats
+            splat_params = self._pending_splat_params
             self._pending_points = None
             self._pending_mesh = None
             self._pending_cams = None
             self._pending_texture = None
             self._pending_splats = None
+            self._pending_splat_params = None
 
         if pts is not None:
             self._upload_points(pts[0], pts[1])
@@ -701,6 +761,8 @@ class GLScene:
             self._upload_cams(cams)
         if splats is not None:
             self._upload_splats(splats[0], splats[1])
+        if splat_params is not None:
+            self._upload_splat_renderer(*splat_params)
 
     def _build_grid(self, size=2.0, divisions=20):
         """Build ground grid + RGB axis lines."""
@@ -3522,7 +3584,11 @@ def run_train_splats(state, scene_gl):
 
             if progress.get('means') is not None:
                 scene_gl.set_splats(
-                    progress['means'], progress['colors'], progress['scales'])
+                    progress['means'], progress['colors'], progress['scales'],
+                    quats=progress.get('quats'),
+                    scales_log=progress.get('scales_log'),
+                    opacities_logit=progress.get('opacities_logit'),
+                    sh0=progress.get('sh0'))
                 # Auto-switch to splats view
                 if 'splats' in state.draw_modes:
                     state.draw_mode = state.draw_modes.index('splats')
