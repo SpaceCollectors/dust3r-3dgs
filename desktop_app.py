@@ -922,6 +922,7 @@ class AppState:
 
         # Export
         self.export_path = ""
+        self._deferred_action = None
 
         # Reconstruction params
         self.niter1 = 300
@@ -4290,16 +4291,7 @@ def main():
                 and getattr(state, 'uv_data', None) is not None
                 and getattr(state, '_baked_texture', None) is not None):
             if imgui.button("Export Textured Mesh (.obj)", width=-1):
-                import tkinter as tk
-                from tkinter import filedialog
-                root = tk.Tk()
-                root.withdraw()
-                path = filedialog.asksaveasfilename(
-                    title="Export Textured Mesh", defaultextension=".obj",
-                    filetypes=[("OBJ files", "*.obj")])
-                root.destroy()
-                if path:
-                    _export_textured_obj(state, path)
+                state._deferred_action = 'export_textured_obj'
 
         imgui.separator()
 
@@ -4336,27 +4328,52 @@ def main():
 
             if state.splat_data is not None and not state.splat_training:
                 if imgui.button("Export Splats (.ply)", width=-1):
-                    import tkinter as tk
-                    from tkinter import filedialog
-                    root = tk.Tk(); root.withdraw()
-                    path = filedialog.asksaveasfilename(
-                        title="Export Splats", defaultextension=".ply",
-                        filetypes=[("PLY files", "*.ply")])
-                    root.destroy()
-                    if path:
-                        from train import save_ply
-                        save_ply(state.splat_data, path)
-                        state.status = f"Splats exported to {path}"
+                    state._deferred_action = 'export_splats'
 
         imgui.separator()
 
         # ── Save ──
         if state.has_mesh:
             if imgui.button("Save Mesh (.ply)", width=-1):
-                import tkinter as tk
-                from tkinter import filedialog
-                root = tk.Tk()
-                root.withdraw()
+                state._deferred_action = 'save_mesh_ply'
+
+        imgui.end_child()
+        imgui.end()
+
+        # ── Deferred file dialogs (run after imgui frame ends) ──
+        action = getattr(state, '_deferred_action', None)
+        if action:
+            state._deferred_action = None
+            imgui.render()
+            impl.render(imgui.get_draw_data())
+            glfw.swap_buffers(window)
+
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw()
+
+            if action == 'export_splats':
+                path = filedialog.asksaveasfilename(
+                    title="Export Splats", defaultextension=".ply",
+                    filetypes=[("PLY files", "*.ply")])
+                root.destroy()
+                if path and state.splat_data is not None:
+                    import importlib.util
+                    _spec = importlib.util.spec_from_file_location(
+                        "_train_export", os.path.join(os.path.dirname(__file__), "train.py"))
+                    _mod = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_mod)
+                    _mod.save_ply(state.splat_data, path)
+                    state.status = f"Splats exported to {path}"
+
+            elif action == 'export_textured_obj':
+                path = filedialog.asksaveasfilename(
+                    title="Export Textured Mesh", defaultextension=".obj",
+                    filetypes=[("OBJ files", "*.obj")])
+                root.destroy()
+                if path:
+                    _export_textured_obj(state, path)
+
+            elif action == 'save_mesh_ply':
                 path = filedialog.asksaveasfilename(
                     title="Save Mesh", defaultextension=".ply",
                     filetypes=[("PLY files", "*.ply")])
@@ -4367,8 +4384,7 @@ def main():
                     save_ply_mesh(path, v, f, c)
                     state.status = f"Saved to {path}"
 
-        imgui.end_child()
-        imgui.end()
+            continue  # skip rest of this frame since we already swapped
 
         # ── 3D Viewport ──
         win_w, win_h = glfw.get_window_size(window)
