@@ -628,7 +628,7 @@ class GLScene:
 
         if draw_mode == 'splats' and self.splat_count > 0:
             gl.glBindVertexArray(self.splat_vao)
-            gl.glPointSize(2.0)
+            gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
             gl.glDrawArrays(gl.GL_POINTS, 0, self.splat_count)
 
         # Cameras: same rotation as scene
@@ -4048,7 +4048,7 @@ def main():
         # ── Display Options ──
         imgui.text("Display")
         _, state.draw_mode = imgui.combo("Mode##draw",
-            state.draw_mode, ["Points", "Mesh", "Wireframe", "Normals", "Shaded"])
+            state.draw_mode, ["Points", "Mesh", "Wireframe", "Normals", "Shaded", "Splats"])
 
         # Scene orientation
         imgui.text("Orientation")
