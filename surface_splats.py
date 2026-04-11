@@ -12,12 +12,30 @@ from torch import optim
 import math
 import time
 
-from rasterizer import render_gaussians
-from train import (
-    load_colmap_dataset, C0, rgb_to_sh, knn_distances,
-    create_optimizers, depth_loss_fn, anisotropy_loss_fn,
-    scale_loss_fn, render_depth_from_pts3d, _ssim, save_ply
-)
+import importlib.util, sys, os as _os
+
+def _import_local(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+_dir = _os.path.dirname(_os.path.abspath(__file__))
+_train = _import_local("_local_train", _os.path.join(_dir, "train.py"))
+_rast = _import_local("_local_rast", _os.path.join(_dir, "rasterizer.py"))
+
+render_gaussians = _rast.render_gaussians
+load_colmap_dataset = _train.load_colmap_dataset
+C0 = _train.C0
+rgb_to_sh = _train.rgb_to_sh
+knn_distances = _train.knn_distances
+create_optimizers = _train.create_optimizers
+depth_loss_fn = _train.depth_loss_fn
+anisotropy_loss_fn = _train.anisotropy_loss_fn
+scale_loss_fn = _train.scale_loss_fn
+render_depth_from_pts3d = _train.render_depth_from_pts3d
+_ssim = _train._ssim
+save_ply = _train.save_ply
 
 
 def sample_mesh_surface(verts, faces, colors, n_samples=50000):
