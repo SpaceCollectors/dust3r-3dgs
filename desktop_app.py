@@ -585,7 +585,8 @@ class GLScene:
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
         print(f"  Uploaded {W}x{H} texture to GPU")
 
-    def draw(self, mvp_grid, mvp_scene, draw_mode='points', camera_pos=None):
+    def draw(self, mvp_grid, mvp_scene, draw_mode='points', camera_pos=None,
+             view_matrix=None, proj_matrix=None, fov_y=None):
         gl.glUseProgram(self.program)
 
         # Grid + axes: fixed orientation
@@ -653,32 +654,31 @@ class GLScene:
             gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
         if draw_mode == 'splats':
-            # Try proper gaussian renderer first, fall back to point sprites
-            if self._splat_renderer is not None and self._splat_renderer.num_splats > 0:
+            if (self._splat_renderer is not None and self._splat_renderer.num_splats > 0
+                    and view_matrix is not None and proj_matrix is not None):
                 try:
+                    import math as _math
                     from splat_renderer import sort_splats_by_depth
-                    view_mat = mvp_scene  # reuse scene MVP as approx view
-                    # Re-sort by depth for current camera
-                    if hasattr(self, '_splat_means'):
-                        # Extract view matrix from camera_pos if available
-                        indices = sort_splats_by_depth(
-                            self._splat_means, mvp_scene[:4, :4])
-                        self._splat_renderer.update_splats(
-                            self._splat_data_packed, indices)
 
-                    # We need separate view and proj matrices for the splat renderer
-                    # For now use the combined MVP and identity proj (approximate)
-                    import math
-                    fov_y = math.radians(45)
-                    fov_x = fov_y  # approximate
-                    focal = 500.0  # approximate
+                    # Sort by depth using the view matrix (with scene transform)
+                    view_with_scene = view_matrix @ mvp_scene
+                    if hasattr(self, '_splat_means'):
+                        indices = sort_splats_by_depth(self._splat_means, view_matrix)
+                        self._splat_renderer.update_splats(self._splat_data_packed, indices)
+
+                    # Compute focal from projection matrix and viewport
                     cam_p = camera_pos if camera_pos is not None else np.zeros(3)
+                    fov = fov_y if fov_y else _math.radians(45)
+                    # focal in pixels: proj[1,1] = 1/tan(fov/2), focal = H/2 / tan(fov/2)
+                    # but we don't have H here, approximate from proj matrix
+                    focal = float(proj_matrix[1, 1]) * 256  # approximate
+
                     self._splat_renderer.draw(
-                        mvp_scene, np.eye(4, dtype=np.float32),
-                        cam_p, fov_x, fov_y, focal)
-                    # Restore program for subsequent draws
+                        view_matrix.astype(np.float32),
+                        proj_matrix.astype(np.float32),
+                        cam_p, fov, fov, focal)
                     gl.glUseProgram(self.program)
-                except Exception:
+                except Exception as e:
                     # Fall back to point sprites
                     if self.splat_count > 0:
                         gl.glBindVertexArray(self.splat_vao)
@@ -4459,7 +4459,11 @@ def main():
             mvp_scene = proj @ view @ scene_tf  # for point cloud / mesh / cameras
 
             mode = state.draw_modes[state.draw_mode]
-            scene_gl.draw(mvp_base, mvp_scene, draw_mode=mode, camera_pos=camera.get_position())
+            scene_gl.draw(mvp_base, mvp_scene, draw_mode=mode,
+                          camera_pos=camera.get_position(),
+                          view_matrix=view @ scene_tf,
+                          proj_matrix=proj,
+                          fov_y=math.radians(camera.fov))
 
         gl.glDisable(gl.GL_SCISSOR_TEST)
 

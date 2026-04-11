@@ -595,24 +595,27 @@ property float nz
         header += f"property float rot_{i}\n"
     header += "end_header\n"
 
+    # Build contiguous binary data (vectorized)
+    normals = np.zeros((N, 3), dtype=np.float32)
+    sh_dc = sh_all[:, 0, :].astype(np.float32)  # (N, 3)
+    # SH rest: group by channel (all R, all G, all B) per splat
+    sh_rest = sh_all[:, 1:, :]  # (N, K-1, 3)
+    sh_rest_interleaved = sh_rest.transpose(0, 2, 1).reshape(N, -1).astype(np.float32)  # (N, 3*(K-1))
+
+    # Pack per-vertex: pos(3) + normal(3) + dc(3) + rest(3*(K-1)) + opacity(1) + scale(3) + quat(4)
+    row = np.concatenate([
+        means.astype(np.float32),
+        normals,
+        sh_dc,
+        sh_rest_interleaved,
+        opacities.reshape(N, 1).astype(np.float32),
+        scales.astype(np.float32),
+        quats.astype(np.float32),
+    ], axis=1)
+
     with open(path, 'wb') as f:
         f.write(header.encode())
-        for i in range(N):
-            # position
-            f.write(means[i].astype(np.float32).tobytes())
-            # normals (zeros)
-            f.write(np.zeros(3, dtype=np.float32).tobytes())
-            # SH DC
-            f.write(sh_all[i, 0, :].astype(np.float32).tobytes())
-            # SH rest (interleaved: all R, all G, all B for each degree)
-            rest = sh_all[i, 1:, :].flatten().astype(np.float32)
-            f.write(rest.tobytes())
-            # opacity (logit space)
-            f.write(np.array([opacities[i]], dtype=np.float32).tobytes())
-            # scales (log space)
-            f.write(scales[i].astype(np.float32).tobytes())
-            # quaternion
-            f.write(quats[i].astype(np.float32).tobytes())
+        f.write(row.tobytes())
 
     print(f"  Saved {N:,d} gaussians to {path}")
 
