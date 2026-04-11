@@ -203,9 +203,15 @@ class OrbitCamera:
         self.distance = max(0.01, self.distance)
 
     def pan(self, dx, dy):
+        # Use camera-local axes so pan follows screen directions at any angle
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
         cy, sy = math.cos(self.yaw), math.sin(self.yaw)
-        right = np.array([cy, 0, -sy], dtype=np.float32)
-        up = np.array([0, 1, 0], dtype=np.float32)
+        forward = np.array([cp * sy, sp, cp * cy], dtype=np.float32)
+        world_up = np.array([0, 1, 0], dtype=np.float32)
+        right = np.cross(forward, world_up)
+        right /= np.linalg.norm(right) + 1e-8
+        up = np.cross(right, forward)
+        up /= np.linalg.norm(up) + 1e-8
         scale = self.distance * 0.002
         self.target += right * dx * scale + up * dy * scale
 
@@ -4131,14 +4137,10 @@ def main():
         vp_w = win_w - vp_x
         vp_h = win_h
 
-        # Skip GL rendering when window is not focused (prevents crashes)
+        # Throttle when not focused but still render (so background tasks show results)
         is_focused = glfw.get_window_attrib(window, glfw.FOCUSED)
         if not is_focused:
-            imgui.render()
-            impl.render(imgui.get_draw_data())
-            glfw.swap_buffers(window)
             import time; time.sleep(0.05)
-            continue
 
         gl.glViewport(vp_x, 0, vp_w, vp_h)
         gl.glScissor(vp_x, 0, vp_w, vp_h)
