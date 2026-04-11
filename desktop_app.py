@@ -204,9 +204,10 @@ class OrbitCamera:
 
     def pan(self, dx, dy):
         # Use camera-local axes so pan follows screen directions at any angle
+        # forward = target - eye (same direction as view matrix)
         cp, sp = math.cos(self.pitch), math.sin(self.pitch)
         cy, sy = math.cos(self.yaw), math.sin(self.yaw)
-        forward = np.array([cp * sy, sp, cp * cy], dtype=np.float32)
+        forward = np.array([-cp * sy, -sp, -cp * cy], dtype=np.float32)
         world_up = np.array([0, 1, 0], dtype=np.float32)
         right = np.cross(forward, world_up)
         right /= np.linalg.norm(right) + 1e-8
@@ -359,10 +360,15 @@ class GLScene:
         self.grid_vao = None
         self.grid_vbo = None
         self.grid_line_count = 0
+        # Splat display buffers
+        self.splat_vao = None
+        self.splat_vbo = None
+        self.splat_count = 0
         # Pending uploads from background threads
         self._pending_points = None
         self._pending_mesh = None
         self._pending_cams = None
+        self._pending_splats = None
         self._pending_grid = True  # build grid on first flush
         import threading
         self._lock = threading.Lock()
@@ -388,6 +394,13 @@ class GLScene:
         """Queue point cloud for upload (thread-safe)."""
         with self._lock:
             self._pending_points = (points.copy(), colors.copy())
+
+    def set_splats(self, positions, colors_f, sizes):
+        """Queue splat point cloud for viewport display (thread-safe).
+        positions: (N,3) float32, colors_f: (N,3) float32 [0,1], sizes: (N,) float32."""
+        colors_u8 = (np.clip(colors_f, 0, 1) * 255).astype(np.uint8)
+        with self._lock:
+            self._pending_splats = (positions.copy(), colors_u8)
 
     def set_mesh(self, verts, faces, colors):
         """Queue mesh for upload (thread-safe). Also computes normals/shading."""
@@ -446,6 +459,27 @@ class GLScene:
         gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, False, 24, gl.ctypes.c_void_p(12))
         gl.glBindVertexArray(0)
         self.point_count = len(points)
+
+    def _upload_splats(self, positions, colors):
+        """Upload splat positions + colors as point cloud to separate buffer."""
+        if len(positions) == 0:
+            self.splat_count = 0
+            return
+        data = np.empty((len(positions), 6), dtype=np.float32)
+        data[:, :3] = positions.astype(np.float32)
+        data[:, 3:6] = colors.astype(np.float32) / 255.0
+        if self.splat_vao is None:
+            self.splat_vao = gl.glGenVertexArrays(1)
+            self.splat_vbo = gl.glGenBuffers(1)
+        gl.glBindVertexArray(self.splat_vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.splat_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_DYNAMIC_DRAW)
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, False, 24, None)
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, False, 24, gl.ctypes.c_void_p(12))
+        gl.glBindVertexArray(0)
+        self.splat_count = len(positions)
 
     def _upload_mesh(self, verts, faces, colors, uvs=None):
         if len(verts) == 0 or len(faces) == 0:
@@ -592,6 +626,11 @@ class GLScene:
                               gl.GL_UNSIGNED_INT, None)
             gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
+        if draw_mode == 'splats' and self.splat_count > 0:
+            gl.glBindVertexArray(self.splat_vao)
+            gl.glPointSize(2.0)
+            gl.glDrawArrays(gl.GL_POINTS, 0, self.splat_count)
+
         # Cameras: same rotation as scene
         if self.cam_line_count > 0:
             gl.glBindVertexArray(self.cam_vao)
@@ -639,16 +678,17 @@ class GLScene:
             msh = self._pending_mesh
             cams = getattr(self, '_pending_cams', None)
             tex = getattr(self, '_pending_texture', None)
+            splats = self._pending_splats
             self._pending_points = None
             self._pending_mesh = None
             self._pending_cams = None
             self._pending_texture = None
+            self._pending_splats = None
 
         if pts is not None:
             self._upload_points(pts[0], pts[1])
         if msh is not None:
             self._upload_mesh(msh[0], msh[1], msh[2])
-            # Store alternate color buffers
             if len(msh) >= 5:
                 self._normal_colors = msh[3]
                 self._shaded_colors = msh[4]
@@ -659,6 +699,8 @@ class GLScene:
             self._upload_texture(*tex)
         if cams is not None:
             self._upload_cams(cams)
+        if splats is not None:
+            self._upload_splats(splats[0], splats[1])
 
     def _build_grid(self, size=2.0, divisions=20):
         """Build ground grid + RGB axis lines."""
@@ -797,13 +839,23 @@ class AppState:
         self.points_modified = False  # True after smooth/upscale (don't reset on conf change)
         self.has_mesh = False
         self.uv_data = None  # (uvs, uv_faces) after Create UVs
-        self.draw_mode = 0  # 0=points, 1=mesh, 2=wireframe, 3=normals, 4=shaded
-        self.draw_modes = ['points', 'mesh', 'wireframe', 'normals', 'shaded']
+        self.draw_mode = 0  # 0=points, 1=mesh, 2=wireframe, 3=normals, 4=shaded, 5=splats
+        self.draw_modes = ['points', 'mesh', 'wireframe', 'normals', 'shaded', 'splats']
 
         # Refinement
         self.refining = False
         self.refine_progress = ""
         self.refine_thread = None
+
+        # Splat training
+        self.splat_training = False
+        self.splat_progress = ""
+        self.splat_step = 0
+        self.splat_total = 0
+        self.splat_data = None  # trained splats ParameterDict
+        self.splat_iterations = 3000
+        self.splat_n_samples = 50000
+        self.splat_anchor_weight = 0.1
 
         # Export
         self.export_path = ""
@@ -3413,6 +3465,60 @@ def _export_textured_obj(state, path):
         import traceback; traceback.print_exc()
 
 
+def run_train_splats(state, scene_gl):
+    """Background thread: train surface-constrained gaussian splats."""
+    try:
+        import tempfile
+        from colmap_export import export_scene_to_colmap
+        from surface_splats import train_surface_splats
+
+        state.splat_progress = "Exporting cameras..."
+        tmpdir = tempfile.mkdtemp()
+        export_dir = os.path.join(tmpdir, 'colmap')
+        export_scene_to_colmap(
+            scene=state.scene, image_paths=state.image_paths,
+            output_dir=export_dir, min_conf_thr=state.min_conf)
+
+        verts, faces, colors = state.mesh_data
+
+        state.splat_progress = "Initializing splats..."
+        gen = train_surface_splats(
+            mesh_data=(verts, faces, colors),
+            colmap_dir=export_dir,
+            iterations=state.splat_iterations,
+            n_samples=state.splat_n_samples,
+            anchor_weight_start=state.splat_anchor_weight,
+            stop_flag=lambda: state.stop_requested,
+        )
+
+        for progress in gen:
+            state.splat_step = progress['step']
+            state.splat_total = progress['total']
+            state.splat_progress = (
+                f"Step {progress['step']}/{progress['total']} | "
+                f"loss={progress['loss']:.4f} | {progress['n_splats']//1000}K splats")
+
+            if progress.get('means') is not None:
+                scene_gl.set_splats(
+                    progress['means'], progress['colors'], progress['scales'])
+                # Auto-switch to splats view
+                if 'splats' in state.draw_modes:
+                    state.draw_mode = state.draw_modes.index('splats')
+
+            if progress.get('done'):
+                state.splat_data = progress.get('splats')
+                state.splat_progress = f"Done: {progress['n_splats']:,d} splats"
+                break
+
+    except Exception as e:
+        state.error_msg = str(e)
+        state.splat_progress = f"Failed: {e}"
+        import traceback; traceback.print_exc()
+    finally:
+        state.splat_training = False
+        state.stop_requested = False
+
+
 def _sample_vertex_colors_from_obj(obj_path):
     """Load a textured OBJ, sample the texture at each vertex's UV, return vertex colors."""
     try:
@@ -4104,6 +4210,48 @@ def main():
                 root.destroy()
                 if path:
                     _export_textured_obj(state, path)
+
+        imgui.separator()
+
+        # ── Gaussian Splats ──
+        if state.has_mesh and state.scene is not None:
+            imgui.text("Gaussian Splats")
+            if not state.splat_training and not state.refining:
+                _, state.splat_iterations = imgui.slider_int(
+                    "Iterations##splat", state.splat_iterations, 500, 10000)
+                _, state.splat_n_samples = imgui.slider_int(
+                    "Samples##splat", state.splat_n_samples, 5000, 200000)
+                _, state.splat_anchor_weight = imgui.slider_float(
+                    "Anchor##splat", state.splat_anchor_weight, 0.0, 1.0, "%.2f")
+                if imgui.button("Train Splats", width=-1):
+                    state.splat_training = True
+                    state.stop_requested = False
+                    threading.Thread(
+                        target=run_train_splats, args=(state, scene_gl),
+                        daemon=True).start()
+
+            if state.splat_training:
+                if state.splat_total > 0:
+                    frac = state.splat_step / state.splat_total
+                    imgui.progress_bar(frac, (-1, 0), state.splat_progress)
+                else:
+                    imgui.text(state.splat_progress)
+                if imgui.button("Stop##splat", width=-1):
+                    state.stop_requested = True
+
+            if state.splat_data is not None and not state.splat_training:
+                if imgui.button("Export Splats (.ply)", width=-1):
+                    import tkinter as tk
+                    from tkinter import filedialog
+                    root = tk.Tk(); root.withdraw()
+                    path = filedialog.asksaveasfilename(
+                        title="Export Splats", defaultextension=".ply",
+                        filetypes=[("PLY files", "*.ply")])
+                    root.destroy()
+                    if path:
+                        from train import save_ply
+                        save_ply(state.splat_data, path)
+                        state.status = f"Splats exported to {path}"
 
         imgui.separator()
 
