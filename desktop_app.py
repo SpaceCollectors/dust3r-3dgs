@@ -3479,17 +3479,39 @@ def run_train_splats(state, scene_gl):
             scene=state.scene, image_paths=state.image_paths,
             output_dir=export_dir, min_conf_thr=state.min_conf)
 
-        verts, faces, colors = state.mesh_data
-
         state.splat_progress = "Initializing splats..."
-        gen = train_surface_splats(
-            mesh_data=(verts, faces, colors),
+
+        # Use mesh if available, otherwise fall back to point cloud
+        kwargs = dict(
             colmap_dir=export_dir,
             iterations=state.splat_iterations,
             n_samples=state.splat_n_samples,
             anchor_weight_start=state.splat_anchor_weight,
             stop_flag=lambda: state.stop_requested,
         )
+        if state.mesh_data is not None:
+            verts, faces, colors = state.mesh_data
+            kwargs['mesh_data'] = (verts, faces, colors)
+        else:
+            # Collect point cloud from scene
+            pts3d_list, confs_list = _extract_scene_data(state)
+            all_pts, all_cols = [], []
+            for i in range(len(state.scene.imgs)):
+                p = pts3d_list[i]; c = confs_list[i]; img = state.scene.imgs[i]
+                if p.ndim == 3:
+                    H, W = p.shape[:2]
+                    mask = c.reshape(H, W) > state.min_conf
+                    all_pts.append(p[mask])
+                    all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                else:
+                    mask = c.ravel() > state.min_conf
+                    all_pts.append(p[mask])
+                    all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+            cloud_pts = np.concatenate(all_pts).astype(np.float32)
+            cloud_cols = np.concatenate(all_cols).astype(np.uint8)
+            kwargs['point_cloud'] = (cloud_pts, cloud_cols)
+
+        gen = train_surface_splats(**kwargs)
 
         for progress in gen:
             state.splat_step = progress['step']
@@ -4214,7 +4236,7 @@ def main():
         imgui.separator()
 
         # ── Gaussian Splats ──
-        if state.has_mesh and state.scene is not None:
+        if (state.has_mesh or state.has_points) and state.scene is not None:
             imgui.text("Gaussian Splats")
             if not state.splat_training and not state.refining:
                 _, state.splat_iterations = imgui.slider_int(

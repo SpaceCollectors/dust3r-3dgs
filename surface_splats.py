@@ -146,7 +146,7 @@ def surface_anchor_loss(means, anchor_tree, anchor_pts_t):
 
 
 def train_surface_splats(
-    mesh_data, colmap_dir,
+    mesh_data=None, point_cloud=None, colmap_dir=None,
     device='cuda', iterations=3000, max_resolution=512,
     n_samples=50000,
     anchor_weight_start=0.1, anchor_weight_end=0.001,
@@ -155,19 +155,48 @@ def train_surface_splats(
     target_splats=0,
     stop_flag=None,
 ):
-    """Generator: train surface-constrained splats, yield progress dicts."""
+    """Generator: train surface-constrained splats, yield progress dicts.
+
+    Accepts either mesh_data=(verts, faces, colors) or point_cloud=(points, colors).
+    If mesh is provided, samples surface points. If point cloud, uses directly.
+    """
     from scipy.spatial import cKDTree
 
-    verts, faces, colors_mesh = mesh_data
-    print(f"Surface splat training: {len(verts):,d} verts, {len(faces):,d} faces")
+    if mesh_data is not None:
+        verts, faces, colors_mesh = mesh_data
+        print(f"Surface splat training: {len(verts):,d} verts, {len(faces):,d} faces")
+        print(f"  Sampling {n_samples:,d} points on mesh surface...")
+        points, normals, scolors = sample_mesh_surface(verts, faces, colors_mesh, n_samples)
+        anchor_pts = verts.astype(np.float32)
+    elif point_cloud is not None:
+        cloud_pts, cloud_cols = point_cloud
+        print(f"Splat training from point cloud: {len(cloud_pts):,d} points")
+        # Subsample if too many
+        if len(cloud_pts) > n_samples:
+            idx = np.random.choice(len(cloud_pts), n_samples, replace=False)
+            points = cloud_pts[idx].astype(np.float32)
+            scolors = cloud_cols[idx].astype(np.uint8)
+        else:
+            points = cloud_pts.astype(np.float32)
+            scolors = cloud_cols.astype(np.uint8)
+        # Estimate normals from KNN
+        tree_tmp = cKDTree(points)
+        normals = np.zeros_like(points)
+        _, nn_idx = tree_tmp.query(points, k=8)
+        for i in range(len(points)):
+            neighbors = points[nn_idx[i, 1:]]
+            centered = neighbors - points[i]
+            if len(centered) >= 3:
+                _, _, vh = np.linalg.svd(centered, full_matrices=False)
+                normals[i] = vh[-1]  # smallest singular vector = normal
+        normals /= (np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-8)
+        anchor_pts = points
+    else:
+        raise ValueError("Must provide mesh_data or point_cloud")
 
-    # Sample initial points on mesh
-    print(f"  Sampling {n_samples:,d} points on mesh surface...")
-    points, normals, scolors = sample_mesh_surface(verts, faces, colors_mesh, n_samples)
-
-    # Build anchor KD-tree from mesh vertices
-    anchor_tree = cKDTree(verts.astype(np.float32))
-    anchor_pts_t = torch.from_numpy(verts.astype(np.float32)).to(device)
+    # Build anchor KD-tree
+    anchor_tree = cKDTree(anchor_pts)
+    anchor_pts_t = torch.from_numpy(anchor_pts).to(device)
 
     # Load camera data
     print(f"  Loading COLMAP dataset from {colmap_dir}")
@@ -189,7 +218,7 @@ def train_surface_splats(
     # Depth priors
     print("  Computing depth priors...")
     depth_maps = []
-    all_pts3d = np.concatenate([verts, points], axis=0)  # use mesh + samples
+    all_pts3d = np.concatenate([anchor_pts, points], axis=0)
     for img in images:
         dm = render_depth_from_pts3d(all_pts3d, img['w2c'], img['K'], img['H'], img['W'])
         depth_maps.append(torch.from_numpy(dm).float().to(device))
