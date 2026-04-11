@@ -249,18 +249,37 @@ def _unwrap_uvs(verts, faces, views=None):
     t0 = time.time()
     F = len(faces)
 
-    # Face normals
+    # Face normals and centroids
     v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
     fn = np.cross(v1 - v0, v2 - v0)
-    fn /= (np.linalg.norm(fn, axis=-1, keepdims=True) + 1e-8)
+    fn_area = np.linalg.norm(fn, axis=-1, keepdims=True)
+    fn /= (fn_area + 1e-8)
     face_centroids = (v0 + v1 + v2) / 3.0
+
+    # Spatially smooth normals using KD-tree on centroids
+    # This averages normals from nearby faces, eliminating noise
+    from scipy.spatial import cKDTree
+    tree = cKDTree(face_centroids)
+    dists_nn = tree.query(face_centroids, k=2)[0][:, 1]  # nearest neighbor distance
+    smooth_radius = float(np.median(dists_nn)) * 8  # average over ~8-neighbor radius
+    print(f"  Normal smoothing radius: {smooth_radius:.6f}")
+
+    smooth_fn = np.zeros_like(fn)
+    # Query all neighbors within radius (batch)
+    neighbor_lists = tree.query_ball_tree(tree, smooth_radius)
+    for fi in range(F):
+        nbs = neighbor_lists[fi]
+        # Area-weighted average of neighbor normals
+        weights = fn_area[nbs].ravel()
+        smooth_fn[fi] = (fn[nbs] * weights[:, None]).sum(axis=0)
+    smooth_fn /= (np.linalg.norm(smooth_fn, axis=-1, keepdims=True) + 1e-8)
 
     # Build projection directions from views or cube-map
     if views and len(views) > 0:
         directions = []
         for view in views:
             c2w = np.linalg.inv(view['w2c'])
-            cam_dir = -c2w[:3, 2]  # camera looks along -Z
+            cam_dir = -c2w[:3, 2]
             directions.append(cam_dir / (np.linalg.norm(cam_dir) + 1e-8))
         directions = np.array(directions, dtype=np.float32)
         label = f"{len(directions)} camera views"
@@ -274,48 +293,9 @@ def _unwrap_uvs(verts, faces, views=None):
 
     n_dirs = len(directions)
 
-    # Initial assignment: best-aligned direction per face normal
-    dots = fn @ directions.T  # (F, n_dirs)
+    # Assignment based on smoothed normals — no salt-and-pepper
+    dots = smooth_fn @ directions.T  # (F, n_dirs)
     face_dir = np.argmax(dots, axis=1)
-
-    # ── Neighbor smoothing to remove isolated face islands ──
-    # Build face adjacency
-    from collections import defaultdict
-    edge_to_faces = defaultdict(list)
-    for fi in range(F):
-        f = faces[fi]
-        for j in range(3):
-            e = (min(f[j], f[(j+1) % 3]), max(f[j], f[(j+1) % 3]))
-            edge_to_faces[e].append(fi)
-
-    neighbors = [[] for _ in range(F)]
-    for flist in edge_to_faces.values():
-        if len(flist) == 2:
-            neighbors[flist[0]].append(flist[1])
-            neighbors[flist[1]].append(flist[0])
-
-    # Iterative majority vote: each face adopts the most common direction
-    # among itself + neighbors, unless its own normal strongly disagrees
-    for iteration in range(5):
-        new_dir = face_dir.copy()
-        changed = 0
-        for fi in range(F):
-            if not neighbors[fi]:
-                continue
-            # Count direction votes from neighbors
-            votes = np.zeros(n_dirs, dtype=np.int32)
-            votes[face_dir[fi]] += 2  # self gets double vote
-            for ni in neighbors[fi]:
-                votes[face_dir[ni]] += 1
-            winner = int(np.argmax(votes))
-            # Only switch if this face's normal is at least somewhat compatible
-            # (dot product > 0 means face roughly faces the direction)
-            if winner != face_dir[fi] and dots[fi, winner] > -0.1:
-                new_dir[fi] = winner
-                changed += 1
-        face_dir = new_dir
-        if changed == 0:
-            break
 
     # ── Project UVs from assigned direction ──
     uvs = np.zeros((F * 3, 2), dtype=np.float32)
