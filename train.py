@@ -32,6 +32,74 @@ from scipy.spatial.transform import Rotation
 # Pure PyTorch rasterizer — no CUDA compilation needed
 from rasterizer import render_gaussians
 
+# gsplat CUDA rasterizer — fast enough for 1M+ splats
+def render_gaussians_gsplat(means3d, scales, quats, opacities, colors,
+                            viewmat, K, W, H, bg_color=None,
+                            sh_degree=None, sh_coeffs=None,
+                            absgrad=False, return_meta=False):
+    """
+    Render gaussians using gsplat's CUDA rasterizer.
+    Same interface as render_gaussians() but orders of magnitude faster.
+
+    For SH lighting: pass sh_degree and sh_coeffs (N, K, 3) instead of colors.
+    Set absgrad=True for AbsGrad/IGS+ strategy (computes absolute gradients).
+    Set return_meta=True to get the info dict needed by gsplat strategies.
+    """
+    from gsplat.rendering import rasterization
+
+    device = means3d.device
+    if bg_color is None:
+        bg_color = torch.ones(3, device=device)
+
+    # gsplat expects batched viewmats (C, 4, 4) and Ks (C, 3, 3)
+    viewmats = viewmat.unsqueeze(0)  # (1, 4, 4)
+    Ks = K.unsqueeze(0)  # (1, 3, 3)
+
+    # Determine color input: SH coefficients or plain RGB
+    if sh_coeffs is not None and sh_degree is not None:
+        render_colors = sh_coeffs  # (N, K, 3)
+        use_sh = sh_degree
+    else:
+        render_colors = colors  # (N, 3)
+        use_sh = None
+
+    rendered, alphas, meta = rasterization(
+        means=means3d,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=render_colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=W,
+        height=H,
+        near_plane=0.01,
+        far_plane=1000.0,
+        eps2d=0.3,
+        sh_degree=use_sh,
+        render_mode="RGB+ED",
+        rasterize_mode="classic",
+        packed=True,
+        absgrad=absgrad,
+    )
+
+    # rendered: (1, H, W, 4) — RGB + expected depth
+    alpha = alphas[0]                          # (H, W, 1)
+    image = rendered[0, :, :, :3]              # (H, W, 3)
+    depth = rendered[0, :, :, 3:4]             # (H, W, 1)
+
+    # Composite background manually
+    image = image + (1.0 - alpha) * bg_color.view(1, 1, 3)
+
+    if return_meta:
+        # Add width/height/n_cameras for strategies that need them
+        meta["width"] = W
+        meta["height"] = H
+        meta["n_cameras"] = 1
+        return image, depth, alpha, meta
+
+    return image, depth, alpha
+
 
 # ── COLMAP Parser ────────────────────────────────────────────────────────────
 
@@ -203,7 +271,7 @@ def create_optimizers(splats, scene_scale=1.0):
         'quats': optim.Adam([splats['quats']], lr=1e-3, eps=1e-15),
         'opacities': optim.Adam([splats['opacities']], lr=5e-2, eps=1e-15),
         'sh0': optim.Adam([splats['sh0']], lr=2.5e-3, eps=1e-15),
-        'shN': optim.Adam([splats['shN']], lr=2.5e-3 / 20, eps=1e-15),
+        'shN': optim.Adam([splats['shN']], lr=2.5e-3 / 5, eps=1e-15),
     }
 
 
@@ -345,11 +413,12 @@ def train(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Crop size for training (render patches, not full images)
-    CROP = 256  # render 256x256 crops — ~4x faster than full 512x384
+    # gsplat is fast enough to render full frames; pytorch rasterizer needs crops
+    CROP = 0 if args.backend == 'gsplat' else 256
 
     print(f"\nStarting training for {args.iterations} iterations...")
-    print(f"  depth_lambda={depth_lambda}, aniso_lambda={aniso_lambda}, scale_lambda={scale_lambda}")
-    print(f"  crop_size={CROP}, random_bg=True")
+    print(f"  backend={args.backend}, depth_lambda={depth_lambda}, aniso_lambda={aniso_lambda}, scale_lambda={scale_lambda}")
+    print(f"  crop_size={CROP or 'full'}, random_bg=True")
     t0 = time.time()
     log_loss = torch.tensor(0.0, device=device)  # GPU-resident, no .item() in hot loop
 
@@ -365,7 +434,7 @@ def train(args):
 
         # Random crop for fast training (full image every 50 steps for preview)
         is_full = (step % 50 == 0)
-        if is_full or min(H, W) <= CROP:
+        if is_full or CROP == 0 or min(H, W) <= CROP:
             pixels = pixels_full
             K = K_full
             depth_gt = depth_gt_full
@@ -386,7 +455,6 @@ def train(args):
         quats = splats['quats']
         scales = torch.exp(splats['scales'])
         opacities = torch.sigmoid(splats['opacities'])
-        colors_rgb = (splats['sh0'].squeeze(1) * C0 + 0.5).clamp(0, 1)
 
         # Clamp scales
         with torch.no_grad():
@@ -396,11 +464,22 @@ def train(args):
         bg = torch.rand(3, device=device)
 
         # Rasterize
-        colors_pred, depth_pred, alpha_pred = render_gaussians(
-            means3d=means, scales=scales, quats=quats,
-            opacities=opacities, colors=colors_rgb,
-            viewmat=w2c, K=K, W=rW, H=rH, bg_color=bg,
-        )
+        if args.backend == 'gsplat':
+            sh_coeffs = torch.cat([splats['sh0'], splats['shN']], dim=1)  # (N, K, 3)
+            sh_degree = int(math.sqrt(sh_coeffs.shape[1])) - 1
+            colors_pred, depth_pred, alpha_pred = render_gaussians_gsplat(
+                means3d=means, scales=scales, quats=quats,
+                opacities=opacities, colors=None,
+                viewmat=w2c, K=K, W=rW, H=rH, bg_color=bg,
+                sh_degree=sh_degree, sh_coeffs=sh_coeffs,
+            )
+        else:
+            colors_rgb = (splats['sh0'].squeeze(1) * C0 + 0.5).clamp(0, 1)
+            colors_pred, depth_pred, alpha_pred = render_gaussians(
+                means3d=means, scales=scales, quats=quats,
+                opacities=opacities, colors=colors_rgb,
+                viewmat=w2c, K=K, W=rW, H=rH, bg_color=bg,
+            )
 
         # GT with same random background
         gt_with_bg = pixels  # photos have no alpha, so no bg needed
@@ -598,9 +677,9 @@ property float nz
     # Build contiguous binary data (vectorized)
     normals = np.zeros((N, 3), dtype=np.float32)
     sh_dc = sh_all[:, 0, :].astype(np.float32)  # (N, 3)
-    # SH rest: group by channel (all R, all G, all B) per splat
+    # SH rest: standard 3DGS layout — coefficient-major (R0,G0,B0, R1,G1,B1, ...)
     sh_rest = sh_all[:, 1:, :]  # (N, K-1, 3)
-    sh_rest_interleaved = sh_rest.transpose(0, 2, 1).reshape(N, -1).astype(np.float32)  # (N, 3*(K-1))
+    sh_rest_interleaved = sh_rest.reshape(N, -1).astype(np.float32)  # (N, (K-1)*3)
 
     # Pack per-vertex: pos(3) + normal(3) + dc(3) + rest(3*(K-1)) + opacity(1) + scale(3) + quat(4)
     row = np.concatenate([
@@ -646,6 +725,8 @@ if __name__ == '__main__':
                         help='Save checkpoint every N iterations')
     parser.add_argument('--target_splats', type=int, default=0,
                         help='Target gaussian count (0=no densification, keep initial count)')
+    parser.add_argument('--backend', type=str, default='gsplat', choices=['gsplat', 'pytorch'],
+                        help='Rasterization backend: gsplat (CUDA, fast, 1M+ splats) or pytorch (pure PyTorch, slow)')
 
     args = parser.parse_args()
     train(args)

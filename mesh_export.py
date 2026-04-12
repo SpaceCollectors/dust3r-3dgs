@@ -696,10 +696,11 @@ def _find_colmap_exe():
     return None
 
 
-def _write_colmap_sparse_model(sparse_dir, image_paths, c2w_list, K_list):
+def _write_colmap_sparse_model(sparse_dir, image_paths, c2w_list, K_list,
+                               scene_pts=None):
     """Write a COLMAP sparse model in text format from known cameras.
-    Also creates dummy 3D points from triangulation of camera centers
-    so that COLMAP's tools recognize images as connected."""
+    If scene_pts is provided, projects them into cameras to create proper
+    observations for PatchMatch depth range estimation."""
     from scipy.spatial.transform import Rotation
     from PIL import Image as PILImage
 
@@ -707,20 +708,24 @@ def _write_colmap_sparse_model(sparse_dir, image_paths, c2w_list, K_list):
     n = min(len(image_paths), len(c2w_list), len(K_list))
 
     # cameras.txt
+    img_sizes = []
     with open(os.path.join(sparse_dir, 'cameras.txt'), 'w') as f:
         f.write("# Camera list\n# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
         for i in range(n):
             img = PILImage.open(image_paths[i])
             W, H = img.size
+            img_sizes.append((W, H))
             K = K_list[i]
             f.write(f"{i+1} PINHOLE {W} {H} {K[0,0]:.6f} {K[1,1]:.6f} {K[0,2]:.6f} {K[1,2]:.6f}\n")
 
     # images.txt
+    w2c_list = []
     with open(os.path.join(sparse_dir, 'images.txt'), 'w') as f:
         f.write("# Image list\n# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
         for i in range(n):
             c2w = c2w_list[i].astype(np.float64)
             w2c = np.linalg.inv(c2w)
+            w2c_list.append(w2c)
             R = w2c[:3, :3]
             t = w2c[:3, 3]
             rot = Rotation.from_matrix(R)
@@ -730,19 +735,48 @@ def _write_colmap_sparse_model(sparse_dir, image_paths, c2w_list, K_list):
             f.write(f"{i+1} {qw:.10f} {qx:.10f} {qy:.10f} {qz:.10f} {t[0]:.10f} {t[1]:.10f} {t[2]:.10f} {i+1} {name}\n")
             f.write("\n")
 
-    # points3D.txt — create some dummy points at camera centers so images appear connected
+    # points3D.txt — use scene points if available, otherwise dummy points
+    n_pts = 0
     with open(os.path.join(sparse_dir, 'points3D.txt'), 'w') as f:
         f.write("# 3D point list\n")
-        pid = 1
-        for i in range(n):
-            center = c2w_list[i][:3, 3]
-            # Each point "seen" by this image and one neighbor
-            j = (i + 1) % n
-            f.write(f"{pid} {center[0]:.6f} {center[1]:.6f} {center[2]:.6f} 128 128 128 0.5 "
-                    f"{i+1} 1 {j+1} 1\n")
-            pid += 1
+        if scene_pts is not None and len(scene_pts) > 0:
+            # Subsample to reasonable count
+            pts = scene_pts
+            if len(pts) > 10000:
+                idx = np.random.choice(len(pts), 10000, replace=False)
+                pts = pts[idx]
+            # For each point, find which cameras see it
+            pid = 1
+            for pt in pts:
+                observers = []
+                for i in range(n):
+                    w2c = w2c_list[i]
+                    K = K_list[i]
+                    W, H = img_sizes[i]
+                    pt_cam = w2c[:3, :3] @ pt + w2c[:3, 3]
+                    if pt_cam[2] < 0.01:
+                        continue
+                    u = K[0, 0] * pt_cam[0] / pt_cam[2] + K[0, 2]
+                    v = K[1, 1] * pt_cam[1] / pt_cam[2] + K[1, 2]
+                    if 0 <= u < W and 0 <= v < H:
+                        observers.append((i + 1, int(u), int(v)))
+                if len(observers) >= 2:
+                    track = " ".join(f"{img_id} {px}" for img_id, px, py in observers)
+                    f.write(f"{pid} {pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} 128 128 128 0.5 {track}\n")
+                    pid += 1
+            n_pts = pid - 1
+        if n_pts == 0:
+            # Fallback: dummy points at camera centers
+            pid = 1
+            for i in range(n):
+                center = c2w_list[i][:3, 3]
+                j = (i + 1) % n
+                f.write(f"{pid} {center[0]:.6f} {center[1]:.6f} {center[2]:.6f} 128 128 128 0.5 "
+                        f"{i+1} 1 {j+1} 1\n")
+                pid += 1
+            n_pts = n
 
-    print(f"  Wrote COLMAP sparse model: {n} cameras, {n} points")
+    print(f"  Wrote COLMAP sparse model: {n} cameras, {n_pts} points")
     return n
 
 
@@ -830,18 +864,23 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
                 if progress_fn: progress_fn("COLMAP: mapping with prior cameras...")
                 print("  Using prior cameras for initialization...")
                 prior_dir = os.path.join(sparse_dir, 'prior')
-                _write_colmap_sparse_model(prior_dir, image_paths, c2w_list, K_list)
+                _write_colmap_sparse_model(prior_dir, image_paths, c2w_list, K_list,
+                                          scene_pts=existing_pts)
 
-                # Run mapper with prior cameras as initialization
-                # This lets COLMAP use our cameras as starting point but refine them
-                print("  Running mapper with camera priors...")
-                r = subprocess.run([colmap_exe, 'mapper',
+                # Use point_triangulator to keep cameras FIXED from DUSt3R
+                # This triangulates 2D matches using our cameras without moving them
+                print("  Triangulating points with fixed cameras...")
+                tri_output = os.path.join(sparse_dir, '0')
+                os.makedirs(tri_output, exist_ok=True)
+                # Copy prior model as the input
+                import shutil as _sh
+                for f in os.listdir(prior_dir):
+                    _sh.copy2(os.path.join(prior_dir, f), tri_output)
+                r = subprocess.run([colmap_exe, 'point_triangulator',
                                '--database_path', db_path,
                                '--image_path', img_dir,
-                               '--input_path', prior_dir,
-                               '--output_path', sparse_dir,
-                               '--Mapper.ba_refine_focal_length', '1',
-                               '--Mapper.ba_refine_extra_params', '0'],
+                               '--input_path', tri_output,
+                               '--output_path', tri_output],
                               capture_output=True, text=True, timeout=600,
                               env=colmap_env)
                 if r.stderr:

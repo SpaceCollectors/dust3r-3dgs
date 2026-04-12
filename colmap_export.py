@@ -82,7 +82,7 @@ def _extract_scene_data(scene, min_conf_thr, clean_depth):
 
 
 def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
-                           clean_depth=True):
+                           clean_depth=True, dense_colors=None):
     """
     Export a DUSt3R or MASt3R scene to COLMAP text format.
 
@@ -179,8 +179,18 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
             all_colors.append((np.clip(imgs[i][mask], 0, 1) * 255).astype(np.uint8))
             all_confs_flat.append(conf[mask])
         elif pts.ndim == 2:
-            # Flat array (e.g., COLMAP dense cloud) — skip for COLMAP export
-            continue
+            # Flat array (e.g., COLMAP dense cloud)
+            mask = conf.ravel() > min_conf_thr if conf is not None else np.ones(len(pts), dtype=bool)
+            all_pts.append(pts[mask])
+            # Use dense_colors if available, otherwise grey
+            if dense_colors is not None and len(dense_colors) == len(pts):
+                cols = dense_colors[mask]
+                if cols.max() <= 1.0:
+                    cols = (np.clip(cols, 0, 1) * 255).astype(np.uint8)
+                all_colors.append(cols.astype(np.uint8))
+            else:
+                all_colors.append(np.full((mask.sum(), 3), 128, dtype=np.uint8))
+            all_confs_flat.append(conf.ravel()[mask] if conf is not None else np.ones(mask.sum()))
         else:
             continue
 

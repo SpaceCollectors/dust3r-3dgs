@@ -42,6 +42,7 @@ out vec3 color;
 out float alpha;
 out vec3 conic;
 out vec2 coordxy;
+out float center_depth;
 
 vec3 get_vec3(int offset) {
     return vec3(g_data[offset], g_data[offset + 1], g_data[offset + 2]);
@@ -102,6 +103,15 @@ void main() {
     vec3 g_scale = get_vec3(start + SCALE_IDX);
     float g_opacity = g_data[start + OPACITY_IDX];
 
+    // Kill degenerate splats: skip if any scale axis is too large
+    // or if anisotropy ratio is extreme
+    float max_s = max(g_scale.x, max(g_scale.y, g_scale.z));
+    float min_s = min(g_scale.x, min(g_scale.y, g_scale.z));
+    if (max_s > 1.0f || max_s / (min_s + 1e-7f) > 50.f) {
+        gl_Position = vec4(-100, -100, -100, 1);
+        return;
+    }
+
     mat3 cov3d = computeCov3D(g_scale * scale_modifier, g_rot);
     vec2 wh = 2 * hfovxy_focal.xy * hfovxy_focal.z;
     vec3 cov2d = computeCov2D(g_pos_view, hfovxy_focal.z, hfovxy_focal.z,
@@ -113,10 +123,13 @@ void main() {
     conic = vec3(cov2d.z * det_inv, -cov2d.y * det_inv, cov2d.x * det_inv);
 
     vec2 quadwh_scr = vec2(3.f * sqrt(cov2d.x), 3.f * sqrt(cov2d.z));
+    // Clamp screen-space quad size to prevent giant splats covering everything
+    quadwh_scr = min(quadwh_scr, wh * 0.5f);
     vec2 quadwh_ndc = quadwh_scr / wh * 2;
     g_pos_screen.xy = g_pos_screen.xy + position * quadwh_ndc;
     coordxy = position * quadwh_scr;
     gl_Position = g_pos_screen;
+    center_depth = g_pos_view.z;
     alpha = g_opacity;
 
     // SH color (DC only for speed)
@@ -132,6 +145,7 @@ in vec3 color;
 in float alpha;
 in vec3 conic;
 in vec2 coordxy;
+in float center_depth;
 
 out vec4 FragColor;
 
@@ -142,6 +156,7 @@ void main() {
     if (power > 0.f) discard;
     float opacity = min(0.99f, alpha * exp(power));
     if (opacity < 1.f / 255.f) discard;
+
     FragColor = vec4(color, opacity);
 }
 """
@@ -333,4 +348,4 @@ def sort_splats_by_depth(means, view_matrix):
     R = view_matrix[:3, :3]
     t = view_matrix[:3, 3]
     depths = (means @ R.T + t[None, :])[:, 2]
-    return np.argsort(-depths).astype(np.int32)
+    return np.argsort(depths).astype(np.int32)

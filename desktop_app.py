@@ -862,6 +862,28 @@ class GLScene:
 
 # ── App State ────────────────────────────────────────────────────────────────
 
+def _track_tmpdir(path):
+    """Register a temp directory for cleanup."""
+    _tracked_tmpdirs.add(str(path))
+    return path
+
+def cleanup_temp_dirs():
+    """Delete all tracked temp directories."""
+    import shutil
+    removed = 0
+    for d in list(_tracked_tmpdirs):
+        try:
+            if os.path.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except Exception:
+            pass
+    _tracked_tmpdirs.clear()
+    return removed
+
+_tracked_tmpdirs = set()
+
+
 class AppState:
     def __init__(self):
         self.show_console = False  # overlay console on viewport
@@ -918,7 +940,22 @@ class AppState:
         self.splat_iterations = 2000
         self.splat_n_samples = 20000
         self.splat_target = 50000  # target splat count (0=no densification)
-        self.splat_anchor_weight = 0.1
+        self.splat_multi_view = True
+        self.splat_multi_view_count = 2
+        self.splat_strategy_idx = 4  # default to Adaptive
+        self.splat_strategies = ['simple', 'mcmc', 'absgrad', 'mrnf', 'adaptive']
+        self.splat_strategy_labels = ['Simple', 'MCMC', 'AbsGrad/IGS+', 'MRNF', 'Adaptive']
+        self.splat_resolution = 1024  # training image resolution
+        # All weights are 0-1 sliders, scaled to actual values in the training call
+        self.splat_anchor = 0.0
+        self.splat_flatness = 0.0
+        self.splat_normal = 0.0
+        self.splat_aniso = 0.0
+        self.splat_depth = 0.0
+        self.splat_coverage = 0.5
+        self.splat_opacity_decay = 0.0
+        self.splat_prune = 0.0
+        self.splat_smooth = 0.0
 
         # Export
         self.export_path = ""
@@ -1267,7 +1304,7 @@ print('SUCCESS')
             import tempfile, shutil
             from PIL import Image as PILImage
 
-            workdir = Path(tempfile.mkdtemp(prefix="colmap_"))
+            workdir = Path(_track_tmpdir(tempfile.mkdtemp(prefix="colmap_")))
             state._colmap_workdir = str(workdir)  # save for densify reuse
             image_dir = workdir / "images"
             image_dir.mkdir()
@@ -1473,7 +1510,7 @@ print('SUCCESS')
                 pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
 
                 import tempfile
-                cache_dir = tempfile.mkdtemp()
+                cache_dir = _track_tmpdir(tempfile.mkdtemp())
                 optim_levels = ['coarse', 'refine', 'refine+depth']
                 opt = optim_levels[state.optim_level]
 
@@ -1815,6 +1852,62 @@ def run_depth_injection(state, scene_gl):
     state.reconstructing = False
 
 
+def _handle_focus_click(state, camera, mx, my, window):
+    """Right-click: raycast to nearest point and set orbit target there."""
+    try:
+        pts3d_list = state.pts3d_list
+        if pts3d_list is None:
+            return
+        all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float32)
+        if len(all_pts) < 10:
+            return
+
+        # Apply scene rotation (same as rendering)
+        from scipy.spatial.transform import Rotation as SciRot
+        R_scene = SciRot.from_euler('xyz', [state.scene_rot_x, state.scene_rot_y, state.scene_rot_z],
+                                     degrees=True).as_matrix().astype(np.float32)
+        pts_display = (R_scene @ all_pts.T).T
+
+        # Viewport
+        win_w, win_h = glfw.get_window_size(window)
+        vp_x = 400
+        vp_w = win_w - vp_x
+        vp_h = win_h
+        if vp_w <= 0 or vp_h <= 0:
+            return
+
+        # Unproject click to ray
+        aspect = vp_w / max(vp_h, 1)
+        proj = camera.get_projection_matrix(aspect)
+        view = camera.get_view_matrix()
+        mvp_inv = np.linalg.inv((proj @ view).astype(np.float64))
+
+        nx = 2.0 * (mx - vp_x) / vp_w - 1.0
+        ny = 1.0 - 2.0 * my / vp_h
+
+        near_h = mvp_inv @ np.array([nx, ny, -1, 1], dtype=np.float64)
+        far_h = mvp_inv @ np.array([nx, ny, 1, 1], dtype=np.float64)
+        near_pt = (near_h[:3] / near_h[3]).astype(np.float32)
+        far_pt = (far_h[:3] / far_h[3]).astype(np.float32)
+        ray_dir = far_pt - near_pt
+        ray_dir /= max(np.linalg.norm(ray_dir), 1e-8)
+
+        # Find nearest point to ray
+        diff = pts_display - near_pt[None, :]
+        cross = np.cross(diff, ray_dir[None, :])
+        ray_dists = np.linalg.norm(cross, axis=-1)
+        nearest_idx = np.argmin(ray_dists)
+        hit_pt_display = pts_display[nearest_idx]
+
+        # Set orbit target to hit point
+        camera.target = hit_pt_display.copy()
+        # Adjust distance to maintain current view feel
+        camera.distance = max(0.1, np.linalg.norm(camera.get_position() - hit_pt_display))
+        state.status = f"Focus: ({hit_pt_display[0]:.2f}, {hit_pt_display[1]:.2f}, {hit_pt_display[2]:.2f})"
+    except Exception as e:
+        print(f"Focus click error: {e}")
+
+
 def _handle_align_click(state, scene_gl, camera, mx, my, window):
     """Raycast from click, find surface points, fit plane, align display rotation."""
     try:
@@ -2065,7 +2158,7 @@ def _create_masked_images(image_paths, prompt, keep=True, mask_sky=False, thresh
     from PIL import Image as PILImage
     import tempfile
 
-    tmpdir = tempfile.mkdtemp(prefix="masked_")
+    tmpdir = _track_tmpdir(tempfile.mkdtemp(prefix="masked_"))
     masks = []
 
     # Get subject masks if prompt given
@@ -2304,35 +2397,11 @@ def run_densify_colmap(state, scene_gl):
             state.image_paths, c2w_list, K_list, progress_fn=progress, **pm_opts)
 
         if len(dense_pts) > 0:
-            # REPLACE all point data with the dense cloud only
+            # Replace point data with dense cloud, keep existing scene/cameras
             state.pts3d_list = [dense_pts]
             state.confs_list = [np.ones(len(dense_pts), dtype=np.float32) * 10.0]
             state._dense_colors = dense_cols
-
-            # Update scene with COLMAP cameras (same frame as the dense cloud)
-            if colmap_cams and len(colmap_cams) > 0:
-                from app import VGGTScene
-                from PIL import Image as PILImage
-                imgs_np = []
-                for p in state.image_paths:
-                    img = PILImage.open(p).convert('RGB')
-                    imgs_np.append(np.array(img).astype(np.float32) / 255.0)
-                extrinsic = np.zeros((len(colmap_cams), 3, 4), dtype=np.float32)
-                intrinsic_all = []
-                for i, (c2w, K, W, H) in enumerate(colmap_cams):
-                    w2c = np.linalg.inv(c2w)
-                    extrinsic[i] = w2c[:3, :].astype(np.float32)
-                    intrinsic_all.append(K)
-                orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
-                state.scene = VGGTScene(imgs_np, extrinsic, np.stack(intrinsic_all),
-                                        [dense_pts], [np.ones(len(dense_pts), dtype=np.float32) * 10],
-                                        orig_sizes)
-                state.cached_cameras = colmap_cams
-                # Update camera display
-                cam_poses = [c2w for c2w, K, W, H in colmap_cams]
-                ext = np.linalg.norm(dense_pts.max(0) - dense_pts.min(0))
-                scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
-                print(f"  Updated scene with {len(colmap_cams)} COLMAP cameras")
+            state.points_modified = True
 
             # Display the dense cloud
             disp_pts, disp_cols = dense_pts, dense_cols
@@ -2770,12 +2839,13 @@ def run_refinement(state, scene_gl, debug_imgs=None):
         from colmap_export import export_scene_to_colmap
 
         # Export COLMAP for camera data
-        tmpdir = tempfile.mkdtemp()
+        tmpdir = _track_tmpdir(tempfile.mkdtemp())
         export_dir = os.path.join(tmpdir, 'colmap')
         state.refine_progress = "Exporting cameras..."
         export_scene_to_colmap(
             scene=state.scene, image_paths=state.image_paths,
-            output_dir=export_dir, min_conf_thr=state.min_conf)
+            output_dir=export_dir, min_conf_thr=state.min_conf,
+            dense_colors=getattr(state, '_dense_colors', None))
 
         views = load_cameras(export_dir)
         C = len(views)
@@ -3249,12 +3319,13 @@ def run_recolor_mesh(state, scene_gl):
         verts, faces, colors = state.mesh_data
 
         # Export cameras
-        tmpdir = tempfile.mkdtemp()
+        tmpdir = _track_tmpdir(tempfile.mkdtemp())
         export_dir = os.path.join(tmpdir, 'colmap')
         state.refine_progress = "Exporting cameras..."
         export_scene_to_colmap(
             scene=state.scene, image_paths=state.image_paths,
-            output_dir=export_dir, min_conf_thr=state.min_conf)
+            output_dir=export_dir, min_conf_thr=state.min_conf,
+            dense_colors=getattr(state, '_dense_colors', None))
         views = load_cameras(export_dir)
 
         V = len(verts)
@@ -3410,11 +3481,12 @@ def run_create_uvs(state, scene_gl):
         if state.scene is not None:
             try:
                 state.refine_progress = "Loading cameras for UV projection..."
-                tmpdir = tempfile.mkdtemp()
+                tmpdir = _track_tmpdir(tempfile.mkdtemp())
                 export_dir = os.path.join(tmpdir, 'colmap')
                 export_scene_to_colmap(
                     scene=state.scene, image_paths=state.image_paths,
-                    output_dir=export_dir, min_conf_thr=state.min_conf)
+                    output_dir=export_dir, min_conf_thr=state.min_conf,
+            dense_colors=getattr(state, '_dense_colors', None))
                 views = load_cameras(export_dir)
                 # Cache views for bake step
                 state._cached_views = views
@@ -3450,11 +3522,12 @@ def run_texture(state, scene_gl):
         views = getattr(state, '_cached_views', None)
         if views is None:
             state.refine_progress = "Exporting cameras..."
-            tmpdir = tempfile.mkdtemp()
+            tmpdir = _track_tmpdir(tempfile.mkdtemp())
             export_dir = os.path.join(tmpdir, 'colmap')
             export_scene_to_colmap(
                 scene=state.scene, image_paths=state.image_paths,
-                output_dir=export_dir, min_conf_thr=state.min_conf)
+                output_dir=export_dir, min_conf_thr=state.min_conf,
+            dense_colors=getattr(state, '_dense_colors', None))
             views = load_cameras(export_dir)
 
         # Bake
@@ -3536,22 +3609,43 @@ def run_train_splats(state, scene_gl):
         from colmap_export import export_scene_to_colmap
         from surface_splats import train_surface_splats
 
-        state.splat_progress = "Exporting cameras..."
-        tmpdir = tempfile.mkdtemp()
-        export_dir = os.path.join(tmpdir, 'colmap')
-        export_scene_to_colmap(
-            scene=state.scene, image_paths=state.image_paths,
-            output_dir=export_dir, min_conf_thr=state.min_conf)
+        # Use imported COLMAP dir directly if available, otherwise re-export
+        imported_dir = getattr(state, '_imported_colmap_dir', None)
+        if imported_dir and os.path.isdir(os.path.join(imported_dir, 'sparse', '0')):
+            export_dir = imported_dir
+            state.splat_progress = "Using imported COLMAP dataset..."
+            print(f"  Using imported COLMAP dataset: {export_dir}")
+        else:
+            state.splat_progress = "Exporting cameras..."
+            tmpdir = _track_tmpdir(tempfile.mkdtemp())
+            export_dir = os.path.join(tmpdir, 'colmap')
+            export_scene_to_colmap(
+                scene=state.scene, image_paths=state.image_paths,
+                output_dir=export_dir, min_conf_thr=state.min_conf,
+                dense_colors=getattr(state, '_dense_colors', None))
 
         state.splat_progress = "Initializing splats..."
 
         # Use mesh if available, otherwise fall back to point cloud
+        # Scale 0-1 sliders to actual training values
         kwargs = dict(
             colmap_dir=export_dir,
             iterations=state.splat_iterations,
+            max_resolution=state.splat_resolution,
             n_samples=state.splat_n_samples,
             target_splats=state.splat_target,
-            anchor_weight_start=state.splat_anchor_weight,
+            anchor_weight_start=state.splat_anchor * 0.2,       # 0-1 -> 0-0.2
+            aniso_lambda=state.splat_aniso,                      # 0-1 direct (1=isotropic)
+            flatness_lambda=state.splat_flatness,                # 0-1 direct (1=razor thin)
+            normal_lambda=state.splat_normal,                   # 0-1 direct (1=fully aligned)
+            depth_lambda=state.splat_depth * 1.0,               # 0-1 -> 0-1.0
+            opacity_decay=state.splat_opacity_decay * 0.01,     # 0-1 -> 0-0.01
+            prune_threshold=state.splat_prune * 0.05,           # 0-1 -> 0-0.05
+            strategy_name=state.splat_strategies[state.splat_strategy_idx],
+            multi_view=state.splat_multi_view,
+            multi_view_count=state.splat_multi_view_count,
+            smooth_strength=state.splat_smooth * 0.3,           # 0-1 -> 0-0.3
+            coverage_lambda=state.splat_coverage,                # 0-1 -> 0-1
             stop_flag=lambda: state.stop_requested,
         )
         if state.mesh_data is not None:
@@ -3560,18 +3654,31 @@ def run_train_splats(state, scene_gl):
         else:
             # Collect point cloud from scene
             pts3d_list, confs_list = _extract_scene_data(state)
+            dense_cols = getattr(state, '_dense_colors', None)
             all_pts, all_cols = [], []
-            for i in range(len(state.scene.imgs)):
-                p = pts3d_list[i]; c = confs_list[i]; img = state.scene.imgs[i]
+            for i in range(len(pts3d_list)):
+                p = pts3d_list[i]; c = confs_list[i]
                 if p.ndim == 3:
+                    # Per-image dense points (DUSt3R/MASt3R/VGGT)
                     H, W = p.shape[:2]
                     mask = c.reshape(H, W) > state.min_conf
                     all_pts.append(p[mask])
-                    all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                    img = state.scene.imgs[i] if i < len(state.scene.imgs) else None
+                    if img is not None and img.shape[0] == H and img.shape[1] == W:
+                        all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                    else:
+                        all_cols.append(np.full((mask.sum(), 3), 128, dtype=np.uint8))
                 else:
+                    # Flat point array (COLMAP PatchMatch)
                     mask = c.ravel() > state.min_conf
                     all_pts.append(p[mask])
-                    all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+                    if dense_cols is not None and len(dense_cols) == len(p):
+                        cols = dense_cols[mask]
+                        if cols.max() <= 1.0:
+                            cols = (np.clip(cols, 0, 1) * 255).astype(np.uint8)
+                        all_cols.append(cols.astype(np.uint8))
+                    else:
+                        all_cols.append(np.full((mask.sum(), 3), 128, dtype=np.uint8))
             cloud_pts = np.concatenate(all_pts).astype(np.float32)
             cloud_cols = np.concatenate(all_cols).astype(np.uint8)
             kwargs['point_cloud'] = (cloud_pts, cloud_cols)
@@ -3784,6 +3891,8 @@ def main():
     mouse_down = [False, False, False]
     last_mouse = [0.0, 0.0]
 
+    last_rclick_time = [0.0]
+
     def mouse_button_callback(window, button, action, mods):
         # Ignore input when window is not focused
         if not glfw.get_window_attrib(window, glfw.FOCUSED):
@@ -3796,6 +3905,15 @@ def main():
                 mx, my = glfw.get_cursor_pos(window)
                 _handle_align_click(state, scene_gl, camera, mx, my, window)
                 return
+            # Double right-click: focus orbit on clicked point
+            if button == 1:
+                now = glfw.get_time()
+                if now - last_rclick_time[0] < 0.3:  # 300ms double-click
+                    mx, my = glfw.get_cursor_pos(window)
+                    _handle_focus_click(state, camera, mx, my, window)
+                    last_rclick_time[0] = 0.0
+                    return
+                last_rclick_time[0] = now
             mouse_down[button] = True
         elif action == glfw.RELEASE:
             mouse_down[button] = False
@@ -3859,16 +3977,31 @@ def main():
             if hasattr(state, '_ever_centered'):
                 del state._ever_centered
             state.__init__()
+            # Clear all GPU-side data
             scene_gl.point_count = 0
             scene_gl.mesh_face_count = 0
             scene_gl.mesh_has_uvs = False
             scene_gl.mesh_tex_id = None
+            scene_gl.cam_line_count = 0
             if hasattr(scene_gl, '_mesh_uvs'):
                 scene_gl._mesh_uvs = None
+            if hasattr(scene_gl, '_splat_renderer') and scene_gl._splat_renderer is not None:
+                scene_gl._splat_renderer.num_splats = 0
+            if hasattr(scene_gl, '_splat_means'):
+                del scene_gl._splat_means
+            if hasattr(scene_gl, '_splat_data_packed'):
+                del scene_gl._splat_data_packed
+            # Reset camera
             camera.distance = 3.0
             camera.target = np.zeros(3, dtype=np.float32)
             camera.yaw = camera.pitch = 0.0
-            state.status = "New project"
+            n_cleaned = cleanup_temp_dirs()
+            state.status = f"New project (cleaned {n_cleaned} temp folders)"
+
+        imgui.same_line()
+        if imgui.button("Clean Temp"):
+            n_cleaned = cleanup_temp_dirs()
+            state.status = f"Cleaned {n_cleaned} temp folders"
 
         imgui.same_line()
         if imgui.button("Save Project"):
@@ -3994,12 +4127,19 @@ def main():
             root.destroy()
             if folder:
                 exts = {'.jpg', '.jpeg', '.png', '.bmp'}
-                state.image_paths = sorted([
+                folder_files = sorted([
                     os.path.join(folder, f) for f in os.listdir(folder)
                     if os.path.splitext(f)[1].lower() in exts
                 ])
+                # Accumulate: add new files to existing selection (deduplicated)
+                existing = set(state.image_paths)
+                new_files = [f for f in folder_files if f not in existing]
+                state.image_paths = sorted(state.image_paths + new_files)
                 state.image_dir = folder
-                state.status = f"Loaded {len(state.image_paths)} images from {folder}"
+                if new_files:
+                    state.status = f"Added {len(new_files)} images from {folder} ({len(state.image_paths)} total)"
+                else:
+                    state.status = f"No new images from {folder}"
         imgui.same_line()
         if imgui.button("Select Files..."):
             import tkinter as tk
@@ -4012,13 +4152,113 @@ def main():
                            ("All files", "*.*")])
             root.destroy()
             if files:
-                state.image_paths = sorted(files)
+                # Accumulate: add new files to existing selection (deduplicated)
+                existing = set(state.image_paths)
+                new_files = [f for f in files if f not in existing]
+                state.image_paths = sorted(state.image_paths + list(new_files))
                 state.image_dir = os.path.dirname(files[0])
-                state.status = f"Loaded {len(state.image_paths)} images"
+                if new_files:
+                    state.status = f"Added {len(new_files)} images ({len(state.image_paths)} total)"
+                else:
+                    state.status = f"No new images (already have {len(state.image_paths)})"
 
         if state.image_paths:
             imgui.text(f"  {len(state.image_paths)} images")
             imgui.text(f"  {state.image_dir}")
+
+        if imgui.button("Import COLMAP Dataset..."):
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw()
+            folder = filedialog.askdirectory(title="Select COLMAP Dataset Folder (contains sparse/ and images/)")
+            root.destroy()
+            if folder:
+                try:
+                    from train import load_colmap_dataset, parse_colmap_cameras, parse_colmap_images, parse_colmap_points3d
+                    from app import VGGTScene
+                    from PIL import Image as PILImage
+
+                    sparse_dir = os.path.join(folder, 'sparse', '0')
+                    images_dir = os.path.join(folder, 'images')
+
+                    if not os.path.isdir(sparse_dir):
+                        state.status = f"Not a COLMAP dataset: missing {sparse_dir}"
+                    else:
+                        cameras = parse_colmap_cameras(os.path.join(sparse_dir, 'cameras.txt'))
+                        col_images = parse_colmap_images(os.path.join(sparse_dir, 'images.txt'))
+
+                        # Prefer dense PLY if available, fall back to points3D.txt
+                        dense_ply = os.path.join(folder, 'dense_point_cloud.ply')
+                        if os.path.exists(dense_ply):
+                            import trimesh
+                            mesh = trimesh.load(dense_ply)
+                            points = np.array(mesh.vertices, dtype=np.float32)
+                            colors = np.array(mesh.colors[:, :3], dtype=np.uint8) if hasattr(mesh, 'colors') and mesh.colors is not None else np.full((len(points), 3), 128, dtype=np.uint8)
+                            print(f"  Loaded dense PLY: {len(points):,d} points")
+                        else:
+                            points, colors = parse_colmap_points3d(os.path.join(sparse_dir, 'points3D.txt'))
+                            print(f"  Loaded points3D: {len(points):,d} points")
+
+                        # Load images
+                        imgs_np = []
+                        img_paths = []
+                        for ci in col_images:
+                            img_path = os.path.join(images_dir, ci['name'])
+                            if os.path.exists(img_path):
+                                img_paths.append(img_path)
+                                pil = PILImage.open(img_path).convert('RGB')
+                                imgs_np.append(np.array(pil).astype(np.float32) / 255.0)
+
+                        if not imgs_np:
+                            state.status = "No images found in COLMAP dataset"
+                        else:
+                            n = len(imgs_np)
+                            # Build camera arrays — undo COLMAP's +0.5 principal point shift
+                            extrinsic = np.zeros((n, 3, 4), dtype=np.float32)
+                            intrinsic_all = []
+                            colmap_cams = []
+                            for i, ci in enumerate(col_images[:n]):
+                                cam = cameras[ci['cam_id']]
+                                W_c, H_c, fx, fy, cx, cy = cam
+                                # COLMAP convention: cx,cy are +0.5 offset from OpenCV
+                                cx -= 0.5; cy -= 0.5
+                                K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+                                intrinsic_all.append(K)
+                                w2c = ci['w2c'].astype(np.float32)
+                                extrinsic[i] = w2c[:3, :]
+                                c2w = ci['c2w'].astype(np.float32)
+                                colmap_cams.append((c2w, K, W_c, H_c))
+
+                            orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
+                            state.scene = VGGTScene(
+                                imgs_np, extrinsic, np.stack(intrinsic_all),
+                                [points], [np.ones(len(points), dtype=np.float32) * 10],
+                                orig_sizes)
+                            state.image_paths = img_paths
+                            state.image_dir = images_dir
+                            state.pts3d_list = [points]
+                            state.confs_list = [np.ones(len(points), dtype=np.float32) * 10]
+                            state._dense_colors = colors
+                            state.cached_cameras = colmap_cams
+                            state.has_points = True
+                            state._imported_colmap_dir = folder  # skip re-export for training
+
+                            # Display
+                            disp_pts, disp_cols = points, colors
+                            if len(disp_pts) > 500000:
+                                idx = np.random.choice(len(disp_pts), 500000, replace=False)
+                                disp_pts, disp_cols = disp_pts[idx], disp_cols[idx]
+                            scene_gl.set_points(disp_pts, disp_cols)
+
+                            cam_poses = [c2w for c2w, K, W, H in colmap_cams]
+                            ext = np.linalg.norm(points.max(0) - points.min(0))
+                            scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
+
+                            state.status = f"Imported COLMAP: {n} cameras, {len(points):,d} points"
+                except Exception as e:
+                    state.status = f"Import failed: {e}"
+                    import traceback; traceback.print_exc()
+
         imgui.separator()
 
         # ── Backend ──
@@ -4162,7 +4402,8 @@ def main():
                         from colmap_export import export_scene_to_colmap
                         export_scene_to_colmap(
                             scene=state.scene, image_paths=state.image_paths,
-                            output_dir=folder, min_conf_thr=state.min_conf)
+                            output_dir=folder, min_conf_thr=state.min_conf,
+                            dense_colors=getattr(state, '_dense_colors', None))
                         state.status = f"Exported to {folder}"
                     except Exception as e:
                         state.error_msg = str(e)
@@ -4299,17 +4540,45 @@ def main():
         if (state.has_mesh or state.has_points) and state.scene is not None:
             imgui.text("Gaussian Splats")
             if not state.splat_training and not state.refining:
-                _, state.splat_iterations = imgui.slider_int(
-                    "Iterations##splat", state.splat_iterations, 500, 10000)
-                _, state.splat_n_samples = imgui.slider_int(
-                    "Samples##splat", state.splat_n_samples, 5000, 200000)
-                _, state.splat_target = imgui.slider_int(
-                    "Target Splats", state.splat_target, 0, 500000)
+                _, state.splat_multi_view = imgui.checkbox(
+                    "Multi-View##splat", state.splat_multi_view)
+                if state.splat_multi_view:
+                    imgui.same_line()
+                    _, state.splat_multi_view_count = imgui.input_int(
+                        "##mv_count", state.splat_multi_view_count, 1, 1)
+                    state.splat_multi_view_count = max(2, state.splat_multi_view_count)
+                _, state.splat_strategy_idx = imgui.combo(
+                    "Strategy##splat", state.splat_strategy_idx,
+                    state.splat_strategy_labels)
+                _, state.splat_iterations = imgui.input_int(
+                    "Iterations##splat", state.splat_iterations, 500, 1000)
+                _, state.splat_resolution = imgui.input_int(
+                    "Resolution##splat", state.splat_resolution, 256, 512)
+                _, state.splat_n_samples = imgui.input_int(
+                    "Samples##splat", state.splat_n_samples, 10000, 50000)
+                _, state.splat_target = imgui.input_int(
+                    "Target Splats", state.splat_target, 50000, 100000)
                 if state.splat_target == 0:
                     imgui.same_line()
                     imgui.text_colored("(no densify)", 0.5, 0.5, 0.5)
-                _, state.splat_anchor_weight = imgui.slider_float(
-                    "Anchor##splat", state.splat_anchor_weight, 0.0, 1.0, "%.2f")
+                _, state.splat_anchor = imgui.slider_float(
+                    "Anchor##splat", state.splat_anchor, 0.0, 1.0, "%.2f")
+                _, state.splat_flatness = imgui.slider_float(
+                    "Flatness##splat", state.splat_flatness, 0.0, 1.0, "%.2f")
+                _, state.splat_normal = imgui.slider_float(
+                    "Normal Align##splat", state.splat_normal, 0.0, 1.0, "%.2f")
+                _, state.splat_aniso = imgui.slider_float(
+                    "Anisotropy##splat", state.splat_aniso, 0.0, 1.0, "%.2f")
+                _, state.splat_coverage = imgui.slider_float(
+                    "Coverage##splat", state.splat_coverage, 0.0, 1.0, "%.2f")
+                _, state.splat_depth = imgui.slider_float(
+                    "Depth##splat", state.splat_depth, 0.0, 1.0, "%.2f")
+                _, state.splat_opacity_decay = imgui.slider_float(
+                    "Opacity Decay##splat", state.splat_opacity_decay, 0.0, 1.0, "%.2f")
+                _, state.splat_prune = imgui.slider_float(
+                    "Prune##splat", state.splat_prune, 0.0, 1.0, "%.2f")
+                _, state.splat_smooth = imgui.slider_float(
+                    "Smooth##splat", state.splat_smooth, 0.0, 1.0, "%.2f")
                 if imgui.button("Train Splats", width=-1):
                     state.splat_training = True
                     state.stop_requested = False
