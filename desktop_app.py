@@ -910,6 +910,10 @@ class AppState:
         self.mask_before_recon = True  # mask images BEFORE reconstruction (better isolation)
         self.masked_image_paths = None  # paths to pre-masked images (temp dir)
 
+        # Bundle adjustment options
+        self.ba_refine_focal = False
+        self.ba_refine_pp = False
+
         # COLMAP PatchMatch options
         self.pm_max_image_size = -1     # -1 = full resolution
         self.pm_num_iterations = 5
@@ -2339,6 +2343,137 @@ def _run_smooth_preview(state, scene_gl):
         state.status = f"Smoothed: {len(points):,d} -> {len(pts):,d} points (radius={state.smooth_radius:.1f}x)"
     except Exception as e:
         state.status = f"Smooth preview failed: {e}"
+        import traceback; traceback.print_exc()
+    finally:
+        state.refining = False
+        state.refine_progress = ""
+
+
+def run_bundle_adjust(state, scene_gl):
+    """Refine cameras via COLMAP bundle adjustment."""
+    state.refine_progress = "Starting bundle adjustment..."
+    try:
+        from mesh_export import bundle_adjust
+        import torch
+
+        scene = state.scene
+        is_vggt = hasattr(scene, '_is_vggt')
+        is_mast3r = hasattr(scene, 'canonical_paths')
+
+        # Extract cameras
+        c2w_all = scene.get_im_poses().detach().cpu().numpy() if hasattr(scene.get_im_poses(), 'detach') \
+            else scene.get_im_poses().numpy() if hasattr(scene.get_im_poses(), 'numpy') \
+            else np.array(scene.get_im_poses())
+        c2w_list = [c2w_all[i].astype(np.float32) for i in range(len(c2w_all))]
+
+        # Extract intrinsics scaled to full resolution
+        pts3d_list, confs_list = _extract_scene_data(state)
+        K_list = []
+        from PIL import Image as PILImage
+        for i in range(len(c2w_list)):
+            if is_vggt:
+                K_model = scene._intrinsic[i].copy()
+                img_pil = PILImage.open(state.image_paths[i])
+                W_full, H_full = img_pil.size
+                ratio = max(W_full, H_full) / 518.0
+                K = np.array([[K_model[0, 0] * ratio, 0, W_full / 2],
+                              [0, K_model[1, 1] * ratio, H_full / 2],
+                              [0, 0, 1]], dtype=np.float32)
+            else:
+                focals = scene.get_focals().detach().cpu().numpy()
+                f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
+                img_pil = PILImage.open(state.image_paths[i])
+                W_full, H_full = img_pil.size
+                W_model = pts3d_list[i].shape[1] if i < len(pts3d_list) and pts3d_list[i].ndim == 3 else 512
+                f_full = f * (W_full / W_model)
+                K = np.array([[f_full, 0, W_full / 2],
+                              [0, f_full, H_full / 2],
+                              [0, 0, 1]], dtype=np.float32)
+            K_list.append(K)
+
+        def progress(msg):
+            state.refine_progress = msg
+
+        refined = bundle_adjust(
+            state.image_paths, c2w_list, K_list,
+            pts3d_list=pts3d_list, confs_list=confs_list,
+            imgs=scene.imgs, min_conf=state.min_conf,
+            refine_focal=state.ba_refine_focal,
+            refine_pp=state.ba_refine_pp,
+            progress_fn=progress)
+
+        if refined is None:
+            state.status = "Bundle adjustment failed"
+            return
+
+        # Write refined cameras back into the scene
+        n = len(refined)
+        if is_vggt:
+            # Update VGGT extrinsics (w2c 3x4)
+            for i in range(n):
+                c2w, K_new, W, H = refined[i]
+                w2c = np.linalg.inv(c2w.astype(np.float64))
+                scene._extrinsic[i] = w2c[:3, :].astype(np.float32)
+                if state.ba_refine_focal:
+                    scene._intrinsic[i][0, 0] = K_new[0, 0] * 518.0 / max(W, H)
+                    scene._intrinsic[i][1, 1] = K_new[1, 1] * 518.0 / max(W, H)
+        elif is_mast3r:
+            # MASt3R uses same pose representation as DUSt3R
+            for i in range(n):
+                c2w, K_new, W, H = refined[i]
+                scene._set_pose(scene.im_poses, i,
+                                torch.tensor(c2w, dtype=torch.float32, device=scene.device),
+                                force=True)
+        else:
+            # DUSt3R BasePCOptimizer / PairViewer
+            if hasattr(scene, '_set_pose'):
+                for i in range(n):
+                    c2w, K_new, W, H = refined[i]
+                    scene._set_pose(scene.im_poses, i,
+                                    torch.tensor(c2w, dtype=torch.float32, device=scene.device),
+                                    force=True)
+            elif hasattr(scene, 'im_poses') and hasattr(scene.im_poses, 'data'):
+                # PairViewer — im_poses is directly 4x4 matrices
+                for i in range(n):
+                    c2w, K_new, W, H = refined[i]
+                    scene.im_poses.data[i] = torch.tensor(c2w, dtype=torch.float32)
+
+        # Invalidate cached point data so it re-extracts with new cameras
+        state.pts3d_list = None
+        state.confs_list = None
+        state.points_modified = False
+
+        # Re-extract and display points with updated cameras
+        pts3d_list, confs_list = _extract_scene_data(state)
+        all_pts, all_cols = [], []
+        for i in range(len(scene.imgs)):
+            p = pts3d_list[i]
+            c = confs_list[i]
+            img = scene.imgs[i]
+            if p.ndim == 3:
+                mask = c.reshape(p.shape[:2]) > state.min_conf if c is not None else np.ones(p.shape[:2], dtype=bool)
+                all_pts.append(p[mask])
+                all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+        if all_pts:
+            points = np.concatenate(all_pts, axis=0)
+            colors = np.concatenate(all_cols, axis=0)
+            if len(points) > 200000:
+                idx = np.random.choice(len(points), 200000, replace=False)
+                points, colors = points[idx], colors[idx]
+            scene_gl.set_points(points, colors)
+
+        # Update camera display
+        cam_poses = scene.get_im_poses()
+        if hasattr(cam_poses, 'detach'):
+            cam_poses = cam_poses.detach().cpu().numpy()
+        ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0)) if len(all_pts) > 0 and len(points) > 0 else 1.0
+        scene_gl.set_cameras([cam_poses[i] for i in range(len(cam_poses))],
+                             scale=float(ext) * 0.05)
+
+        state.status = f"Bundle adjusted {n} cameras"
+
+    except Exception as e:
+        state.status = f"Bundle adjust failed: {e}"
         import traceback; traceback.print_exc()
     finally:
         state.refining = False
@@ -4327,6 +4462,19 @@ def main():
         if state.reconstructing:
             imgui.text(state.status)
             imgui.progress_bar(state.recon_frac)
+
+        # ── Bundle Adjustment ──
+        if state.scene is not None and state.has_points and not state.reconstructing and not state.refining:
+            backend = state.backends[state.backend_idx]
+            if backend in ('dust3r', 'mast3r', 'vggt', 'pow3r'):
+                _, state.ba_refine_focal = imgui.checkbox("Refine Focal Length##ba", state.ba_refine_focal)
+                imgui.same_line()
+                _, state.ba_refine_pp = imgui.checkbox("Refine PP##ba", state.ba_refine_pp)
+                if imgui.button("Bundle Adjust Cameras", width=-1):
+                    state.refining = True
+                    state.refine_thread = threading.Thread(
+                        target=run_bundle_adjust, args=(state, scene_gl), daemon=True)
+                    state.refine_thread.start()
 
         # ── AI Depth Enhancement ──
         if state.scene is not None and state.has_points and not state.reconstructing and not state.refining:

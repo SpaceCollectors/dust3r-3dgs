@@ -1063,6 +1063,280 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _write_ba_model(model_dir, image_paths, c2w_list, K_list,
+                    pts3d_list, confs_list, imgs, min_conf=2.0,
+                    max_points=50000, stride=4):
+    """Write a COLMAP sparse model with proper 2D-3D tracks for bundle adjustment.
+
+    Uses DUSt3R/MASt3R/VGGT per-pixel pointmaps directly: each pixel in image i
+    is a 2D observation of its corresponding 3D point. Points visible in multiple
+    images (via reprojection) get multi-view tracks.
+    """
+    from scipy.spatial.transform import Rotation
+    from PIL import Image as PILImage
+
+    os.makedirs(model_dir, exist_ok=True)
+    n = min(len(image_paths), len(c2w_list), len(K_list))
+
+    # Get image sizes
+    img_sizes = []
+    for p in image_paths[:n]:
+        im = PILImage.open(p)
+        img_sizes.append(im.size)  # (W, H)
+
+    # Precompute w2c matrices
+    w2c_list = []
+    for i in range(n):
+        c2w = c2w_list[i].astype(np.float64)
+        w2c_list.append(np.linalg.inv(c2w))
+
+    # Sample 3D points from pointmaps with their source pixel coordinates
+    # Each point knows: (3D xyz, source_image_id, source_pixel_u, source_pixel_v)
+    sampled_pts = []  # (x, y, z)
+    sampled_obs = []  # list of lists: [(img_id, u, v), ...]
+    for i in range(min(n, len(pts3d_list))):
+        pts = pts3d_list[i]
+        conf = confs_list[i] if i < len(confs_list) else None
+        if pts is None or pts.ndim != 3:
+            continue
+        H_m, W_m = pts.shape[:2]
+        if conf is not None:
+            mask = conf > min_conf
+        else:
+            mask = np.ones((H_m, W_m), dtype=bool)
+
+        # Scale factor from model resolution to full image resolution
+        W_full, H_full = img_sizes[i]
+        sx = W_full / W_m
+        sy = H_full / H_m
+
+        # Sample on a grid with stride, only confident points
+        for v in range(0, H_m, stride):
+            for u in range(0, W_m, stride):
+                if not mask[v, u]:
+                    continue
+                pt3d = pts[v, u]
+                if np.any(np.isnan(pt3d)) or np.any(np.isinf(pt3d)):
+                    continue
+
+                # Source observation in full-res pixel coords
+                u_full = u * sx + sx / 2
+                v_full = v * sy + sy / 2
+                observations = [(i + 1, u_full, v_full)]
+
+                # Project into other cameras for multi-view tracks
+                for j in range(n):
+                    if j == i:
+                        continue
+                    w2c = w2c_list[j]
+                    K = K_list[j]
+                    pt_cam = w2c[:3, :3] @ pt3d + w2c[:3, 3]
+                    if pt_cam[2] < 0.01:
+                        continue
+                    pu = float(K[0, 0]) * pt_cam[0] / pt_cam[2] + float(K[0, 2])
+                    pv = float(K[1, 1]) * pt_cam[1] / pt_cam[2] + float(K[1, 2])
+                    Wj, Hj = img_sizes[j]
+                    if 0 <= pu < Wj and 0 <= pv < Hj:
+                        observations.append((j + 1, pu, pv))
+
+                if len(observations) >= 2:
+                    sampled_pts.append(pt3d)
+                    sampled_obs.append(observations)
+
+    # Subsample if too many
+    if len(sampled_pts) > max_points:
+        idx = np.random.choice(len(sampled_pts), max_points, replace=False)
+        sampled_pts = [sampled_pts[i] for i in idx]
+        sampled_obs = [sampled_obs[i] for i in idx]
+
+    n_pts = len(sampled_pts)
+    print(f"  BA model: {n_pts} points with multi-view tracks")
+
+    # Build per-image 2D point lists
+    # img_points[img_id] = [(u, v, point3d_id), ...]
+    img_points = {i + 1: [] for i in range(n)}
+    for pid, obs_list in enumerate(sampled_obs):
+        point3d_id = pid + 1
+        for (img_id, u, v) in obs_list:
+            pt2d_idx = len(img_points[img_id])
+            img_points[img_id].append((u, v, point3d_id))
+
+    # Write cameras.txt
+    with open(os.path.join(model_dir, 'cameras.txt'), 'w') as f:
+        f.write("# Camera list\n# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        for i in range(n):
+            W, H = img_sizes[i]
+            K = K_list[i]
+            f.write(f"{i+1} PINHOLE {W} {H} {K[0,0]:.6f} {K[1,1]:.6f} {K[0,2]:.6f} {K[1,2]:.6f}\n")
+
+    # Write images.txt with proper POINTS2D lines
+    with open(os.path.join(model_dir, 'images.txt'), 'w') as f:
+        f.write("# Image list with two lines of data per image:\n")
+        f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        for i in range(n):
+            w2c = w2c_list[i]
+            R = w2c[:3, :3]
+            t = w2c[:3, 3]
+            rot = Rotation.from_matrix(R)
+            quat = rot.as_quat()  # (x, y, z, w)
+            qw, qx, qy, qz = float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2])
+            name = os.path.basename(image_paths[i])
+            f.write(f"{i+1} {qw:.10f} {qx:.10f} {qy:.10f} {qz:.10f} "
+                    f"{t[0]:.10f} {t[1]:.10f} {t[2]:.10f} {i+1} {name}\n")
+            # POINTS2D line: X Y POINT3D_ID for each observation
+            pts2d = img_points[i + 1]
+            if pts2d:
+                parts = " ".join(f"{u:.2f} {v:.2f} {pid}" for u, v, pid in pts2d)
+                f.write(f"{parts}\n")
+            else:
+                f.write("\n")
+
+    # Write points3D.txt with tracks
+    with open(os.path.join(model_dir, 'points3D.txt'), 'w') as f:
+        f.write("# 3D point list\n")
+        f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        # Build POINT2D_IDX lookup: for each image, the index of each point in that image's list
+        img_pt2d_idx = {i + 1: {} for i in range(n)}  # img_id -> {point3d_id: idx}
+        for img_id in range(1, n + 1):
+            for idx, (u, v, pid) in enumerate(img_points[img_id]):
+                img_pt2d_idx[img_id][pid] = idx
+
+        for pid in range(1, n_pts + 1):
+            pt = sampled_pts[pid - 1]
+            obs = sampled_obs[pid - 1]
+            track_parts = []
+            for (img_id, u, v) in obs:
+                pt2d_idx = img_pt2d_idx[img_id].get(pid)
+                if pt2d_idx is not None:
+                    track_parts.append(f"{img_id} {pt2d_idx}")
+            track_str = " ".join(track_parts)
+            f.write(f"{pid} {pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} 128 128 128 0.5 {track_str}\n")
+
+    print(f"  Wrote BA model: {n} cameras, {n_pts} points with tracks")
+    return n_pts
+
+
+def bundle_adjust(image_paths, c2w_list, K_list,
+                  pts3d_list, confs_list, imgs,
+                  min_conf=2.0, refine_focal=False, refine_pp=False,
+                  progress_fn=None):
+    """Run COLMAP bundle adjustment on DUSt3R/MASt3R/VGGT scene data.
+
+    Takes cameras and per-pixel pointmaps directly — no feature extraction or
+    matching needed. Builds 2D-3D tracks from the pointmaps and runs BA.
+    Returns list of refined (c2w, K, W, H) per image, or None on failure.
+    """
+    import tempfile, shutil, subprocess
+
+    colmap_exe = _find_colmap_exe()
+    if not colmap_exe:
+        raise RuntimeError(
+            "COLMAP executable not found. Download from:\n"
+            "  https://github.com/colmap/colmap/releases\n"
+            "  Get: colmap-x64-windows-cuda.zip\n"
+            "  Extract to project folder as colmap/")
+
+    colmap_env = os.environ.copy()
+    colmap_env['GLOG_logtostderr'] = '1'
+
+    n_imgs = len(image_paths)
+    workdir = tempfile.mkdtemp(prefix='colmap_ba_')
+    print(f"  Bundle adjust workdir: {workdir}")
+
+    try:
+        # Step 1: Write COLMAP model with proper tracks from pointmaps
+        if progress_fn:
+            progress_fn("Bundle adjust: building tracks...")
+        model_dir = os.path.join(workdir, "sparse", "0")
+        n_pts = _write_ba_model(model_dir, image_paths, c2w_list, K_list,
+                                pts3d_list, confs_list, imgs,
+                                min_conf=min_conf)
+        if n_pts == 0:
+            raise RuntimeError("No multi-view points found for bundle adjustment")
+
+        # Step 2: Run bundle adjustment directly on the model
+        if progress_fn:
+            progress_fn("Bundle adjust: optimizing...")
+        print("  Running bundle adjustment...")
+        ba_output = os.path.join(workdir, "sparse", "ba")
+        os.makedirs(ba_output, exist_ok=True)
+        r = subprocess.run([colmap_exe, 'bundle_adjuster',
+                        '--input_path', model_dir,
+                        '--output_path', ba_output,
+                        '--BundleAdjustment.refine_focal_length',
+                        '1' if refine_focal else '0',
+                        '--BundleAdjustment.refine_principal_point',
+                        '1' if refine_pp else '0',
+                        '--BundleAdjustment.refine_extra_params', '0'],
+                       capture_output=True, text=True, timeout=600,
+                       env=colmap_env)
+        if r.stdout:
+            for line in r.stdout.split('\n'):
+                if line.strip():
+                    print(f"    {line.strip()}")
+        if r.stderr:
+            for line in r.stderr.split('\n'):
+                if any(k in line.lower() for k in ['cost', 'residual', 'iteration', 'points', 'images']):
+                    print(f"    {line.strip()}")
+
+        # Step 3: Convert binary output to text for reading
+        subprocess.run([colmap_exe, 'model_converter',
+                        '--input_path', ba_output,
+                        '--output_path', ba_output,
+                        '--output_type', 'TXT'],
+                       capture_output=True, timeout=60, env=colmap_env)
+
+        # Step 4: Read back refined cameras
+        cameras_path = os.path.join(ba_output, 'cameras.txt')
+        images_path = os.path.join(ba_output, 'images.txt')
+        if not os.path.exists(cameras_path) or not os.path.exists(images_path):
+            # Fall back to input dir (BA may not have produced output)
+            cameras_path = os.path.join(model_dir, 'cameras.txt')
+            images_path = os.path.join(model_dir, 'images.txt')
+            if not os.path.exists(cameras_path):
+                raise RuntimeError("Bundle adjustment produced no output model")
+
+        from train import parse_colmap_cameras, parse_colmap_images
+        cameras = parse_colmap_cameras(cameras_path)
+        col_images = parse_colmap_images(images_path)
+
+        # Match refined cameras back to input images by filename
+        name_to_idx = {}
+        for i, p in enumerate(image_paths):
+            name_to_idx[os.path.basename(p)] = i
+
+        refined = [None] * n_imgs
+        for ci in col_images:
+            idx = name_to_idx.get(ci['name'])
+            if idx is not None:
+                cam = cameras.get(ci['cam_id'])
+                if cam:
+                    W, H, fx, fy, cx, cy = cam
+                    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+                                 dtype=np.float64)
+                    refined[idx] = (ci['c2w'].astype(np.float32), K.astype(np.float32), W, H)
+
+        # Fill any missing with originals
+        from PIL import Image as PILImage
+        for i in range(n_imgs):
+            if refined[i] is None:
+                img = PILImage.open(image_paths[i])
+                W, H = img.size
+                refined[i] = (c2w_list[i], K_list[i], W, H)
+
+        n_refined = sum(1 for r in refined if r is not None)
+        print(f"  Bundle adjustment done: {n_refined}/{n_imgs} cameras refined")
+        return refined
+
+    except Exception as e:
+        print(f"  Bundle adjustment failed: {e}")
+        import traceback; traceback.print_exc()
+        return None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def save_dense_ply(path, pts, colors):
     n = len(pts)
     header = f"ply\nformat binary_little_endian 1.0\nelement vertex {n}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"

@@ -132,8 +132,23 @@ def parse_colmap_images(path):
     with open(path) as f:
         lines = [l.strip() for l in f if not l.startswith('#')]
     # images.txt has 2 lines per image: pose line + points2d line (may be empty)
-    # Filter: pose lines have 9+ fields, points2d lines are empty or have x,y,id triples
-    pose_lines = [l for l in lines if l and len(l.split()) >= 9]
+    # Pose lines: IMAGE_ID(int) QW QX QY QZ TX TY TZ CAMERA_ID(int) NAME(str)
+    # Points2D lines: X(float) Y(float) POINT3D_ID triples — skip these
+    pose_lines = []
+    for l in lines:
+        if not l or len(l.split()) < 10:
+            continue
+        parts = l.split()
+        # Pose lines have an integer IMAGE_ID and a filename as the 10th field
+        try:
+            int(parts[0])
+            int(parts[8])
+            # 10th field should contain a dot (filename extension) or no dot (still a name)
+            # but NOT be purely numeric (which would be a POINTS2D x-coordinate)
+            if not parts[9].replace('.', '').replace('-', '').replace('+', '').replace('e', '').isdigit():
+                pose_lines.append(l)
+        except ValueError:
+            continue
     for line in pose_lines:
         parts = line.split()
         img_id = int(parts[0])
