@@ -183,7 +183,7 @@ class OrbitCamera:
 
     def get_projection_matrix(self, aspect):
         """Compute 4x4 perspective projection matrix."""
-        near, far = 0.01, 100.0
+        near, far = 0.01, 10000.0
         f = 1.0 / math.tan(math.radians(self.fov) / 2.0)
         proj = np.zeros((4, 4), dtype=np.float32)
         proj[0, 0] = f / aspect
@@ -357,6 +357,9 @@ class GLScene:
         self.cam_vao = None
         self.cam_vbo = None
         self.cam_line_count = 0
+        self.widget_vao = None
+        self.widget_vbo = None
+        self.widget_line_count = 0
         self.grid_vao = None
         self.grid_vbo = None
         self.grid_line_count = 0
@@ -373,6 +376,7 @@ class GLScene:
         self._pending_cams = None
         self._pending_splats = None
         self._pending_grid = True  # build grid on first flush
+        self._pending_widgets = None
         import threading
         self._lock = threading.Lock()
 
@@ -690,9 +694,18 @@ class GLScene:
                 gl.glDrawArrays(gl.GL_POINTS, 0, self.splat_count)
 
         # Cameras: same rotation as scene
-        if self.cam_line_count > 0:
+        if self.cam_line_count > 0 and getattr(self, '_show_cameras', True):
             gl.glBindVertexArray(self.cam_vao)
             gl.glDrawArrays(gl.GL_LINES, 0, self.cam_line_count)
+
+        # Alignment widgets: discs + normals (drawn on top with depth bias)
+        if self.widget_line_count > 0:
+            gl.glDepthFunc(gl.GL_LEQUAL)
+            gl.glLineWidth(2.0)
+            gl.glBindVertexArray(self.widget_vao)
+            gl.glDrawArrays(gl.GL_LINES, 0, self.widget_line_count)
+            gl.glLineWidth(1.0)
+            gl.glDepthFunc(gl.GL_LESS)
 
         gl.glBindVertexArray(0)
 
@@ -724,6 +737,73 @@ class GLScene:
         with self._lock:
             self._pending_cams = np.array(data, dtype=np.float32)
 
+    def set_widgets(self, anchors, highlight_points=None):
+        """Queue alignment widget geometry (thread-safe).
+        anchors: list of {'pos': np.array(3), 'normal': np.array(3), 'radius': float, 'color': (r,g,b)}
+        highlight_points: optional np.array (N,3) of points to highlight (shown as bright dots)
+        """
+        lines = []
+        for anchor in anchors:
+            pos = anchor['pos'].astype(np.float32)
+            normal = anchor['normal'].astype(np.float32)
+            normal = normal / max(np.linalg.norm(normal), 1e-8)
+            radius = anchor['radius']
+            color = np.array(anchor.get('color', (1, 1, 0)), dtype=np.float32)
+
+            # Build tangent frame
+            if abs(normal[1]) < 0.9:
+                tangent = np.cross(normal, np.array([0, 1, 0], dtype=np.float32))
+            else:
+                tangent = np.cross(normal, np.array([1, 0, 0], dtype=np.float32))
+            tangent /= max(np.linalg.norm(tangent), 1e-8)
+            bitangent = np.cross(normal, tangent)
+            bitangent /= max(np.linalg.norm(bitangent), 1e-8)
+
+            # Disc outline (circle of line segments)
+            n_seg = 24
+            for s in range(n_seg):
+                a0 = 2 * np.pi * s / n_seg
+                a1 = 2 * np.pi * (s + 1) / n_seg
+                p0 = pos + radius * (np.cos(a0) * tangent + np.sin(a0) * bitangent)
+                p1 = pos + radius * (np.cos(a1) * tangent + np.sin(a1) * bitangent)
+                lines.append(np.concatenate([p0, color]))
+                lines.append(np.concatenate([p1, color]))
+
+            # Normal arrow (from center, length = radius)
+            tip = pos + normal * radius * 1.5
+            lines.append(np.concatenate([pos, color]))
+            lines.append(np.concatenate([tip, color * 0.8]))
+
+            # Cross-hairs on disc for visibility
+            lines.append(np.concatenate([pos - tangent * radius, color * 0.5]))
+            lines.append(np.concatenate([pos + tangent * radius, color * 0.5]))
+            lines.append(np.concatenate([pos - bitangent * radius, color * 0.5]))
+            lines.append(np.concatenate([pos + bitangent * radius, color * 0.5]))
+
+        # Highlighted neighborhood points — draw as small cross marks
+        if highlight_points is not None and len(highlight_points) > 0:
+            hi_color = np.array([1.0, 1.0, 0.0], dtype=np.float32)
+            # Subsample if too many (keep it fast)
+            pts = highlight_points
+            if len(pts) > 200:
+                pts = pts[np.random.choice(len(pts), 200, replace=False)]
+            tick = float(np.linalg.norm(pts.max(0) - pts.min(0))) * 0.005
+            tick = max(tick, 0.001)
+            for p in pts:
+                pf = p.astype(np.float32)
+                for axis in range(3):
+                    offset = np.zeros(3, dtype=np.float32)
+                    offset[axis] = tick
+                    lines.append(np.concatenate([pf - offset, hi_color]))
+                    lines.append(np.concatenate([pf + offset, hi_color]))
+
+        if not lines:
+            with self._lock:
+                self._pending_widgets = np.zeros((0, 6), dtype=np.float32)
+            return
+        with self._lock:
+            self._pending_widgets = np.array(lines, dtype=np.float32)
+
     def flush_pending(self):
         """Upload pending data to GL (must be called from main/GL thread)."""
         # Build grid on first call
@@ -738,12 +818,14 @@ class GLScene:
             tex = getattr(self, '_pending_texture', None)
             splats = self._pending_splats
             splat_params = self._pending_splat_params
+            widgets = self._pending_widgets
             self._pending_points = None
             self._pending_mesh = None
             self._pending_cams = None
             self._pending_texture = None
             self._pending_splats = None
             self._pending_splat_params = None
+            self._pending_widgets = None
 
         if pts is not None:
             self._upload_points(pts[0], pts[1])
@@ -759,6 +841,8 @@ class GLScene:
             self._upload_texture(*tex)
         if cams is not None:
             self._upload_cams(cams)
+        if widgets is not None:
+            self._upload_widgets(widgets)
         if splats is not None:
             self._upload_splats(splats[0], splats[1])
         if splat_params is not None:
@@ -844,6 +928,23 @@ class GLScene:
         stored_uvs = getattr(self, '_mesh_uvs', None)
         self._upload_mesh(verts, faces, shaded, stored_uvs)
 
+    def _upload_widgets(self, data):
+        if len(data) == 0:
+            self.widget_line_count = 0
+            return
+        if self.widget_vao is None:
+            self.widget_vao = gl.glGenVertexArrays(1)
+            self.widget_vbo = gl.glGenBuffers(1)
+        gl.glBindVertexArray(self.widget_vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.widget_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_DYNAMIC_DRAW)
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, False, 24, None)
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, False, 24, gl.ctypes.c_void_p(12))
+        gl.glBindVertexArray(0)
+        self.widget_line_count = len(data)
+
     def _upload_cams(self, data):
         # data is already (N, 6) float32 numpy array
         if not hasattr(self, 'cam_vao') or self.cam_vao is None:
@@ -913,6 +1014,11 @@ class AppState:
         # Bundle adjustment options
         self.ba_refine_focal = False
         self.ba_refine_pp = False
+        self.ba_n_iters = 200
+        self.ba_min_conf = 2.0
+        self.ba_max_shift = 0.2   # max translation as fraction of scene scale
+        self.ba_huber_scale = 0.1
+        self.show_cameras = True
 
         # COLMAP PatchMatch options
         self.pm_max_image_size = -1     # -1 = full resolution
@@ -994,6 +1100,7 @@ class AppState:
         self.poisson_depth_val = 10  # Poisson octree depth (higher = more detail)
         self.poisson_trim = 5.0      # trim percentile for low-density regions
         self.bp_radius_mult = 4.0    # ball pivot max radius multiplier (1=tight, 8=fill gaps)
+        self.delaunay_edge_mult = 8.0  # radius multiplier for local Delaunay neighbor selection
         self.use_smoothing = False # whether to smooth before meshing
         self.ai_depth_mix = 0.7  # 0=pure dust3r, 1=full AI detail
         self.ai_highpass_radius = 10.0  # high-pass sigma in pixels
@@ -1004,9 +1111,15 @@ class AppState:
 
         # Scene orientation transform (applied in shader)
         self.scene_rot_x = 180.0  # degrees (DUSt3R convention: Y-down, flip to Y-up)
-        self.align_mode = None  # None, 'floor', or 'wall' — waiting for click
+        self.align_mode = None  # None, 'floor', 'wall', 'hline', 'vline'
         self.align_floor_normal = None  # stored floor normal vector
         self.align_wall_normal = None   # stored wall normal vector
+        self.align_floor_anchor = None  # {'pos': np.array(3), 'normal': np.array(3), 'radius': float}
+        self.align_wall_anchor = None
+        self.align_preview_rot = None   # (rx, ry, rz) snapshot before preview
+        self.align_line_mode = None     # None, 'hline', 'vline'
+        self.align_line_start = None    # np.array(3) world-space first click
+        self.align_line_start_screen = None  # (sx, sy) for rubber-band drawing
         self.scene_rot_y = 0.0
         self.scene_rot_z = 0.0
         self.scene_flip_y = False
@@ -1912,172 +2025,246 @@ def _handle_focus_click(state, camera, mx, my, window):
         print(f"Focus click error: {e}")
 
 
+def _update_align_widgets(state, scene_gl, hover_anchor=None, hover_points=None):
+    """Rebuild alignment widget geometry from current anchors + optional hover preview."""
+    anchors = []
+    if state.align_floor_anchor is not None:
+        a = state.align_floor_anchor.copy()
+        a['color'] = (0.3, 1.0, 0.3)  # green
+        anchors.append(a)
+    if state.align_wall_anchor is not None:
+        a = state.align_wall_anchor.copy()
+        a['color'] = (0.3, 0.7, 1.0)  # blue
+        anchors.append(a)
+    if hover_anchor is not None:
+        anchors.append(hover_anchor)
+    scene_gl.set_widgets(anchors, highlight_points=hover_points)
+
+
+def _raycast_to_surface(state, camera, mx, my, window, circle_px=40, subsample=1,
+                        return_neighborhood=False):
+    """Raycast from screen coords into point cloud. Returns (centroid, normal, radius) or None.
+    If return_neighborhood=True, returns (centroid, normal, radius, neighborhood_pts).
+    Works in original (pre-rotation) space."""
+    pts3d_list = state.pts3d_list
+    if pts3d_list is None:
+        return None
+    all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float32)
+    if len(all_pts) < 10:
+        return None
+    if subsample > 1:
+        all_pts = all_pts[::subsample]
+
+    from scipy.spatial.transform import Rotation as SciRot
+    R_scene = SciRot.from_euler('xyz', [state.scene_rot_x, state.scene_rot_y, state.scene_rot_z],
+                                 degrees=True).as_matrix().astype(np.float32)
+    pts_display = (R_scene @ all_pts.T).T
+
+    win_w, win_h = glfw.get_window_size(window)
+    vp_x = 400
+    vp_w = win_w - vp_x
+    vp_h = win_h
+    if vp_w <= 0 or vp_h <= 0:
+        return None
+
+    aspect = vp_w / max(vp_h, 1)
+    proj = camera.get_projection_matrix(aspect)
+    view = camera.get_view_matrix()
+    mvp = proj @ view
+    mvp_inv = np.linalg.inv(mvp.astype(np.float64))
+
+    nx = 2.0 * (mx - vp_x) / vp_w - 1.0
+    ny = 1.0 - 2.0 * my / vp_h
+    near_h = mvp_inv @ np.array([nx, ny, -1, 1], dtype=np.float64)
+    far_h = mvp_inv @ np.array([nx, ny, 1, 1], dtype=np.float64)
+    near_pt = (near_h[:3] / near_h[3]).astype(np.float32)
+    far_pt = (far_h[:3] / far_h[3]).astype(np.float32)
+    ray_dir = far_pt - near_pt
+    ray_dir /= max(np.linalg.norm(ray_dir), 1e-8)
+
+    # Project points to screen, select within circle
+    pts_h = np.column_stack([pts_display, np.ones(len(pts_display))]).astype(np.float64)
+    clip = (mvp.astype(np.float64) @ pts_h.T).T
+    w = clip[:, 3]
+    valid_w = np.abs(w) > 1e-6
+    ndc_x = np.zeros(len(all_pts)); ndc_y = np.zeros(len(all_pts))
+    ndc_x[valid_w] = clip[valid_w, 0] / w[valid_w]
+    ndc_y[valid_w] = clip[valid_w, 1] / w[valid_w]
+    screen_x = (ndc_x + 1) * 0.5 * vp_w + vp_x
+    screen_y = (1 - ndc_y) * 0.5 * vp_h
+    screen_dist = np.sqrt((screen_x - mx) ** 2 + (screen_y - my) ** 2)
+    mask = valid_w & (screen_dist < circle_px)
+    neighborhood = all_pts[mask]
+
+    if len(neighborhood) < 10:
+        return None
+
+    centroid = neighborhood.mean(axis=0)
+    cov = (neighborhood - centroid).T @ (neighborhood - centroid)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    normal = eigvecs[:, 0].astype(np.float32)
+    normal /= max(np.linalg.norm(normal), 1e-8)
+
+    # Orient normal toward camera
+    cam_pos = camera.get_position()
+    R_scene_inv = R_scene.T
+    cam_pos_orig = R_scene_inv @ cam_pos
+    to_cam = cam_pos_orig - centroid
+    if np.dot(normal, to_cam) < 0:
+        normal = -normal
+
+    radius = float(np.linalg.norm(neighborhood - centroid, axis=1).mean()) * 1.5
+    radius = max(radius, 0.01)
+    if return_neighborhood:
+        return centroid, normal, radius, neighborhood
+    return centroid, normal, radius
+
+
+def _compute_align_rotation(floor_n, wall_n):
+    """Compute scene rotation (Euler XYZ degrees) from floor and/or wall normals.
+    Returns (rx, ry, rz) or None."""
+    from scipy.spatial.transform import Rotation as SciRot
+
+    if floor_n is not None and wall_n is not None:
+        Y = floor_n / max(np.linalg.norm(floor_n), 1e-8)
+        Z = wall_n - np.dot(wall_n, Y) * Y
+        Z /= max(np.linalg.norm(Z), 1e-8)
+        X = np.cross(Y, Z)
+        X /= max(np.linalg.norm(X), 1e-8)
+        R_new = np.array([X, Y, Z], dtype=np.float32)
+    elif floor_n is not None:
+        Y = floor_n / max(np.linalg.norm(floor_n), 1e-8)
+        # Z (forward) should be orthogonal to Y, close to world-Z
+        ref_fwd = np.array([0, 0, 1], dtype=np.float32)
+        if abs(np.dot(Y, ref_fwd)) > 0.9:
+            ref_fwd = np.array([1, 0, 0], dtype=np.float32)
+        Z = ref_fwd - np.dot(ref_fwd, Y) * Y
+        Z /= max(np.linalg.norm(Z), 1e-8)
+        X = np.cross(Y, Z)
+        X /= max(np.linalg.norm(X), 1e-8)
+        R_new = np.array([X, Y, Z], dtype=np.float32)
+    elif wall_n is not None:
+        Z = wall_n / max(np.linalg.norm(wall_n), 1e-8)
+        # Y should be as close to world-up as possible, orthogonal to Z
+        ref_up = np.array([0, 1, 0], dtype=np.float32)
+        if abs(np.dot(Z, ref_up)) > 0.9:
+            ref_up = np.array([1, 0, 0], dtype=np.float32)
+        Y = ref_up - np.dot(ref_up, Z) * Z  # project out Z component
+        Y /= max(np.linalg.norm(Y), 1e-8)
+        X = np.cross(Y, Z)
+        X /= max(np.linalg.norm(X), 1e-8)
+        R_new = np.array([X, Y, Z], dtype=np.float32)
+    else:
+        return None
+
+    euler = SciRot.from_matrix(R_new.astype(np.float64)).as_euler('xyz', degrees=True)
+    return (float(euler[0]), float(euler[1]), float(euler[2]))
+
+
 def _handle_align_click(state, scene_gl, camera, mx, my, window):
-    """Raycast from click, find surface points, fit plane, align display rotation."""
+    """Raycast from click, find surface points, fit plane, place anchor widget."""
     try:
         mode = state.align_mode
         state.align_mode = None
 
-        pts3d_list = state.pts3d_list
-        if pts3d_list is None:
+        result = _raycast_to_surface(state, camera, mx, my, window)
+        if result is None:
+            state.status = "Too few points — try a different spot"
             return
-        all_pts = np.concatenate([p.reshape(-1, 3) for p in pts3d_list], axis=0).astype(np.float32)
-        if len(all_pts) < 10:
-            return
+        centroid, normal, radius = result
 
-        # Build scene rotation matrix (must match rendering)
-        from scipy.spatial.transform import Rotation as SciRot
-        R_scene = SciRot.from_euler('xyz', [state.scene_rot_x, state.scene_rot_y, state.scene_rot_z],
-                                     degrees=True).as_matrix().astype(np.float32)
-
-        # Transform points to display space (same as shader)
-        pts_display = (R_scene @ all_pts.T).T
-
-        # Get viewport info
-        win_w, win_h = glfw.get_window_size(window)
-        vp_x = 400
-        vp_w = win_w - vp_x
-        vp_h = win_h
-        if vp_w <= 0 or vp_h <= 0:
-            return
-
-        # Unproject click to ray in display space
-        aspect = vp_w / max(vp_h, 1)
-        proj = camera.get_projection_matrix(aspect)
-        view = camera.get_view_matrix()
-        mvp = proj @ view
-        mvp_inv = np.linalg.inv(mvp.astype(np.float64))
-
-        # Normalize mouse to clip space [-1, 1]
-        nx = 2.0 * (mx - vp_x) / vp_w - 1.0
-        ny = 1.0 - 2.0 * my / vp_h
-
-        # Unproject near/far to get ray
-        near_h = mvp_inv @ np.array([nx, ny, -1, 1], dtype=np.float64)
-        far_h = mvp_inv @ np.array([nx, ny, 1, 1], dtype=np.float64)
-        near_pt = (near_h[:3] / near_h[3]).astype(np.float32)
-        far_pt = (far_h[:3] / far_h[3]).astype(np.float32)
-        ray_dir = far_pt - near_pt
-        ray_dir /= max(np.linalg.norm(ray_dir), 1e-8)
-
-        # Find nearest point to ray (in display space)
-        diff = pts_display - near_pt[None, :]
-        cross = np.cross(diff, ray_dir[None, :])
-        ray_dists = np.linalg.norm(cross, axis=-1)
-        nearest_idx = np.argmin(ray_dists)
-        hit_pt = all_pts[nearest_idx]  # in original space
-
-        # Select points that project within the circle radius (screen space)
-        circle_px = 40  # must match the visual circle
-        # Project all display-space points to screen
-        pts_h = np.column_stack([pts_display, np.ones(len(pts_display))]).astype(np.float64)
-        clip = (mvp.astype(np.float64) @ pts_h.T).T
-        w = clip[:, 3]
-        valid_w = np.abs(w) > 1e-6
-        ndc_x = np.zeros(len(all_pts)); ndc_y = np.zeros(len(all_pts))
-        ndc_x[valid_w] = clip[valid_w, 0] / w[valid_w]
-        ndc_y[valid_w] = clip[valid_w, 1] / w[valid_w]
-        screen_x = (ndc_x + 1) * 0.5 * vp_w + vp_x
-        screen_y = (1 - ndc_y) * 0.5 * vp_h
-        screen_dist = np.sqrt((screen_x - mx) ** 2 + (screen_y - my) ** 2)
-        mask = valid_w & (screen_dist < circle_px)
-        neighborhood = all_pts[mask]
-
-        print(f"  Click: ({mx:.0f},{my:.0f}), vp=({vp_x},{vp_w}x{vp_h})")
-        print(f"  Screen proj range: x=[{screen_x[valid_w].min():.0f}-{screen_x[valid_w].max():.0f}], y=[{screen_y[valid_w].min():.0f}-{screen_y[valid_w].max():.0f}]")
-        print(f"  Min screen dist: {screen_dist[valid_w].min():.1f}px, selected: {mask.sum()} points")
-
-        if len(neighborhood) < 10:
-            state.status = f"Too few points ({mask.sum()}) — try increasing radius"
-            return
-
-        # Fit plane via PCA on the neighborhood
-        centroid = neighborhood.mean(axis=0)
-        cov = (neighborhood - centroid).T @ (neighborhood - centroid)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        normal = eigvecs[:, 0].astype(np.float32)  # smallest eigenvalue = plane normal
-        normal /= max(np.linalg.norm(normal), 1e-8)
-
-        # Orient normal toward camera (surface faces viewer)
-        cam_pos = camera.get_position()
-        # Camera position is in display space, need to undo scene rotation
-        R_scene_inv = R_scene.T  # orthogonal, so inv = transpose
-        cam_pos_orig = R_scene_inv @ cam_pos
-        to_cam = cam_pos_orig - centroid
-        if np.dot(normal, to_cam) < 0:
-            normal = -normal
-
-        # Store the normal for this mode
+        # Store normal and anchor (no rotation applied yet — user clicks "Align")
+        anchor = {'pos': centroid.copy(), 'normal': normal.copy(), 'radius': radius}
         if mode == 'floor':
             state.align_floor_normal = normal.copy()
-            print(f"  Stored floor normal: {normal} ({len(neighborhood)} pts)")
-        else:
+            state.align_floor_anchor = anchor
+            state.status = "Floor anchor placed — click Align to apply"
+            print(f"  Floor anchor: normal={normal}, radius={radius:.4f}")
+        elif mode == 'wall':
             state.align_wall_normal = normal.copy()
-            print(f"  Stored wall normal: {normal} ({len(neighborhood)} pts)")
+            state.align_wall_anchor = anchor
+            state.status = "Wall anchor placed — click Align to apply"
+            print(f"  Wall anchor: normal={normal}, radius={radius:.4f}")
 
-        # Compute rotation from stored normals
-        floor_n = state.align_floor_normal
-        wall_n = state.align_wall_normal
-
-        if floor_n is not None and wall_n is not None:
-            # Both normals available — build full rotation from two constraints
-            # Y-axis = floor normal (up)
-            # Z-axis = wall normal (forward)
-            # X-axis = cross(Y, Z) (right)
-            Y = floor_n / max(np.linalg.norm(floor_n), 1e-8)
-            Z = wall_n - np.dot(wall_n, Y) * Y  # orthogonalize wall to floor
-            Z /= max(np.linalg.norm(Z), 1e-8)
-            X = np.cross(Y, Z)
-            X /= max(np.linalg.norm(X), 1e-8)
-
-            # R maps: X→[1,0,0], Y→[0,1,0], Z→[0,0,1]
-            # So R = [target_X | target_Y | target_Z]^T @ [X | Y | Z]
-            # Which is: columns of [X,Y,Z] become rows of R_new
-            R_new = np.array([X, Y, Z], dtype=np.float32)  # 3x3
-            print(f"  Full alignment from floor+wall normals")
-            state.status = f"Aligned floor+wall"
-
-        elif floor_n is not None:
-            # Only floor — align normal to Y-up
-            Y = floor_n / max(np.linalg.norm(floor_n), 1e-8)
-            # Pick an arbitrary X perpendicular to Y
-            if abs(Y[0]) < 0.9:
-                X = np.cross(Y, np.array([1, 0, 0], dtype=np.float32))
-            else:
-                X = np.cross(Y, np.array([0, 0, 1], dtype=np.float32))
-            X /= max(np.linalg.norm(X), 1e-8)
-            Z = np.cross(X, Y)
-            R_new = np.array([X, Y, Z], dtype=np.float32)
-            print(f"  Floor-only alignment")
-            state.status = f"Aligned floor — click wall to refine"
-
-        elif wall_n is not None:
-            # Only wall — align normal to Z-forward
-            Z = wall_n / max(np.linalg.norm(wall_n), 1e-8)
-            if abs(Z[1]) < 0.9:
-                Y = np.cross(Z, np.array([0, 1, 0], dtype=np.float32))
-                Y = np.cross(np.array([0, 1, 0], dtype=np.float32), Z)
-            else:
-                Y = np.cross(Z, np.array([1, 0, 0], dtype=np.float32))
-            Y /= max(np.linalg.norm(Y), 1e-8)
-            X = np.cross(Y, Z)
-            X /= max(np.linalg.norm(X), 1e-8)
-            R_new = np.array([X, Y, Z], dtype=np.float32)
-            print(f"  Wall-only alignment")
-            state.status = f"Aligned wall — click floor to refine"
-        else:
-            return
-
-        # Extract Euler XYZ (must match rendering convention)
-        euler = SciRot.from_matrix(R_new.astype(np.float64)).as_euler('xyz', degrees=True)
-        state.scene_rot_x = float(euler[0])
-        state.scene_rot_y = float(euler[1])
-        state.scene_rot_z = float(euler[2])
+        _update_align_widgets(state, scene_gl)
 
     except Exception as e:
         state.status = f"Alignment failed: {e}"
         import traceback; traceback.print_exc()
         state.align_mode = None
+
+
+def _handle_line_click(state, scene_gl, camera, mx, my, window):
+    """Handle clicks for horizontal/vertical line alignment tools."""
+    try:
+        result = _raycast_to_surface(state, camera, mx, my, window)
+        if result is None:
+            state.status = "No surface found — try a different spot"
+            return
+        centroid, normal, radius = result
+
+        if state.align_line_start is None:
+            # First click — store start point
+            state.align_line_start = centroid.copy()
+            state.align_line_start_screen = (mx, my)
+            state.status = f"Line start set — click end point"
+            return
+
+        # Second click — compute direction and apply alignment
+        start = state.align_line_start
+        end = centroid.copy()
+        direction = end - start
+        length = np.linalg.norm(direction)
+        if length < 1e-6:
+            state.status = "Points too close — try again"
+            state.align_line_start = None
+            state.align_line_start_screen = None
+            return
+        direction /= length
+
+        mode = state.align_line_mode
+
+        if mode == 'vline':
+            # This direction should be vertical (Y-up) — treat as floor normal constraint
+            # Floor normal is perpendicular to the line direction projected to horizontal
+            # Actually: vertical line means this direction IS the up direction
+            state.align_floor_normal = direction.astype(np.float32)
+            state.align_floor_anchor = {'pos': (start + end) / 2, 'normal': direction.astype(np.float32), 'radius': length / 2}
+            print(f"  Vertical line: direction={direction}")
+
+        elif mode == 'hline':
+            # This direction should be horizontal — use it to constrain wall/yaw
+            # If floor normal exists, project direction onto floor plane
+            floor_n = state.align_floor_normal
+            if floor_n is not None:
+                direction = direction - np.dot(direction, floor_n) * floor_n
+                d_len = np.linalg.norm(direction)
+                if d_len < 1e-6:
+                    state.status = "Line is parallel to floor normal"
+                    state.align_line_start = None
+                    state.align_line_start_screen = None
+                    return
+                direction /= d_len
+            # Use projected direction as wall normal (forward direction)
+            state.align_wall_normal = direction.astype(np.float32)
+            state.align_wall_anchor = {'pos': (start + end) / 2, 'normal': direction.astype(np.float32), 'radius': length / 2}
+            print(f"  Horizontal line: direction={direction}")
+
+        # Update widgets (no rotation applied yet — user clicks "Align")
+        _update_align_widgets(state, scene_gl)
+        state.status = f"{'V-Line' if mode == 'vline' else 'H-Line'} placed — click Align to apply"
+
+        # Reset line tool state
+        state.align_line_start = None
+        state.align_line_start_screen = None
+        state.align_line_mode = None
+
+    except Exception as e:
+        state.status = f"Line alignment failed: {e}"
+        import traceback; traceback.print_exc()
+        state.align_line_start = None
+        state.align_line_start_screen = None
+        state.align_line_mode = None
 
 
 def _align_to_cached_cameras(pts3d_list, cam_poses_c2w, cached_cameras):
@@ -2350,10 +2537,10 @@ def _run_smooth_preview(state, scene_gl):
 
 
 def run_bundle_adjust(state, scene_gl):
-    """Refine cameras via COLMAP bundle adjustment."""
+    """Refine cameras via depth-consistency optimization on pointmaps."""
     state.refine_progress = "Starting bundle adjustment..."
     try:
-        from mesh_export import bundle_adjust
+        from mesh_export import bundle_adjust_depth_consistency
         import torch
 
         scene = state.scene
@@ -2366,7 +2553,7 @@ def run_bundle_adjust(state, scene_gl):
             else np.array(scene.get_im_poses())
         c2w_list = [c2w_all[i].astype(np.float32) for i in range(len(c2w_all))]
 
-        # Extract intrinsics scaled to full resolution
+        # Extract pointmaps and intrinsics
         pts3d_list, confs_list = _extract_scene_data(state)
         K_list = []
         from PIL import Image as PILImage
@@ -2394,22 +2581,26 @@ def run_bundle_adjust(state, scene_gl):
         def progress(msg):
             state.refine_progress = msg
 
-        refined = bundle_adjust(
-            state.image_paths, c2w_list, K_list,
-            pts3d_list=pts3d_list, confs_list=confs_list,
-            imgs=scene.imgs, min_conf=state.min_conf,
+        refined = bundle_adjust_depth_consistency(
+            c2w_list, K_list, pts3d_list, confs_list,
+            image_paths=state.image_paths,
             refine_focal=state.ba_refine_focal,
-            refine_pp=state.ba_refine_pp,
+            n_iters=state.ba_n_iters,
+            min_conf=state.ba_min_conf,
+            max_shift=state.ba_max_shift,
+            huber_scale=state.ba_huber_scale,
             progress_fn=progress)
 
         if refined is None:
             state.status = "Bundle adjustment failed"
             return
 
-        # Write refined cameras back into the scene
+        # Save old cameras before updating (needed to transform pointmaps)
         n = len(refined)
+        old_c2w = [c2w_list[i].astype(np.float64) for i in range(n)]
+
+        # Write refined cameras back into the scene
         if is_vggt:
-            # Update VGGT extrinsics (w2c 3x4)
             for i in range(n):
                 c2w, K_new, W, H = refined[i]
                 w2c = np.linalg.inv(c2w.astype(np.float64))
@@ -2418,14 +2609,12 @@ def run_bundle_adjust(state, scene_gl):
                     scene._intrinsic[i][0, 0] = K_new[0, 0] * 518.0 / max(W, H)
                     scene._intrinsic[i][1, 1] = K_new[1, 1] * 518.0 / max(W, H)
         elif is_mast3r:
-            # MASt3R uses same pose representation as DUSt3R
             for i in range(n):
                 c2w, K_new, W, H = refined[i]
                 scene._set_pose(scene.im_poses, i,
                                 torch.tensor(c2w, dtype=torch.float32, device=scene.device),
                                 force=True)
         else:
-            # DUSt3R BasePCOptimizer / PairViewer
             if hasattr(scene, '_set_pose'):
                 for i in range(n):
                     c2w, K_new, W, H = refined[i]
@@ -2433,18 +2622,51 @@ def run_bundle_adjust(state, scene_gl):
                                     torch.tensor(c2w, dtype=torch.float32, device=scene.device),
                                     force=True)
             elif hasattr(scene, 'im_poses') and hasattr(scene.im_poses, 'data'):
-                # PairViewer — im_poses is directly 4x4 matrices
                 for i in range(n):
                     c2w, K_new, W, H = refined[i]
                     scene.im_poses.data[i] = torch.tensor(c2w, dtype=torch.float32)
 
-        # Invalidate cached point data so it re-extracts with new cameras
-        state.pts3d_list = None
-        state.confs_list = None
-        state.points_modified = False
+        # Transform pointmaps to match refined cameras.
+        # Pointmaps are in world space baked with the OLD cameras. After BA moves
+        # a camera, its points must follow: new_pt = new_c2w @ old_w2c @ old_pt
+        print("  Transforming pointmaps to match refined cameras...")
+        for i in range(min(n, len(pts3d_list))):
+            new_c2w = refined[i][0].astype(np.float64)
+            old_w2c = np.linalg.inv(old_c2w[i])
+            delta = new_c2w @ old_w2c  # maps old world -> new world
 
-        # Re-extract and display points with updated cameras
-        pts3d_list, confs_list = _extract_scene_data(state)
+            # Skip if camera barely moved (identity check)
+            if np.allclose(delta, np.eye(4), atol=1e-6):
+                continue
+
+            p = pts3d_list[i]
+            if p.ndim == 3:
+                H_m, W_m = p.shape[:2]
+                flat = p.reshape(-1, 3).astype(np.float64)
+                transformed = (delta[:3, :3] @ flat.T).T + delta[:3, 3]
+                pts3d_list[i] = transformed.reshape(H_m, W_m, 3).astype(np.float32)
+            elif p.ndim == 2:
+                flat = p.astype(np.float64)
+                transformed = (delta[:3, :3] @ flat.T).T + delta[:3, 3]
+                pts3d_list[i] = transformed.astype(np.float32)
+
+            # Update backend's internal pointmaps so COLMAP export stays consistent
+            if is_vggt and hasattr(scene, '_pts3d') and i < len(scene._pts3d):
+                scene._pts3d[i] = pts3d_list[i]
+            elif not is_vggt and not is_mast3r:
+                # DUSt3R: update internal pts3d tensor
+                pts3d_all = scene.get_pts3d()
+                if i < len(pts3d_all) and hasattr(pts3d_all[i], 'data'):
+                    pts3d_all[i].data.copy_(torch.tensor(pts3d_list[i],
+                                            dtype=pts3d_all[i].dtype,
+                                            device=pts3d_all[i].device))
+
+        # Cache the transformed pointmaps
+        state.pts3d_list = pts3d_list
+        state.confs_list = confs_list
+        state.points_modified = True
+
+        # Display points with updated cameras
         all_pts, all_cols = [], []
         for i in range(len(scene.imgs)):
             p = pts3d_list[i]
@@ -2809,7 +3031,8 @@ def run_dense_mesh(state, scene_gl):
 
             state.refine_progress = f"Meshing {len(pts):,d} points ({mesh_mode})..."
             if mesh_mode == 'delaunay':
-                verts, faces, colors = _mesh_local_delaunay(pts, cols, cam_center=cam_center)
+                verts, faces, colors = _mesh_local_delaunay(pts, cols, cam_center=cam_center,
+                                                           radius_mult=state.delaunay_edge_mult)
             else:
                 verts, faces, colors = _mesh_ball_pivot_from_cloud(pts, cols, cam_center=cam_center)
 
@@ -2827,7 +3050,8 @@ def run_dense_mesh(state, scene_gl):
                 poisson_depth=state.poisson_depth_val,
                 trim_percentile=state.poisson_trim,
                 dense_colors=getattr(state, '_dense_colors', None),
-                bp_radius_mult=state.bp_radius_mult)
+                bp_radius_mult=state.bp_radius_mult,
+                delaunay_edge_mult=state.delaunay_edge_mult)
 
         if len(faces) > 0:
             state.mesh_data = (verts, faces, colors)
@@ -4035,10 +4259,13 @@ def main():
         if imgui.get_io().want_capture_mouse:
             return
         if action == glfw.PRESS:
-            # Alignment click: cast ray and find plane
-            if state.align_mode and button == 0:
+            # Alignment / line tool click
+            if button == 0 and (state.align_mode or state.align_line_mode):
                 mx, my = glfw.get_cursor_pos(window)
-                _handle_align_click(state, scene_gl, camera, mx, my, window)
+                if state.align_line_mode:
+                    _handle_line_click(state, scene_gl, camera, mx, my, window)
+                else:
+                    _handle_align_click(state, scene_gl, camera, mx, my, window)
                 return
             # Double right-click: focus orbit on clicked point
             if button == 1:
@@ -4062,6 +4289,8 @@ def main():
 
     glfw.set_mouse_button_callback(window, mouse_button_callback)
     glfw.set_scroll_callback(window, scroll_callback)
+    # Note: don't install a key callback — it would override imgui's key handler
+    # and corrupt imgui state. Escape handling is done via polling in the main loop.
 
     while not glfw.window_should_close(window):
       try:
@@ -4073,6 +4302,18 @@ def main():
             continue
 
         impl.process_inputs()
+
+        # Escape key: cancel alignment tools (polled to avoid overriding imgui's key callback)
+        if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
+            if state.align_mode or state.align_line_mode:
+                if state.align_preview_rot:
+                    state.scene_rot_x, state.scene_rot_y, state.scene_rot_z = state.align_preview_rot
+                    state.align_preview_rot = None
+                state.align_mode = None
+                state.align_line_mode = None
+                state.align_line_start = None
+                state.align_line_start_screen = None
+                state.status = "Alignment cancelled"
 
         # Mouse drag for orbit/pan
         mx, my = glfw.get_cursor_pos(window)
@@ -4467,38 +4708,18 @@ def main():
         if state.scene is not None and state.has_points and not state.reconstructing and not state.refining:
             backend = state.backends[state.backend_idx]
             if backend in ('dust3r', 'mast3r', 'vggt', 'pow3r'):
-                _, state.ba_refine_focal = imgui.checkbox("Refine Focal Length##ba", state.ba_refine_focal)
+                _, state.ba_refine_focal = imgui.checkbox("Refine Focal##ba", state.ba_refine_focal)
                 imgui.same_line()
                 _, state.ba_refine_pp = imgui.checkbox("Refine PP##ba", state.ba_refine_pp)
+                _, state.ba_n_iters = imgui.slider_int("Iterations##ba", state.ba_n_iters, 50, 500)
+                _, state.ba_min_conf = imgui.slider_float("Min Conf##ba", state.ba_min_conf, 0.5, 10.0, "%.1f")
+                _, state.ba_max_shift = imgui.slider_float("Max Shift##ba", state.ba_max_shift, 0.05, 0.5, "%.2f")
+                _, state.ba_huber_scale = imgui.slider_float("Huber Scale##ba", state.ba_huber_scale, 0.01, 1.0, "%.2f")
                 if imgui.button("Bundle Adjust Cameras", width=-1):
                     state.refining = True
                     state.refine_thread = threading.Thread(
                         target=run_bundle_adjust, args=(state, scene_gl), daemon=True)
                     state.refine_thread.start()
-
-        # ── AI Depth Enhancement ──
-        if state.scene is not None and state.has_points and not state.reconstructing and not state.refining:
-            imgui.separator()
-            imgui.text("AI Depth Enhancement")
-            _, state.ai_depth_mix = imgui.slider_float(
-                "Detail Strength", state.ai_depth_mix, 0.0, 2.0,
-                format="%.2f")
-            _, state.ai_highpass_radius = imgui.slider_float(
-                "Highpass Radius", state.ai_highpass_radius, 1.0, 50.0,
-                format="%.1f px")
-
-            has_depthmaps = hasattr(state.scene, 'im_depthmaps')
-            if has_depthmaps:
-                _, state.ai_refine_poses = imgui.checkbox("Refine poses after injection", state.ai_refine_poses)
-                if state.ai_refine_poses:
-                    _, state.ai_pose_iters = imgui.input_int("Pose Iters", state.ai_pose_iters, 25, 50)
-                if imgui.button("Inject AI Depth (highpass blend)", width=-1):
-                    state.reconstructing = True
-                    state.recon_thread = threading.Thread(
-                        target=run_depth_injection, args=(state, scene_gl), daemon=True)
-                    state.recon_thread.start()
-            else:
-                imgui.text_colored("(Depth injection needs DUSt3R backend)", 0.7, 0.7, 0.3)
 
         imgui.separator()
 
@@ -4506,26 +4727,66 @@ def main():
         imgui.text("Display")
         _, state.draw_mode = imgui.combo("Mode##draw",
             state.draw_mode, ["Points", "Mesh", "Wireframe", "Normals", "Shaded", "Splats"])
+        _, state.show_cameras = imgui.checkbox("Show Cameras", state.show_cameras)
 
         # Scene orientation
         imgui.text("Orientation")
+        # Anchor indicators (clickable to remove)
         if state.align_floor_normal is not None:
             imgui.same_line()
-            imgui.text_colored("F", 0.3, 1.0, 0.3)
+            if imgui.small_button("F##rm_floor"):
+                state.align_floor_normal = None
+                state.align_floor_anchor = None
+                _update_align_widgets(state, scene_gl)
         if state.align_wall_normal is not None:
             imgui.same_line()
-            imgui.text_colored("W", 0.3, 0.7, 1.0)
-        if state.align_mode:
-            imgui.text_colored(f"Click on the {state.align_mode} to align", 1.0, 1.0, 0.3)
-            if imgui.button("Cancel"):
+            if imgui.small_button("W##rm_wall"):
+                state.align_wall_normal = None
+                state.align_wall_anchor = None
+                _update_align_widgets(state, scene_gl)
+
+        active_tool = state.align_mode or state.align_line_mode
+        if active_tool:
+            if state.align_line_mode:
+                if state.align_line_start is not None:
+                    imgui.text_colored("Click end point of line", 1.0, 1.0, 0.3)
+                else:
+                    label = "horizontal" if state.align_line_mode == 'hline' else "vertical"
+                    imgui.text_colored(f"Click start of {label} line", 1.0, 1.0, 0.3)
+            else:
+                imgui.text_colored(f"Click on the {state.align_mode} to align", 1.0, 1.0, 0.3)
+            if imgui.button("Cancel##align"):
                 state.align_mode = None
+                state.align_line_mode = None
+                state.align_line_start = None
+                state.align_line_start_screen = None
+                if state.align_preview_rot:
+                    state.scene_rot_x, state.scene_rot_y, state.scene_rot_z = state.align_preview_rot
+                    state.align_preview_rot = None
         else:
-            if imgui.button("Align Floor"):
+            if imgui.button("Floor"):
                 state.align_mode = 'floor'
             imgui.same_line()
-            if imgui.button("Align Wall"):
+            if imgui.button("Wall"):
                 state.align_mode = 'wall'
             imgui.same_line()
+            if imgui.button("H-Line"):
+                state.align_line_mode = 'hline'
+            imgui.same_line()
+            if imgui.button("V-Line"):
+                state.align_line_mode = 'vline'
+            has_anchors = state.align_floor_normal is not None or state.align_wall_normal is not None
+            if has_anchors:
+                if imgui.button("Align", width=-1):
+                    rot = _compute_align_rotation(state.align_floor_normal, state.align_wall_normal)
+                    if rot:
+                        state.scene_rot_x, state.scene_rot_y, state.scene_rot_z = rot
+                        parts = []
+                        if state.align_floor_normal is not None:
+                            parts.append("floor")
+                        if state.align_wall_normal is not None:
+                            parts.append("wall")
+                        state.status = f"Aligned: {' + '.join(parts)}"
             if imgui.button("Flip Up"):
                 state.scene_rot_x = (state.scene_rot_x + 180) % 360 - 180
             imgui.same_line()
@@ -4533,6 +4794,9 @@ def main():
                 state.scene_rot_x = state.scene_rot_y = state.scene_rot_z = 0.0
                 state.align_floor_normal = None
                 state.align_wall_normal = None
+                state.align_floor_anchor = None
+                state.align_wall_anchor = None
+                _update_align_widgets(state, scene_gl)
         imgui.separator()
 
         # ── Export ──
@@ -4589,6 +4853,10 @@ def main():
             _, state.bp_radius_mult = imgui.input_float("Radius Mult", state.bp_radius_mult, 0.5, 1.0)
             imgui.same_line()
             imgui.text_colored("(1=tight, 8=fill gaps)", 0.5, 0.5, 0.5)
+        if state.mesh_modes[state.mesh_mode_idx] == 'delaunay':
+            _, state.delaunay_edge_mult = imgui.slider_float("Radius##del", state.delaunay_edge_mult, 2.0, 30.0, format="%.1fx")
+            imgui.same_line()
+            imgui.text_colored("(higher=fill gaps)", 0.5, 0.5, 0.5)
         changed_smooth, state.use_smoothing = imgui.checkbox("Smooth Points", state.use_smoothing)
         if state.use_smoothing:
             imgui.same_line()
@@ -4876,6 +5144,7 @@ def main():
             mvp_scene = proj @ view @ scene_tf  # for point cloud / mesh / cameras
 
             mode = state.draw_modes[state.draw_mode]
+            scene_gl._show_cameras = state.show_cameras
             scene_gl.draw(mvp_base, mvp_scene, draw_mode=mode,
                           camera_pos=camera.get_position(),
                           view_matrix=view @ scene_tf,
@@ -4888,14 +5157,58 @@ def main():
         debug_imgs.flush()
         debug_imgs.draw_window("Debug Views")
 
-        # ── Align cursor circle ──
-        if state.align_mode:
+        # ── Align cursor overlay + hover preview ──
+        try:
+          if state.align_mode or state.align_line_mode:
             mx_cur, my_cur = glfw.get_cursor_pos(window)
-            if mx_cur > vp_x:  # only in viewport area
+            if mx_cur > vp_x and not imgui.get_io().want_capture_mouse:
                 draw_list = imgui.get_foreground_draw_list()
-                circle_px = 40  # fixed pixel radius on screen
-                draw_list.add_circle(mx_cur, my_cur, circle_px, imgui.get_color_u32_rgba(1, 1, 0, 0.8), 32, 2.0)
-                draw_list.add_circle_filled(mx_cur, my_cur, 3, imgui.get_color_u32_rgba(1, 1, 0, 1.0), 12)
+                if state.align_mode:
+                    # Circle cursor for floor/wall click
+                    circle_px = 40
+                    is_floor = state.align_mode == 'floor'
+                    color = imgui.get_color_u32_rgba(0.3, 1, 0.3, 0.8) if is_floor \
+                            else imgui.get_color_u32_rgba(0.3, 0.7, 1, 0.8)
+                    draw_list.add_circle(mx_cur, my_cur, circle_px, color, 32, 2.0)
+                    draw_list.add_circle_filled(mx_cur, my_cur, 3, color, 12)
+
+                    # Hover preview: show gizmo + highlighted points at cursor
+                    result = _raycast_to_surface(state, camera, mx_cur, my_cur, window,
+                                                 subsample=4, return_neighborhood=True)
+                    if result is not None:
+                        centroid, normal, radius, nbhood = result
+                        hover_color = (0.3, 1.0, 0.3) if is_floor else (0.3, 0.7, 1.0)
+                        hover_anchor = {'pos': centroid, 'normal': normal,
+                                        'radius': radius, 'color': hover_color}
+                        _update_align_widgets(state, scene_gl,
+                                              hover_anchor=hover_anchor,
+                                              hover_points=nbhood)
+                        state._had_hover_widget = True
+                    else:
+                        # No surface under cursor — show just the placed anchors
+                        _update_align_widgets(state, scene_gl)
+                        state._had_hover_widget = False
+
+                elif state.align_line_mode:
+                    # Crosshair cursor for line tools
+                    color = imgui.get_color_u32_rgba(0, 1, 1, 0.8) if state.align_line_mode == 'hline' \
+                            else imgui.get_color_u32_rgba(1, 0, 1, 0.8)
+                    size = 15
+                    draw_list.add_line(mx_cur - size, my_cur, mx_cur + size, my_cur, color, 2.0)
+                    draw_list.add_line(mx_cur, my_cur - size, mx_cur, my_cur + size, color, 2.0)
+
+                    # Rubber-band line from start point
+                    if state.align_line_start_screen is not None:
+                        sx, sy = state.align_line_start_screen
+                        draw_list.add_line(sx, sy, mx_cur, my_cur, color, 2.0)
+                        draw_list.add_circle_filled(sx, sy, 4, color, 8)
+          else:
+            # Not in align mode — clear any leftover hover widgets
+            if getattr(state, '_had_hover_widget', False):
+                _update_align_widgets(state, scene_gl)
+                state._had_hover_widget = False
+        except Exception:
+            pass  # never break the imgui frame from overlay drawing
 
         # ── Console Overlay ──
         if state.show_console:
@@ -4923,7 +5236,14 @@ def main():
         glfw.swap_buffers(window)
       except Exception as _frame_err:
         # Don't crash on a single bad frame — log and continue
-        print(f"  Frame error: {_frame_err}")
+        _err_str = str(_frame_err)
+        if 'Forgot to call Render' not in _err_str:
+            import traceback; traceback.print_exc()
+        # Try to end the frame cleanly so next new_frame() doesn't assert
+        try:
+            imgui.end_frame()
+        except Exception:
+            pass
         try:
             glfw.swap_buffers(window)
         except Exception:

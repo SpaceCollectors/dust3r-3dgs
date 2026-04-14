@@ -438,13 +438,13 @@ def train_surface_splats(
         depth_maps.append(torch.from_numpy(dm).float().to(device))
 
     # Initialize splats
-    print(f"  Initializing {len(points):,d} surface splats...")
+    print(f"  Initializing {len(points):,d} splats...")
     splats = init_surface_splats(points, normals, scolors, device)
     optimizers = create_optimizers(splats, scene_scale)
 
     # Compute max allowed scale from initial splat density
     init_knn = knn_distances(points, k=3)
-    max_scale_abs = float(np.median(init_knn) * 3.0)  # 3x median neighbor distance
+    max_scale_abs = float(np.median(init_knn) * 3.0)
     print(f"  Max splat scale: {max_scale_abs:.4f} (3x median KNN={np.median(init_knn):.4f})")
 
     # Store per-splat surface normals (not a parameter — fixed targets)
@@ -575,7 +575,6 @@ def train_surface_splats(
 
         # Clamp scales
         with torch.no_grad():
-            # Cap absolute scale: no splat larger than 3x the median neighbor distance
             splats['scales'].data.clamp_(min=-10.0, max=math.log(max_scale_abs))
 
         bg = torch.rand(3, device=device)
