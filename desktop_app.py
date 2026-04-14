@@ -985,6 +985,81 @@ def cleanup_temp_dirs():
 _tracked_tmpdirs = set()
 
 
+def _extract_video_frames(video_path, state):
+    """Extract frames from a video file into a temp directory."""
+    import cv2, tempfile
+
+    state.video_extracting = True
+    try:
+        # Use os.path.shortname workaround for non-ASCII paths on Windows
+        try:
+            cap = cv2.VideoCapture(video_path)
+        except Exception:
+            cap = cv2.VideoCapture()
+        if not cap.isOpened():
+            # Retry with short path on Windows for non-ASCII filenames
+            try:
+                import ctypes
+                buf = ctypes.create_unicode_buffer(512)
+                ctypes.windll.kernel32.GetShortPathNameW(video_path, buf, 512)
+                if buf.value:
+                    cap = cv2.VideoCapture(buf.value)
+            except Exception:
+                pass
+        if not cap.isOpened():
+            state.status = f"Failed to open video: {os.path.basename(video_path)}"
+            return []
+
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Determine frame step
+        if state.video_target_fps > 0:
+            step = max(1, int(round(video_fps / state.video_target_fps)))
+        else:
+            step = max(1, state.video_frame_interval)
+
+        max_frames = state.video_max_frames if state.video_max_frames > 0 else 999999
+        max_size = state.video_max_size if state.video_max_size > 0 else 999999
+        est_total = min(max_frames, total_frames // step)
+
+        tmpdir = _track_tmpdir(tempfile.mkdtemp(prefix="video_frames_"))
+
+        extracted = []
+        frame_idx = 0
+        saved = 0
+
+        while saved < max_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Resize if exceeds max size
+            h, w = frame.shape[:2]
+            longest = max(h, w)
+            if longest > max_size:
+                scale = max_size / longest
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+            # Use ASCII-only filenames and imencode to avoid Windows Unicode path issues
+            out_path = os.path.join(tmpdir, f"frame_{frame_idx:06d}.jpg")
+            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if ok:
+                with open(out_path, 'wb') as fout:
+                    fout.write(buf.tobytes())
+                extracted.append(out_path)
+                saved += 1
+
+            state.status = f"Extracting frame {saved}/{est_total}..."
+            frame_idx += step
+
+        cap.release()
+        return extracted
+    finally:
+        state.video_extracting = False
+
+
 class AppState:
     def __init__(self):
         self.show_console = False  # overlay console on viewport
@@ -993,10 +1068,18 @@ class AppState:
         self.image_paths = []
         self.image_dir = ""
 
+        # Video import settings
+        self.video_frame_interval = 10    # extract every Nth frame
+        self.video_target_fps = 0.0       # alternative: target FPS (0 = use interval mode)
+        self.video_max_frames = 100       # cap total extracted frames
+        self.video_max_size = 1920        # max frame size in pixels (longest edge)
+        self.video_extracting = False     # True while extraction thread runs
+
         # Backend
         self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap, 4=pow3r
         self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap', 'pow3r']
         self.cached_cameras = None  # reference cameras from first reconstruction (for alignment)
+        self.vggt_ensemble = False
 
         # Reconstruction
         self.scene = None
@@ -1128,6 +1211,10 @@ class AppState:
         self.stop_requested = False
         self.needs_recenter = False
 
+        # Camera POV cycling
+        self.cam_view_idx = -1   # -1 = free orbit, 0..N-1 = scene camera index
+        self.cam_view_name = ""  # displayed image name when viewing a scene camera
+
         # Status
         self.status = "Ready. Load images to begin."
         self.error_msg = ""
@@ -1168,53 +1255,107 @@ def run_reconstruction(state, scene_gl):
                 print(f"  Pre-masking failed: {e}, using original images")
 
         if backend == 'vggt':
-            from vggt.models.vggt import VGGT
-            from vggt.utils.load_fn import load_and_preprocess_images
-            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-            from vggt.utils.geometry import unproject_depth_map_to_point_map
+            use_ensemble = state.vggt_ensemble and len(state.image_paths) > 4
 
-            state.status = "Loading VGGT model..."
-            state.recon_frac = 0.1
-            model = _load_pretrained_cached(VGGT, "facebook/VGGT-1B").to('cuda')
-            model.eval()
+            if use_ensemble:
+                state.status = "Running VGGT ensemble..."
+                state.recon_frac = 0.1
+                from app import _reconstruct_vggt_ensemble
+                vggt_scene = _reconstruct_vggt_ensemble(state.image_paths)
+            else:
+                from vggt.models.vggt import VGGT
+                from vggt.utils.load_fn import load_and_preprocess_images
+                from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+                from vggt.utils.geometry import unproject_depth_map_to_point_map
 
-            state.status = "Running VGGT inference..."
-            state.recon_frac = 0.3
-            images = load_and_preprocess_images(state.image_paths).to('cuda')
-            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                state.status = "Loading VGGT model..."
+                state.recon_frac = 0.1
+                model = _load_pretrained_cached(VGGT, "facebook/VGGT-1B").to('cuda')
+                model.eval()
 
-            with torch.no_grad():
-                with torch.amp.autocast('cuda', dtype=dtype):
-                    predictions = model(images)
+                state.status = "Running VGGT inference..."
+                state.recon_frac = 0.3
+                images = load_and_preprocess_images(state.image_paths).to('cuda')
+                dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-            pose_enc = predictions["pose_enc"]
-            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-            depth_map = predictions["depth"].squeeze(0).cpu().numpy()
-            depth_conf = predictions["depth_conf"].squeeze(0).cpu().numpy()
-            extrinsic = extrinsic.squeeze(0).cpu().numpy()
-            intrinsic = intrinsic.squeeze(0).cpu().numpy()
+                # Register progress hooks on aggregator blocks
+                n_frame = len(model.aggregator.frame_blocks)
+                n_global = len(model.aggregator.global_blocks)
+                total_blocks = n_frame + n_global
+                block_counter = [0]
+                hooks = []
+                def _make_hook():
+                    def _hook(module, input, output):
+                        block_counter[0] += 1
+                        pct = block_counter[0] / total_blocks
+                        state.status = f"VGGT: block {block_counter[0]}/{total_blocks}"
+                        state.recon_frac = 0.3 + 0.4 * pct
+                    return _hook
+                for blk in model.aggregator.frame_blocks:
+                    hooks.append(blk.register_forward_hook(_make_hook()))
+                for blk in model.aggregator.global_blocks:
+                    hooks.append(blk.register_forward_hook(_make_hook()))
 
-            if depth_map.ndim == 3:
-                depth_map = depth_map[..., None]
-            state.status = "Unprojecting depth maps..."
-            state.recon_frac = 0.6
-            pts3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+                with torch.no_grad():
+                    with torch.amp.autocast('cuda', dtype=dtype):
+                        predictions = model(images)
 
-            imgs_np = images.cpu().numpy().transpose(0, 2, 3, 1)
+                for h in hooks:
+                    h.remove()
 
+                pose_enc = predictions["pose_enc"]
+                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+                depth_map = predictions["depth"].squeeze(0).cpu().numpy()
+                depth_conf = predictions["depth_conf"].squeeze(0).cpu().numpy()
+                extrinsic = extrinsic.squeeze(0).cpu().numpy()
+                intrinsic = intrinsic.squeeze(0).cpu().numpy()
+
+                if depth_map.ndim == 3:
+                    depth_map = depth_map[..., None]
+
+                pts3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+                imgs_np = images.cpu().numpy().transpose(0, 2, 3, 1)
+
+                from app import VGGTScene
+                from PIL import Image as PILImage
+                from PIL.ImageOps import exif_transpose
+                orig_sizes = []
+                for p in state.image_paths:
+                    im = exif_transpose(PILImage.open(p)).convert('RGB')
+                    orig_sizes.append(im.size)
+
+                imgs_list = []
+                pts3d_all = []
+                conf_all = []
+                for i in range(len(state.image_paths)):
+                    img_i = imgs_np[i]
+                    conf_i = depth_conf[i].copy()
+                    padding_mask = img_i.mean(axis=-1) > 0.95
+                    conf_i[padding_mask] = 0
+                    imgs_list.append(img_i)
+                    pts3d_all.append(pts3d[i])
+                    conf_all.append(conf_i)
+
+                vggt_scene = VGGTScene(imgs_list, extrinsic, intrinsic,
+                                       pts3d_all, conf_all, orig_sizes)
+
+                del model, predictions
+                torch.cuda.empty_cache()
+
+            # Extract point cloud from VGGTScene for display
             state.status = "Extracting point cloud..."
             state.recon_frac = 0.7
-            # Build simple scene data — filter out white padding pixels
             all_pts = []
             all_colors = []
-            for i in range(len(state.image_paths)):
-                conf_mask = depth_conf[i] > state.min_conf
-                # Mask out white padding from mixed aspect ratios
-                # Padding is white (1.0, 1.0, 1.0) — detect pixels where all channels > 0.95
-                not_padding = imgs_np[i].mean(axis=-1) < 0.95
+            for i in range(len(vggt_scene.imgs)):
+                p = vggt_scene._pts3d[i]
+                c = vggt_scene._depth_conf[i]
+                img = vggt_scene.imgs[i]
+                conf_mask = c > state.min_conf
+                not_padding = img.mean(axis=-1) < 0.95
                 mask = conf_mask & not_padding
-                all_pts.append(pts3d[i][mask])
-                all_colors.append((imgs_np[i][mask] * 255).astype(np.uint8))
+                all_pts.append(p[mask])
+                all_colors.append((img[mask] * 255).astype(np.uint8))
 
             if all_pts:
                 points = np.concatenate(all_pts, axis=0)
@@ -1227,43 +1368,18 @@ def run_reconstruction(state, scene_gl):
 
             state.status = "Building scene..."
             state.recon_frac = 0.85
-            # Build VGGTScene for downstream use (mesh gen, export)
-            from app import VGGTScene
-            from PIL import Image as PILImage
-            from PIL.ImageOps import exif_transpose
-            orig_sizes = []
-            for p in state.image_paths:
-                im = exif_transpose(PILImage.open(p)).convert('RGB')
-                orig_sizes.append(im.size)
+            state.scene = vggt_scene
 
-            # Zero out confidence for padding pixels so downstream ignores them
-            imgs_list = []
-            pts3d_all = []
-            conf_all = []
-            for i in range(len(state.image_paths)):
-                img_i = imgs_np[i]
-                conf_i = depth_conf[i].copy()
-                # Mark padding as zero confidence
-                padding_mask = img_i.mean(axis=-1) > 0.95
-                conf_i[padding_mask] = 0
-                imgs_list.append(img_i)
-                pts3d_all.append(pts3d[i])
-                conf_all.append(conf_i)
-            # VGGT cameras: extrinsic is w2c (3x4), invert to c2w
+            # Set camera visualizations
+            extrinsic = vggt_scene._extrinsic
             cam_poses = []
             for i in range(len(extrinsic)):
                 w2c_44 = np.eye(4, dtype=np.float32)
                 w2c_44[:3, :] = extrinsic[i]
                 cam_poses.append(np.linalg.inv(w2c_44))
-
-            state.scene = VGGTScene(imgs_list, extrinsic, intrinsic,
-                                    pts3d_all, conf_all, orig_sizes)
-            if cam_poses:
-                ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0)) if len(points) > 0 else 1.0
+            if cam_poses and len(points) > 0:
+                ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
                 scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
-
-            del model, predictions
-            torch.cuda.empty_cache()
 
         elif backend == 'pow3r':
             # Pow3R — run in subprocess to avoid module conflicts with mast3r's dust3r
@@ -4315,6 +4431,26 @@ def main():
                 state.align_line_start_screen = None
                 state.status = "Alignment cancelled"
 
+        # Left/Right arrows: cycle through scene camera POVs
+        if not imgui.get_io().want_capture_keyboard and state.cached_cameras:
+            n_cams = len(state.cached_cameras)
+            arrow_pressed = False
+            if glfw.get_key(window, glfw.KEY_RIGHT) == glfw.PRESS and not getattr(state, '_arrow_held', False):
+                state.cam_view_idx = (state.cam_view_idx + 1) % n_cams
+                arrow_pressed = True
+            elif glfw.get_key(window, glfw.KEY_LEFT) == glfw.PRESS and not getattr(state, '_arrow_held', False):
+                state.cam_view_idx = (state.cam_view_idx - 1) % n_cams
+                arrow_pressed = True
+            # Track key held state for single-step per press
+            state._arrow_held = (glfw.get_key(window, glfw.KEY_LEFT) == glfw.PRESS or
+                                 glfw.get_key(window, glfw.KEY_RIGHT) == glfw.PRESS)
+            if arrow_pressed and 0 <= state.cam_view_idx < n_cams:
+                idx = state.cam_view_idx
+                if idx < len(state.image_paths):
+                    state.cam_view_name = os.path.basename(state.image_paths[idx])
+                else:
+                    state.cam_view_name = f"Camera {idx}"
+
         # Mouse drag for orbit/pan
         mx, my = glfw.get_cursor_pos(window)
         dx, dy = mx - last_mouse[0], my - last_mouse[1]
@@ -4327,8 +4463,10 @@ def main():
         if not imgui.get_io().want_capture_mouse:
             if mouse_down[0]:  # Left = orbit
                 camera.orbit(dx, dy)
+                state.cam_view_idx = -1; state.cam_view_name = ""
             if mouse_down[1]:  # Right = pan
                 camera.pan(-dx, dy)
+                state.cam_view_idx = -1; state.cam_view_name = ""
             if mouse_down[2]:  # Middle = zoom
                 camera.zoom(-dy * 0.1)
 
@@ -4538,6 +4676,51 @@ def main():
                 else:
                     state.status = f"No new images (already have {len(state.image_paths)})"
 
+        if imgui.button("Import Video...") and not state.video_extracting:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            video_path = filedialog.askopenfilename(
+                title="Select Video File",
+                filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.flv *.wmv"),
+                           ("All files", "*.*")])
+            root.destroy()
+            if video_path:
+                state.status = f"Extracting frames from {os.path.basename(video_path)}..."
+                def _do_extract(vp=video_path):
+                    frames = _extract_video_frames(vp, state)
+                    if frames:
+                        existing = set(state.image_paths)
+                        new_files = [f for f in frames if f not in existing]
+                        state.image_paths = sorted(state.image_paths + new_files)
+                        state.image_dir = os.path.dirname(frames[0])
+                        state.status = f"Extracted {len(new_files)} frames from {os.path.basename(vp)} ({len(state.image_paths)} total)"
+                    else:
+                        state.status = "No frames extracted"
+                threading.Thread(target=_do_extract, daemon=True).start()
+
+        expanded, _ = imgui.collapsing_header("Video Settings")
+        if expanded:
+            mode_labels = ["Every Nth Frame", "Target FPS"]
+            current_mode = 1 if state.video_target_fps > 0 else 0
+            _, new_mode = imgui.combo("Extract Mode", current_mode, mode_labels)
+            if new_mode == 0 and state.video_target_fps > 0:
+                state.video_target_fps = 0.0
+            elif new_mode == 1 and state.video_target_fps <= 0:
+                state.video_target_fps = 2.0
+            if state.video_target_fps > 0:
+                _, state.video_target_fps = imgui.slider_float(
+                    "Target FPS", state.video_target_fps, 0.5, 30.0, "%.1f")
+            else:
+                _, state.video_frame_interval = imgui.input_int(
+                    "Frame Interval (N)", state.video_frame_interval, 1, 10)
+                state.video_frame_interval = max(1, state.video_frame_interval)
+            _, state.video_max_frames = imgui.input_int("Max Frames", state.video_max_frames, 10, 50)
+            state.video_max_frames = max(1, state.video_max_frames)
+            _, state.video_max_size = imgui.input_int("Max Size (px)", state.video_max_size, 64, 256)
+            state.video_max_size = max(128, state.video_max_size)
+
         if state.image_paths:
             imgui.text(f"  {len(state.image_paths)} images")
             imgui.text(f"  {state.image_dir}")
@@ -4653,6 +4836,9 @@ def main():
 
         if state.backends[state.backend_idx] == 'pow3r':
             _, state.niter1 = imgui.input_int("Iterations##pow3r", state.niter1, 50, 100)
+
+        if state.backends[state.backend_idx] == 'vggt':
+            _, state.vggt_ensemble = imgui.checkbox("Ensemble (merge overlapping bundles)", state.vggt_ensemble)
 
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
         _, state.mask_sky = imgui.checkbox("Mask Sky", state.mask_sky)
@@ -5129,8 +5315,6 @@ def main():
 
         if vp_w > 0 and vp_h > 0:
             aspect = vp_w / vp_h
-            view = camera.get_view_matrix()
-            proj = camera.get_projection_matrix(aspect)
             # Scene orientation transform
             def _rot_matrix(rx, ry, rz):
                 from scipy.spatial.transform import Rotation as _R
@@ -5140,16 +5324,45 @@ def main():
                 return m
 
             scene_tf = _rot_matrix(state.scene_rot_x, state.scene_rot_y, state.scene_rot_z)
+
+            # Camera POV mode: use full c2w matrix (preserves roll)
+            if (state.cam_view_idx >= 0 and state.cached_cameras
+                    and state.cam_view_idx < len(state.cached_cameras)):
+                c2w_raw = state.cached_cameras[state.cam_view_idx][0]
+                K = state.cached_cameras[state.cam_view_idx][1]
+                H = state.cached_cameras[state.cam_view_idx][3]
+                # Convert DUSt3R convention (Y-down, Z-forward) to OpenGL (Y-up, Z-backward)
+                gl_from_cv = np.diag([1, -1, -1, 1]).astype(np.float32)
+                c2w_world = scene_tf @ c2w_raw.astype(np.float32)
+                view = (gl_from_cv @ np.linalg.inv(c2w_world)).astype(np.float32)
+                cam_fov = float(np.degrees(2 * np.arctan(H / (2 * K[1, 1]))))
+                cam_pos = c2w_world[:3, 3]
+                # Build projection from camera intrinsics FOV
+                near, far = 0.01, 10000.0
+                f = 1.0 / math.tan(math.radians(cam_fov) / 2.0)
+                proj = np.zeros((4, 4), dtype=np.float32)
+                proj[0, 0] = f / aspect
+                proj[1, 1] = f
+                proj[2, 2] = (far + near) / (near - far)
+                proj[2, 3] = 2 * far * near / (near - far)
+                proj[3, 2] = -1.0
+                fov_y = math.radians(cam_fov)
+            else:
+                view = camera.get_view_matrix()
+                proj = camera.get_projection_matrix(aspect)
+                cam_pos = camera.get_position()
+                fov_y = math.radians(camera.fov)
+
             mvp_base = proj @ view            # for grid + axes (fixed)
             mvp_scene = proj @ view @ scene_tf  # for point cloud / mesh / cameras
 
             mode = state.draw_modes[state.draw_mode]
             scene_gl._show_cameras = state.show_cameras
             scene_gl.draw(mvp_base, mvp_scene, draw_mode=mode,
-                          camera_pos=camera.get_position(),
+                          camera_pos=cam_pos,
                           view_matrix=view @ scene_tf,
                           proj_matrix=proj,
-                          fov_y=math.radians(camera.fov))
+                          fov_y=fov_y)
 
         gl.glDisable(gl.GL_SCISSOR_TEST)
 
@@ -5209,6 +5422,21 @@ def main():
                 state._had_hover_widget = False
         except Exception:
             pass  # never break the imgui frame from overlay drawing
+
+        # ── Camera POV overlay ──
+        if state.cam_view_name and state.cam_view_idx >= 0:
+            try:
+                draw_list = imgui.get_foreground_draw_list()
+                label = f"[{state.cam_view_idx + 1}/{len(state.cached_cameras)}] {state.cam_view_name}"
+                text_color = imgui.get_color_u32_rgba(1.0, 1.0, 0.3, 1.0)
+                bg_color = imgui.get_color_u32_rgba(0, 0, 0, 0.6)
+                tx = vp_x + 10
+                ty = 10
+                # Background rect
+                draw_list.add_rect_filled(tx - 4, ty - 2, tx + len(label) * 8 + 4, ty + 18, bg_color, 4)
+                draw_list.add_text(tx, ty, text_color, label)
+            except Exception:
+                pass
 
         # ── Console Overlay ──
         if state.show_console:

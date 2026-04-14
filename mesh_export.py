@@ -1095,23 +1095,43 @@ def densify_colmap(image_paths, c2w_list=None, K_list=None, progress_fn=None,
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _rotvec_to_matrix_batch(rvecs):
+    """Convert batch of rotation vectors (N,3) to rotation matrices (N,3,3) via Rodrigues."""
+    import torch
+    N = rvecs.shape[0]
+    theta = torch.norm(rvecs, dim=1, keepdim=True).clamp(min=1e-8)  # (N,1)
+    k = rvecs / theta  # (N,3)
+    K = torch.zeros(N, 3, 3, device=rvecs.device, dtype=rvecs.dtype)
+    K[:, 0, 1] = -k[:, 2]; K[:, 0, 2] = k[:, 1]
+    K[:, 1, 0] = k[:, 2];  K[:, 1, 2] = -k[:, 0]
+    K[:, 2, 0] = -k[:, 1]; K[:, 2, 1] = k[:, 0]
+    eye = torch.eye(3, device=rvecs.device, dtype=rvecs.dtype).unsqueeze(0)
+    sin_t = torch.sin(theta).unsqueeze(-1)  # (N,1,1)
+    cos_t = torch.cos(theta).unsqueeze(-1)
+    return eye + sin_t * K + (1 - cos_t) * (K @ K)
+
+
 def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
                                     image_paths=None,
                                     refine_focal=False, stride=4, min_conf=2.0,
                                     n_iters=200, max_shift=0.2, huber_scale=0.1,
                                     progress_fn=None):
-    """Bundle adjustment via multi-view depth consistency.
+    """Bundle adjustment via multi-view depth consistency (GPU-accelerated).
 
     For each pair of overlapping cameras, projects camera A's pointmap into
     camera B's image and compares depths. Optimizes pose (6 DOF) + optional
     focal length (1 DOF) per camera to minimize depth disagreement.
 
     No feature matching needed — works directly on the pointmaps.
+    Uses PyTorch autograd on GPU for fast optimization.
 
     Returns list of refined (c2w, K, W, H) per image, or None on failure.
     """
-    from scipy.optimize import least_squares
+    import torch
     from scipy.spatial.transform import Rotation
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"  Depth-consistency BA: using {device}")
 
     n_imgs = len(c2w_list)
     if n_imgs < 2:
@@ -1124,11 +1144,9 @@ def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
         print("  Depth-consistency BA: preparing data...")
 
         # Subsample pointmaps for speed
-        # pts3d_list[i] is (H, W, 3) in world space, confs_list[i] is (H, W)
-        cam_pts = []   # world-space 3D points per camera (N_i, 3)
-        cam_confs = []  # confidence per point
-        cam_pixels = []  # pixel coords (u, v) in model resolution
-        cam_HW = []     # (H, W) of each pointmap
+        cam_pts = []
+        cam_confs = []
+        cam_HW = []
 
         for i in range(n_imgs):
             p = pts3d_list[i]
@@ -1137,47 +1155,38 @@ def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
                 print(f"  Skipping camera {i}: pointmap not (H,W,3)")
                 cam_pts.append(None)
                 cam_confs.append(None)
-                cam_pixels.append(None)
                 cam_HW.append((0, 0))
                 continue
 
             H, W = p.shape[:2]
             cam_HW.append((H, W))
 
-            # Subsample with stride
             ys = np.arange(0, H, stride)
             xs = np.arange(0, W, stride)
             yy, xx = np.meshgrid(ys, xs, indexing='ij')
-            yy = yy.ravel()
-            xx = xx.ravel()
+            yy, xx = yy.ravel(), xx.ravel()
 
-            pts = p[yy, xx]  # (N, 3)
+            pts = p[yy, xx]
             conf = c.reshape(H, W)[yy, xx] if c is not None else np.ones(len(yy), dtype=np.float32) * 10
-            pixels = np.stack([xx.astype(np.float64), yy.astype(np.float64)], axis=1)  # (N, 2) as (u, v)
 
-            # Filter by confidence and valid points
             valid = (conf > min_conf) & np.isfinite(pts).all(axis=1)
             cam_pts.append(pts[valid].astype(np.float64))
             cam_confs.append(conf[valid].astype(np.float64))
-            cam_pixels.append(pixels[valid])
 
-        # Build overlapping pairs: project A's points into B, check how many land inside
+        # Scale intrinsics to model resolution
         if progress_fn:
             progress_fn("BA: Finding overlapping pairs...")
         print("  Finding overlapping camera pairs...")
 
-        # Scale intrinsics to model resolution for projection/indexing into pointmaps.
-        # The caller may pass full-resolution K but pointmaps are at model resolution.
         K_f64 = []
-        K_full = [K.astype(np.float64) for K in K_list]  # keep originals for output
+        K_full = [K.astype(np.float64) for K in K_list]
         for i in range(n_imgs):
             K = K_list[i].astype(np.float64).copy()
             H_m, W_m = cam_HW[i]
             if H_m > 0 and W_m > 0:
-                # Detect scale: if principal point is far from model center, K is at full res
                 cx, cy = K[0, 2], K[1, 2]
                 if cx > W_m * 1.5 or cy > H_m * 1.5:
-                    sx = W_m / (2.0 * cx)  # cx ≈ W_full/2, so sx ≈ W_m/W_full
+                    sx = W_m / (2.0 * cx)
                     sy = H_m / (2.0 * cy)
                     K[0, 0] *= sx; K[0, 2] = W_m / 2.0
                     K[1, 1] *= sy; K[1, 2] = H_m / 2.0
@@ -1187,8 +1196,9 @@ def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
             K_f64.append(K)
         w2c_init = [np.linalg.inv(c2w.astype(np.float64)) for c2w in c2w_list]
 
-        pairs = []  # (i, j) pairs with overlap
-        pair_data = []  # precomputed data per pair
+        # Build overlapping pairs
+        pairs = []
+        pair_data = []
 
         for i in range(n_imgs):
             if cam_pts[i] is None or len(cam_pts[i]) == 0:
@@ -1197,39 +1207,30 @@ def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
                 if i == j or cam_pts[j] is None or len(cam_pts[j]) == 0:
                     continue
 
-                # Project camera i's points into camera j
-                pts_w = cam_pts[i]  # (N, 3) world space
+                pts_w = cam_pts[i]
                 H_j, W_j = cam_HW[j]
 
-                # Transform to camera j space
                 p_cam = (w2c_init[j][:3, :3] @ pts_w.T).T + w2c_init[j][:3, 3]
                 depth_proj = p_cam[:, 2]
 
-                # Project to pixel coords in j
                 u_proj = K_f64[j][0, 0] * p_cam[:, 0] / p_cam[:, 2] + K_f64[j][0, 2]
                 v_proj = K_f64[j][1, 1] * p_cam[:, 1] / p_cam[:, 2] + K_f64[j][1, 2]
 
-                # Check which points land inside j's image and are in front
                 inside = ((depth_proj > 0.01) &
                           (u_proj >= 0) & (u_proj < W_j) &
                           (v_proj >= 0) & (v_proj < H_j))
 
-                n_overlap = inside.sum()
-                if n_overlap < 20:
+                if inside.sum() < 20:
                     continue
 
-                # For overlapping points, get camera j's depth at those pixel locations
-                # Use nearest-neighbor lookup into j's pointmap
                 u_int = np.clip(u_proj[inside].astype(int), 0, W_j - 1)
                 v_int = np.clip(v_proj[inside].astype(int), 0, H_j - 1)
 
-                # Camera j's points at those pixels, transformed to j's camera space
-                pts_j_world = pts3d_list[j][v_int, u_int]  # (M, 3)
+                pts_j_world = pts3d_list[j][v_int, u_int]
                 p_j_cam = (w2c_init[j][:3, :3] @ pts_j_world.astype(np.float64).T).T + w2c_init[j][:3, 3]
                 depth_j = p_j_cam[:, 2]
                 depth_i_in_j = depth_proj[inside]
 
-                # Filter: both depths positive, j's confidence at those pixels
                 conf_j_at = confs_list[j].reshape(H_j, W_j)[v_int, u_int].astype(np.float64)
                 conf_i_at = cam_confs[i][inside]
                 valid = (depth_j > 0.01) & (depth_i_in_j > 0.01) & (conf_j_at > min_conf)
@@ -1237,15 +1238,14 @@ def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
                 if valid.sum() < 10:
                     continue
 
-                # Store indices of i's points that overlap with j
                 inside_idx = np.where(inside)[0]
                 overlap_idx = inside_idx[valid]
                 weights = np.sqrt(conf_i_at[valid] * conf_j_at[valid])
 
                 pairs.append((i, j))
                 pair_data.append({
-                    'pts_i_idx': overlap_idx,  # indices into cam_pts[i]
-                    'pix_j': np.stack([u_int[valid], v_int[valid]], axis=1),  # pixel coords in j
+                    'pts_i_idx': overlap_idx,
+                    'pix_j': np.stack([u_int[valid], v_int[valid]], axis=1),
                     'weights': weights,
                 })
                 print(f"    Pair ({i}->{j}): {valid.sum()} overlapping points")
@@ -1257,153 +1257,163 @@ def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
         total_overlaps = sum(len(pd['weights']) for pd in pair_data)
         print(f"  {len(pairs)} directed pairs, {total_overlaps} overlap points")
 
-        # Pack camera parameters: 6 per camera (rvec + tvec), optionally +1 focal
-        if progress_fn:
-            progress_fn("BA: Optimizing cameras...")
-        print("  Optimizing camera poses via depth consistency...")
-
-        params_per_cam = 7 if refine_focal else 6
-        x0 = np.zeros(n_imgs * params_per_cam)
-
-        for i in range(n_imgs):
-            rvec = Rotation.from_matrix(w2c_init[i][:3, :3]).as_rotvec()
-            tvec = w2c_init[i][:3, 3]
-            off = i * params_per_cam
-            x0[off:off + 3] = rvec
-            x0[off + 3:off + 6] = tvec
-            if refine_focal:
-                x0[off + 6] = K_f64[i][0, 0]
-
-        # Compute scene scale for bounds
-        all_centers = np.array([c2w_list[i][:3, 3].astype(np.float64) for i in range(n_imgs)])
-        scene_scale = max(np.linalg.norm(all_centers.max(0) - all_centers.min(0)), 1e-3)
-
-        # Normalize weights: mean=1 so cost is interpretable regardless of scene
+        # Normalize weights
         all_weights = np.concatenate([pd['weights'] for pd in pair_data])
         w_mean = max(all_weights.mean(), 1e-8)
         for pd in pair_data:
             pd['weights'] = pd['weights'] / w_mean
 
-        # Best-solution tracking for early stopping
-        best_state = {'cost': np.inf, 'x': x0.copy(), 'eval': 0}
-        n_eval = [0]
+        # Initialize parameters on GPU as packed tensors
+        if progress_fn:
+            progress_fn("BA: Optimizing cameras (GPU)...")
+        print("  Optimizing camera poses via depth consistency (GPU)...")
 
-        def residuals(x):
-            res_list = []
+        init_rv = np.stack([Rotation.from_matrix(w2c_init[i][:3, :3]).as_rotvec() for i in range(n_imgs)])
+        init_tv = np.stack([w2c_init[i][:3, 3] for i in range(n_imgs)])
 
-            for pi, (i, j) in enumerate(pairs):
-                pd = pair_data[pi]
-                pts_w = cam_pts[i][pd['pts_i_idx']]  # (M, 3) world space
+        rvecs = torch.tensor(init_rv, dtype=torch.float32, device=device, requires_grad=True)  # (C,3)
+        tvecs = torch.tensor(init_tv, dtype=torch.float32, device=device, requires_grad=True)  # (C,3)
+        rv0 = torch.tensor(init_rv, dtype=torch.float32, device=device)
+        tv0 = torch.tensor(init_tv, dtype=torch.float32, device=device)
 
-                # Camera j's current w2c
-                off_j = j * params_per_cam
-                R_j = Rotation.from_rotvec(x[off_j:off_j + 3]).as_matrix()
-                t_j = x[off_j + 3:off_j + 6]
+        focal_param = None
+        f0_tensor = None
+        if refine_focal:
+            f0_np = np.array([K_f64[i][0, 0] for i in range(n_imgs)], dtype=np.float32)
+            focal_param = torch.tensor(f0_np, dtype=torch.float32, device=device, requires_grad=True)
+            f0_tensor = torch.tensor(f0_np, dtype=torch.float32, device=device)
 
-                # Project i's points into j's camera
-                p_cam_j = (R_j @ pts_w.T).T + t_j  # (M, 3)
-                depth_i_in_j = p_cam_j[:, 2]
-
-                # Camera j's own points at the overlap pixels
-                pix_j = pd['pix_j']  # (M, 2) as (u, v)
-                pts_j_w = pts3d_list[j][pix_j[:, 1], pix_j[:, 0]].astype(np.float64)
-                p_j_cam = (R_j @ pts_j_w.T).T + t_j
-                depth_j = p_j_cam[:, 2]
-
-                # Depth ratio residual: log(depth_i / depth_j)
-                # Using log makes it scale-invariant and symmetric
-                valid = (depth_i_in_j > 0.01) & (depth_j > 0.01)
-                ratio = np.where(valid, depth_i_in_j / depth_j, 1.0)
-                log_ratio = np.where(valid, np.log(ratio), 0.0)
-
-                res_list.append(log_ratio * pd['weights'])
-
-            res = np.concatenate(res_list)
-            cost = np.sum(res ** 2)
-
-            n_eval[0] += 1
-
-            # Track best solution
-            if cost < best_state['cost']:
-                best_state['cost'] = cost
-                best_state['x'] = x.copy()
-                best_state['eval'] = n_eval[0]
-
-            if n_eval[0] % 20 == 0:
-                print(f"    iter {n_eval[0]}: cost={cost:.4f} (best={best_state['cost']:.4f})")
-                if progress_fn:
-                    progress_fn(f"BA: iter {n_eval[0]}, cost={cost:.4f}")
-
-            return res
-
-        # Set bounds: tight bounds prevent divergence
-        lb = np.full_like(x0, -np.inf)
-        ub = np.full_like(x0, np.inf)
+        # Compute bounds
+        all_centers = np.array([c2w_list[i][:3, 3].astype(np.float64) for i in range(n_imgs)])
+        scene_scale = max(np.linalg.norm(all_centers.max(0) - all_centers.min(0)), 1e-3)
         max_t_shift = scene_scale * max_shift
-        max_r_shift = np.radians(max_shift * 75)  # scale rotation proportionally
-        for i in range(n_imgs):
-            off = i * params_per_cam
-            lb[off:off + 3] = x0[off:off + 3] - max_r_shift
-            ub[off:off + 3] = x0[off:off + 3] + max_r_shift
-            lb[off + 3:off + 6] = x0[off + 3:off + 6] - max_t_shift
-            ub[off + 3:off + 6] = x0[off + 3:off + 6] + max_t_shift
+        max_r_shift = np.radians(max_shift * 75)
 
-        initial_cost = np.sum(residuals(x0) ** 2)
-        print(f"  Initial cost: {initial_cost:.4f}")
-        print(f"  Scene scale: {scene_scale:.4f}, max translation shift: {max_t_shift:.4f}")
+        # Batch all pair data into flat tensors for GPU parallelism
+        # For each pair (i->j), we have M overlap points.
+        # We concatenate all points and store which camera j they belong to.
+        all_pts_i = []    # world points from camera i
+        all_pts_j = []    # world points from camera j at overlap pixels
+        all_weights = []
+        all_j_idx = []    # camera j index for each point (for batched rotation lookup)
 
-        result = least_squares(residuals, x0, method='trf',
-                               bounds=(lb, ub),
-                               loss='huber', f_scale=huber_scale,
-                               max_nfev=n_iters, verbose=0)
+        for pi, (i, j) in enumerate(pairs):
+            pd = pair_data[pi]
+            pts_i_w = cam_pts[i][pd['pts_i_idx']].astype(np.float32)
+            pix_j = pd['pix_j']
+            pts_j_w = pts3d_list[j][pix_j[:, 1], pix_j[:, 0]].astype(np.float32)
+            w = pd['weights'].astype(np.float32)
+            M = len(w)
 
-        # Use the best solution seen, not the final one (optimizer can overshoot)
-        final_cost_raw = np.sum(result.fun ** 2)
-        if best_state['cost'] < final_cost_raw:
-            print(f"  Using best solution from iter {best_state['eval']} "
-                  f"(cost={best_state['cost']:.4f} vs final={final_cost_raw:.4f})")
-            result_x = best_state['x']
-            final_cost = best_state['cost']
-        else:
-            result_x = result.x
-            final_cost = final_cost_raw
+            all_pts_i.append(pts_i_w)
+            all_pts_j.append(pts_j_w)
+            all_weights.append(w)
+            all_j_idx.append(np.full(M, j, dtype=np.int64))
 
-        print(f"  Final cost: {final_cost:.4f} ({result.message})")
+        all_pts_i = torch.tensor(np.concatenate(all_pts_i), dtype=torch.float32, device=device)   # (T,3)
+        all_pts_j = torch.tensor(np.concatenate(all_pts_j), dtype=torch.float32, device=device)   # (T,3)
+        all_weights_t = torch.tensor(np.concatenate(all_weights), dtype=torch.float32, device=device) # (T,)
+        all_j_idx_t = torch.tensor(np.concatenate(all_j_idx), dtype=torch.int64, device=device)    # (T,)
 
-        if final_cost > initial_cost * 0.95:
+        T = all_pts_i.shape[0]
+        print(f"  Batched {T} overlap points from {len(pairs)} pairs onto {device}")
+
+        # Optimizer
+        opt_params = [rvecs, tvecs]
+        if refine_focal:
+            opt_params.append(focal_param)
+        optimizer = torch.optim.Adam(opt_params, lr=1e-3)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters, eta_min=1e-5)
+
+        best_cost = float('inf')
+        best_rvecs = rvecs.detach().clone()
+        best_tvecs = tvecs.detach().clone()
+        best_focal = focal_param.detach().clone() if refine_focal else None
+        best_iter = 0
+        initial_cost = None
+
+        for it in range(n_iters):
+            optimizer.zero_grad()
+
+            # Batch Rodrigues: all cameras at once -> (C,3,3)
+            R_all = _rotvec_to_matrix_batch(rvecs)
+
+            # Gather per-point rotation and translation by j index
+            R_j = R_all[all_j_idx_t]       # (T,3,3)
+            t_j = tvecs[all_j_idx_t]       # (T,3)
+
+            # Batched rotation + translation: p_cam = R @ pts + t
+            depth_i = torch.bmm(R_j, all_pts_i.unsqueeze(-1)).squeeze(-1)[:, 2] + t_j[:, 2]
+            depth_j = torch.bmm(R_j, all_pts_j.unsqueeze(-1)).squeeze(-1)[:, 2] + t_j[:, 2]
+
+            # Log depth ratio with Huber
+            safe_di = torch.clamp(depth_i, min=0.01)
+            safe_dj = torch.clamp(depth_j, min=0.01)
+            residuals = torch.log(safe_di / safe_dj) * all_weights_t
+
+            total_loss = torch.nn.functional.huber_loss(
+                residuals, torch.zeros_like(residuals),
+                reduction='sum', delta=huber_scale)
+
+            total_loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            # Clamp parameters to bounds (vectorized)
+            with torch.no_grad():
+                rvecs.data.clamp_(rv0 - max_r_shift, rv0 + max_r_shift)
+                tvecs.data.clamp_(tv0 - max_t_shift, tv0 + max_t_shift)
+
+            cost_val = total_loss.item()
+            if initial_cost is None:
+                initial_cost = cost_val
+
+            if cost_val < best_cost:
+                best_cost = cost_val
+                best_rvecs = rvecs.detach().clone()
+                best_tvecs = tvecs.detach().clone()
+                if refine_focal:
+                    best_focal = focal_param.detach().clone()
+                best_iter = it
+
+            if it % 20 == 0 or it == n_iters - 1:
+                print(f"    iter {it}: cost={cost_val:.4f} (best={best_cost:.4f})")
+                if progress_fn:
+                    progress_fn(f"BA: iter {it}/{n_iters}, cost={cost_val:.4f}")
+
+        print(f"  Best at iter {best_iter}: cost={best_cost:.4f}")
+
+        if best_cost > initial_cost * 0.95:
             print("  BA did not improve enough — keeping original cameras")
             return None
 
-        # Extract refined cameras, reject any that moved too far
+        # Extract refined cameras
         refined = []
-        reject_threshold = max_t_shift * 0.75  # reject cameras that used >75% of the allowed shift
+        reject_threshold = max_t_shift * 0.75
+        best_rv_np = best_rvecs.cpu().numpy().astype(np.float64)
+        best_tv_np = best_tvecs.cpu().numpy().astype(np.float64)
         for i in range(n_imgs):
-            off = i * params_per_cam
-            R = Rotation.from_rotvec(result_x[off:off + 3]).as_matrix()
-            t = result_x[off + 3:off + 6]
+            rv = best_rv_np[i]
+            tv = best_tv_np[i]
 
-            # Check how far this camera moved
-            t_shift = np.linalg.norm(t - x0[off + 3:off + 6])
-            r_shift = np.linalg.norm(result_x[off:off + 3] - x0[off:off + 3])
+            t_shift = np.linalg.norm(tv - init_tv[i])
             if t_shift > reject_threshold:
                 print(f"    Camera {i}: translation shift {t_shift:.4f} exceeds threshold "
                       f"{reject_threshold:.4f} — keeping original")
-                # Use original pose
-                R = Rotation.from_rotvec(x0[off:off + 3]).as_matrix()
-                t = x0[off + 3:off + 6]
+                rv = init_rv[i]
+                tv = init_tv[i]
             elif t_shift > reject_threshold * 0.5:
                 print(f"    Camera {i}: translation shift {t_shift:.4f} (large)")
 
+            R = Rotation.from_rotvec(rv).as_matrix()
             w2c = np.eye(4)
             w2c[:3, :3] = R
-            w2c[:3, 3] = t
+            w2c[:3, 3] = tv
             c2w = np.linalg.inv(w2c).astype(np.float32)
 
-            # Return full-resolution K (K_full), not model-resolution K_f64
             K_out = K_full[i].copy()
             if refine_focal:
-                # Optimized focal is at model resolution; scale back to full res
-                f_model = result_x[off + 6]
+                f_model = best_focal[i].item()
                 f_scale = K_full[i][0, 0] / K_f64[i][0, 0] if K_f64[i][0, 0] > 0 else 1.0
                 K_out[0, 0] = K_out[1, 1] = f_model * f_scale
 
@@ -1416,7 +1426,7 @@ def bundle_adjust_depth_consistency(c2w_list, K_list, pts3d_list, confs_list,
             refined.append((c2w, K_out.astype(np.float32), W, H))
 
         print(f"  Depth-consistency BA done: {n_imgs} cameras refined, "
-              f"cost {initial_cost:.4f} -> {final_cost:.4f}")
+              f"cost {initial_cost:.4f} -> {best_cost:.4f}")
         return refined
 
     except Exception as e:
