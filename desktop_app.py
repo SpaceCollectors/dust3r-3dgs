@@ -1080,6 +1080,7 @@ class AppState:
         self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap', 'pow3r']
         self.cached_cameras = None  # reference cameras from first reconstruction (for alignment)
         self.vggt_ensemble = False
+        self.vggt_equirect = False  # treat single image as equirectangular panorama
 
         # Reconstruction
         self.scene = None
@@ -1256,8 +1257,14 @@ def run_reconstruction(state, scene_gl):
 
         if backend == 'vggt':
             use_ensemble = state.vggt_ensemble and len(state.image_paths) > 4
+            use_equirect = state.vggt_equirect and len(state.image_paths) == 1
 
-            if use_ensemble:
+            if use_equirect:
+                state.status = "Running VGGT equirectangular..."
+                state.recon_frac = 0.1
+                from app import _reconstruct_vggt_equirect
+                vggt_scene = _reconstruct_vggt_equirect(state.image_paths[0])
+            elif use_ensemble:
                 state.status = "Running VGGT ensemble..."
                 state.recon_frac = 0.1
                 from app import _reconstruct_vggt_ensemble
@@ -1347,38 +1354,70 @@ def run_reconstruction(state, scene_gl):
             state.recon_frac = 0.7
             all_pts = []
             all_colors = []
+            min_conf_used = state.min_conf
             for i in range(len(vggt_scene.imgs)):
                 p = vggt_scene._pts3d[i]
                 c = vggt_scene._depth_conf[i]
                 img = vggt_scene.imgs[i]
-                conf_mask = c > state.min_conf
+                conf_mask = c > min_conf_used
                 not_padding = img.mean(axis=-1) < 0.95
-                mask = conf_mask & not_padding
+                valid = np.isfinite(p).all(axis=-1)
+                mask = conf_mask & not_padding & valid
+                n_pass = mask.sum()
+                print(f"    Image {i}: conf range [{c.min():.2f}, {c.max():.2f}], "
+                      f"{n_pass}/{mask.size} points pass (conf>{min_conf_used:.1f})")
                 all_pts.append(p[mask])
                 all_colors.append((img[mask] * 255).astype(np.uint8))
 
-            if all_pts:
-                points = np.concatenate(all_pts, axis=0)
-                colors = np.concatenate(all_colors, axis=0)
+            points = np.concatenate(all_pts, axis=0) if all_pts else np.zeros((0, 3), dtype=np.float32)
+            colors = np.concatenate(all_colors, axis=0) if all_pts else np.zeros((0, 3), dtype=np.uint8)
+
+            # If min_conf filtered everything, retry with a lower threshold
+            if len(points) == 0:
+                print(f"  WARNING: 0 points with min_conf={min_conf_used:.1f}, retrying with min_conf=0.5")
+                all_pts2 = []
+                all_colors2 = []
+                for i in range(len(vggt_scene.imgs)):
+                    p = vggt_scene._pts3d[i]
+                    c = vggt_scene._depth_conf[i]
+                    img = vggt_scene.imgs[i]
+                    mask = (c > 0.5) & (img.mean(axis=-1) < 0.95) & np.isfinite(p).all(axis=-1)
+                    all_pts2.append(p[mask])
+                    all_colors2.append((img[mask] * 255).astype(np.uint8))
+                points = np.concatenate(all_pts2, axis=0) if all_pts2 else np.zeros((0, 3), dtype=np.float32)
+                colors = np.concatenate(all_colors2, axis=0) if all_pts2 else np.zeros((0, 3), dtype=np.uint8)
+                print(f"    Fallback: {len(points)} points with min_conf=0.5")
+
+            if len(points) > 0:
                 if len(points) > 200000:
                     idx = np.random.choice(len(points), 200000, replace=False)
                     points, colors = points[idx], colors[idx]
                 scene_gl.set_points(points, colors)
                 state.has_points = True; state.needs_recenter = True
+            else:
+                print("  WARNING: VGGT produced 0 valid points — check input images")
 
             state.status = "Building scene..."
             state.recon_frac = 0.85
             state.scene = vggt_scene
 
-            # Set camera visualizations
+            # Set camera visualizations (always, even if points are sparse)
             extrinsic = vggt_scene._extrinsic
             cam_poses = []
             for i in range(len(extrinsic)):
                 w2c_44 = np.eye(4, dtype=np.float32)
                 w2c_44[:3, :] = extrinsic[i]
-                cam_poses.append(np.linalg.inv(w2c_44))
-            if cam_poses and len(points) > 0:
-                ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+                c2w = np.linalg.inv(w2c_44)
+                # Sanity check: skip degenerate cameras (NaN/Inf or zero translation)
+                if np.isfinite(c2w).all():
+                    cam_poses.append(c2w)
+                else:
+                    print(f"    Camera {i}: degenerate pose (NaN/Inf), skipping")
+            if cam_poses:
+                if len(points) > 0:
+                    ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+                else:
+                    ext = 1.0
                 scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
 
         elif backend == 'pow3r':
@@ -3105,6 +3144,29 @@ def run_dense_mesh(state, scene_gl):
         imgs = scene.imgs
         pts3d_list, confs_list = _extract_scene_data(state)
         mesh_min_conf = state.min_conf
+
+        # ── Equirectangular shortcut: spherical grid mesh from merged points ──
+        if getattr(scene, '_equirect', False):
+            state.refine_progress = "Building equirectangular mesh..."
+            from equirect import equirect_mesh
+            eq_pts3d = scene._equirect_merged_pts3d
+            eq_conf = scene._equirect_merged_conf
+            pano = scene._equirect_pano_img  # uint8
+            verts, faces, colors, texture, uvs = equirect_mesh(
+                eq_pts3d, eq_conf, pano,
+                min_conf=mesh_min_conf, depth_edge_mult=5.0, step=2)
+            if len(faces) > 0:
+                state.mesh_data = (verts, faces, colors)
+                # Apply panorama texture with UVs
+                scene_gl.set_texture(texture, uvs, faces, verts, faces, colors)
+                state.uv_data = (texture, uvs, faces)
+                state.has_mesh = True
+                state.draw_mode = 1
+                state.status = f"Equirect mesh: {len(verts):,d} verts, {len(faces):,d} faces (textured)"
+            else:
+                state.status = "Equirect mesh: no faces generated"
+            state.refining = False
+            return
 
         from mesh_export import create_dense_mesh, _smooth_cloud, _collect_points
         from mesh_export import _mesh_local_delaunay, _mesh_ball_pivot_from_cloud, _close_holes_pymeshlab
@@ -4838,7 +4900,8 @@ def main():
             _, state.niter1 = imgui.input_int("Iterations##pow3r", state.niter1, 50, 100)
 
         if state.backends[state.backend_idx] == 'vggt':
-            _, state.vggt_ensemble = imgui.checkbox("Ensemble (merge overlapping bundles)", state.vggt_ensemble)
+            _, state.vggt_ensemble = imgui.checkbox("Ensemble (bundles of 20 w/ overlap)", state.vggt_ensemble)
+            _, state.vggt_equirect = imgui.checkbox("Equirectangular panorama (single 360° image)", state.vggt_equirect)
 
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
         _, state.mask_sky = imgui.checkbox("Mask Sky", state.mask_sky)

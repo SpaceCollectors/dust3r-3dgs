@@ -207,6 +207,403 @@ def _reconstruct_vggt(paths):
     return VGGTScene(imgs_list, extrinsic, intrinsic, pts3d_list, conf_list, original_sizes)
 
 
+def _reconstruct_vggt_equirect(path):
+    """Run VGGT depth estimation on a single equirectangular panorama.
+
+    Decomposes the panorama into 12 views (4 horizontal + 4 up-diagonal +
+    4 down-diagonal, 105° FOV each), runs VGGT on all 12 as a bundle,
+    forces a shared camera center, then stitches depth back into a single
+    equirectangular depth map. Returns a VGGTScene with one equirect view.
+    """
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    from vggt.utils.geometry import unproject_depth_map_to_point_map
+    from equirect import equirect_to_cubemap
+    from PIL import Image as PILImage
+    from PIL.ImageOps import exif_transpose
+
+    print("VGGT equirectangular: decomposing panorama into 12 views...")
+    pano_img = exif_transpose(PILImage.open(path)).convert('RGB')
+    eq_w, eq_h = pano_img.size
+    print(f"  Panorama size: {eq_w}x{eq_h}")
+
+    # Cap output resolution to avoid excessive memory for stitching
+    max_eq_w = 2048
+    if eq_w > max_eq_w:
+        scale = max_eq_w / eq_w
+        eq_w = max_eq_w
+        eq_h = int(eq_h * scale)
+        pano_img = pano_img.resize((eq_w, eq_h), PILImage.BICUBIC)
+        print(f"  Downscaled to {eq_w}x{eq_h} for stitching")
+
+    # Decompose into cube faces at VGGT's preferred resolution
+    # FOV > 90° gives overlap between adjacent faces for better VGGT matching
+    face_size = 518  # VGGT internal resolution (divisible by 14)
+    face_fov = 105.0  # degrees — 15° overlap on each edge
+
+    # Create a textured version of the panorama for VGGT matching.
+    # Featureless surfaces (white walls, ceilings) confuse VGGT because
+    # there's nothing to match between faces. We overlay a faint
+    # thresholded perlin-like noise to create sharp, non-repeating blobs.
+    # Used ONLY for VGGT inference — original colors in the output.
+    pano_arr = np.array(pano_img).astype(np.float32)
+    rng = np.random.RandomState(42)
+    # Multi-octave smooth noise → threshold → sharp non-repeating blobs.
+    # Target ~20-40px features at face_size=518, which means ~40-80px at equirect.
+    pattern = np.zeros((eq_h, eq_w), dtype=np.float32)
+    for octave_scale in [20, 10, 5]:  # feature sizes in pixels at equirect res
+        gh = max(2, eq_h // octave_scale)
+        gw = max(2, eq_w // octave_scale)
+        small = rng.randn(gh, gw).astype(np.float32)
+        small_up = np.array(PILImage.fromarray(small, mode='F').resize(
+            (eq_w, eq_h), PILImage.BILINEAR))
+        pattern += small_up * (octave_scale / 40)  # weight larger features more
+    # Threshold to create sharp edges
+    pattern = np.sign(pattern) * 15  # ±15 intensity (~6% of 255)
+    pano_textured = np.clip(pano_arr + pattern[:, :, None], 0, 255).astype(np.uint8)
+    pano_textured_img = PILImage.fromarray(pano_textured)
+    # Save textured panorama + pattern for inspection
+    debug_pattern = ((pattern + 15) / 30 * 255).clip(0, 255).astype(np.uint8)
+    PILImage.fromarray(debug_pattern).save(os.path.join(TMPDIR, 'debug_pattern.png'))
+    pano_textured_img.save(os.path.join(TMPDIR, 'debug_pano_textured.png'))
+    print(f"  Added noise pattern for VGGT matching (saved debug_pattern.png and debug_pano_textured.png to {TMPDIR})")
+
+    # Decompose TEXTURED panorama for VGGT inference
+    faces_textured, face_names = equirect_to_cubemap(pano_textured_img, face_size=face_size, fov_deg=face_fov)
+
+    print(f"  {len(face_names)} faces extracted ({face_fov:.0f}° FOV)")
+
+    # Build VGGT input tensor directly — skip disk save/reload entirely.
+    # Faces are already 518×518 RGB, just convert to (N, 3, H, W) float [0,1].
+    from torchvision import transforms as TF
+    to_tensor = TF.ToTensor()
+    face_tensors = [to_tensor(f) for f in faces_textured]
+    images = torch.stack(face_tensors).to(DEVICE)
+
+    model = load_model('vggt')
+    print(f"  VGGT input: {images.shape}")
+
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(dtype=DTYPE):
+            predictions = model(images)
+
+    pose_enc = predictions["pose_enc"]
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+
+    depth_map = predictions["depth"].squeeze(0).cpu().numpy()
+    depth_conf = predictions["depth_conf"].squeeze(0).cpu().numpy()
+    n_faces = len(face_names)
+    extrinsic = extrinsic.squeeze(0).cpu().numpy()  # (N, 3, 4)
+    intrinsic = intrinsic.squeeze(0).cpu().numpy()   # (N, 3, 3)
+
+    if depth_map.ndim == 4:
+        depth_map = depth_map[..., 0]  # (N, H, W)
+
+    # Unproject each face to 3D (in VGGT's coordinate frame)
+    depth_4d = depth_map[..., None]  # (N, H, W, 1)
+    pts3d = unproject_depth_map_to_point_map(depth_4d, extrinsic, intrinsic)
+
+    # Keep cameras exactly where VGGT placed them — moving them creates
+    # seams in the point cloud at face boundaries.
+
+    # Extract CLEAN face crops from the original panorama at full resolution.
+    # Determine a face size that preserves panorama detail:
+    # each face covers ~(fov/360)*eq_w pixels horizontally.
+    clean_face_size = max(face_size, int(eq_w * face_fov / 360))
+    # Round to nearest multiple of 14 for consistency
+    clean_face_size = ((clean_face_size + 13) // 14) * 14
+    print(f"  Clean face crops: {clean_face_size}x{clean_face_size} "
+          f"(from {eq_w}x{eq_h} panorama)")
+    faces_clean, _ = equirect_to_cubemap(pano_img, face_size=clean_face_size, fov_deg=face_fov)
+
+    # Build N-view VGGTScene (one per face), mesh builder handles per-face grid.
+    # scene.imgs = textured faces (for point cloud display, matches VGGT input)
+    # scene._equirect_clean_imgs = clean faces at full res (for mesh coloring)
+    imgs_list = []
+    pts3d_list = []
+    conf_list = []
+    clean_imgs_list = []
+    for i in range(n_faces):
+        face_np = np.array(faces_textured[i]).astype(np.float32) / 255.0
+        imgs_list.append(face_np)
+        clean_np = np.array(faces_clean[i]).astype(np.float32) / 255.0
+        clean_imgs_list.append(clean_np)
+        pts3d_list.append(pts3d[i])
+        conf_list.append(depth_conf[i])
+
+    original_sizes = [(face_size, face_size)] * n_faces
+
+    del predictions, images
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # ── Merge overlapping faces into a single equirect point grid ───────
+    from equirect import merge_faces_to_equirect
+    eq_pts3d, eq_conf, eq_color = merge_faces_to_equirect(
+        pts3d_list, conf_list, clean_imgs_list, eq_h, eq_w, fov_deg=face_fov)
+
+    # Build a single-view VGGTScene from the merged equirect grid
+    eq_img = np.array(pano_img).astype(np.float32) / 255.0
+    eq_extrinsic = np.zeros((1, 3, 4), dtype=np.float64)
+    eq_extrinsic[0, :3, :3] = np.eye(3)
+    eq_intrinsic = np.zeros((1, 3, 3), dtype=np.float64)
+    eq_intrinsic[0] = np.eye(3)
+
+    scene = VGGTScene(
+        [eq_img], eq_extrinsic, eq_intrinsic,
+        [eq_pts3d], [eq_conf], [(eq_w, eq_h)])
+    scene._equirect = True
+    scene._equirect_merged_pts3d = eq_pts3d
+    scene._equirect_merged_conf = eq_conf
+    scene._equirect_merged_color = eq_color
+    scene._equirect_pano_img = np.array(pano_img)  # uint8 for texture
+    scene._equirect_pano_size = (eq_w, eq_h)
+
+    print(f"VGGT equirectangular complete: {n_faces} faces → {eq_w}x{eq_h} merged")
+    return scene
+
+
+def _reconstruct_vggt_ensemble(paths, bundle_size=20, n_anchors=16):
+    """Run VGGT on scattered bundles with shared anchors for global alignment.
+
+    Strategy:
+    1. Pick `n_anchors` images spread evenly across the full sequence — these
+       go in EVERY bundle and serve as Procrustes anchors.
+    2. Remaining images are grouped into consecutive pairs.
+    3. Pairs are distributed round-robin across bundles so each bundle's pairs
+       are scattered across the full sequence (wide baselines).
+    4. Bundle 0 defines the reference frame; others align via Procrustes on
+       the shared anchors.
+    5. Each image gets depth/extrinsic from exactly ONE bundle (no mixing).
+    """
+    from vggt.utils.load_fn import load_and_preprocess_images
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+    N = len(paths)
+    if N <= bundle_size:
+        print(f"VGGT ensemble: only {N} images, falling back to single pass")
+        return _reconstruct_vggt(paths)
+
+    model = load_model('vggt')
+    all_images = load_and_preprocess_images(paths).to(DEVICE)  # (N, 3, H, W)
+    H_int, W_int = all_images.shape[2], all_images.shape[3]
+
+    # ── 1. Pick anchor images spread across the sequence ──────────────────
+    anchor_indices = np.round(np.linspace(0, N - 1, n_anchors)).astype(int).tolist()
+    anchor_set = set(anchor_indices)
+
+    # ── 2. Group remaining images into consecutive pairs ──────────────────
+    remaining = [i for i in range(N) if i not in anchor_set]
+    pairs = []
+    i = 0
+    while i < len(remaining):
+        if i + 1 < len(remaining) and remaining[i + 1] == remaining[i] + 1:
+            pairs.append((remaining[i], remaining[i + 1]))
+            i += 2
+        else:
+            pairs.append((remaining[i],))
+            i += 1
+
+    # ── 3. Distribute pairs round-robin across bundles ────────────────────
+    max_pairs_per_bundle = (bundle_size - n_anchors) // 2
+    n_bundles = max(1, -(-len(pairs) // max_pairs_per_bundle))  # ceil div
+
+    bundle_pairs = [[] for _ in range(n_bundles)]
+    for pi, pair in enumerate(pairs):
+        bundle_pairs[pi % n_bundles].append(pair)
+
+    # Build final bundle index lists (anchors + scattered pairs)
+    bundles = []
+    for bi in range(n_bundles):
+        imgs = set(anchor_indices)
+        for pair in bundle_pairs[bi]:
+            imgs.update(pair)
+        bundles.append(sorted(imgs))
+
+    # Which bundle owns each image (for depth assignment)
+    best_bundle = np.full(N, 0, dtype=int)
+    for bi in range(n_bundles):
+        for pair in bundle_pairs[bi]:
+            for img_idx in pair:
+                best_bundle[img_idx] = bi
+    # Anchors: assign to bundle 0
+    for ai in anchor_indices:
+        best_bundle[ai] = 0
+
+    print(f"VGGT ensemble: {N} images, {n_bundles} scattered bundles "
+          f"(max {bundle_size}/bundle, {n_anchors} shared anchors)")
+    for bi, b in enumerate(bundles):
+        print(f"  Bundle {bi}: {len(b)} images, "
+              f"indices [{b[0]}..{b[-1]}], "
+              f"{len(bundle_pairs[bi])} pairs")
+
+    # ── Helper functions ──────────────────────────────────────────────────
+
+    def cam_frames(extrinsics):
+        """Extract camera centers + axis endpoints from w2c matrices (3,4)."""
+        centers, rights, ups, fwds = [], [], [], []
+        for w2c in extrinsics:
+            R = w2c[:3, :3]
+            t = w2c[:3, 3]
+            C = -R.T @ t
+            right = R.T @ np.array([1, 0, 0])
+            up    = R.T @ np.array([0, 1, 0])
+            fwd   = R.T @ np.array([0, 0, 1])
+            centers.append(C)
+            rights.append(C + right)
+            ups.append(C + up)
+            fwds.append(C + fwd)
+        return (np.array(centers), np.array(rights),
+                np.array(ups), np.array(fwds))
+
+    def rigid_align(src, dst):
+        """Rigid alignment (rotation + translation only, no scale).
+        Finds R, t minimizing ||dst - (R@src + t)||^2.
+        VGGT predicts metric depth so scale should be ~1.0 between bundles."""
+        src_mean = src.mean(axis=0)
+        dst_mean = dst.mean(axis=0)
+        src_c = src - src_mean
+        dst_c = dst - dst_mean
+        H_mat = src_c.T @ dst_c
+        U, _, Vt = np.linalg.svd(H_mat)
+        d = np.linalg.det(Vt.T @ U.T)
+        R = Vt.T @ np.diag([1, 1, d]) @ U.T
+        t = dst_mean - R @ src_mean
+        return R, t
+
+    def procrustes_rigid(bun_w2c, ref_w2c):
+        """Align bundle cameras to reference using positions + orientations.
+        Rigid (no scale) — uses 4 points per camera for robustness."""
+        bun_c, bun_r, bun_u, bun_f = cam_frames(bun_w2c)
+        ref_c, ref_r, ref_u, ref_f = cam_frames(ref_w2c)
+        src = np.concatenate([bun_c, bun_r, bun_u, bun_f], axis=0)
+        dst = np.concatenate([ref_c, ref_r, ref_u, ref_f], axis=0)
+        return rigid_align(src, dst)
+
+    def transform_w2c(w2c, R_align, t_align):
+        """Transform a w2c (3,4) matrix from bundle frame to reference frame.
+        Rigid transform (no scale): P_ref = R_align @ P_bun + t_align."""
+        R_w = w2c[:3, :3]
+        t_w = w2c[:3, 3]
+        C_bun = -R_w.T @ t_w
+        C_ref = R_align @ C_bun + t_align
+        R_ref = R_w @ R_align.T
+        t_ref = -R_ref @ C_ref
+        w2c_new = np.zeros((3, 4), dtype=np.float64)
+        w2c_new[:3, :3] = R_ref
+        w2c_new[:3, 3] = t_ref
+        return w2c_new
+
+    # ── Per-image storage ─────────────────────────────────────────────────
+    global_extrinsic = np.zeros((N, 3, 4), dtype=np.float64)
+    global_intrinsic = np.zeros((N, 3, 3), dtype=np.float64)
+    global_depth = np.zeros((N, H_int, W_int), dtype=np.float32)
+    global_conf = np.zeros((N, H_int, W_int), dtype=np.float32)
+    assigned_depth = np.zeros(N, dtype=bool)
+
+    # ── Process each bundle ───────────────────────────────────────────────
+    ref_anchor_w2c = None  # anchor w2c from bundle 0 (reference frame)
+
+    for bi, bundle_idx in enumerate(bundles):
+        B = len(bundle_idx)
+        print(f"  Running bundle {bi+1}/{n_bundles}: {B} images")
+
+        # Map from global image index → local index in this bundle
+        global_to_local = {gi: li for li, gi in enumerate(bundle_idx)}
+
+        bundle_images = all_images[bundle_idx]
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=DTYPE):
+                pred = model(bundle_images)
+
+        b_pose_enc = pred["pose_enc"]
+        b_extri, b_intri = pose_encoding_to_extri_intri(b_pose_enc, (H_int, W_int))
+        b_extri = b_extri.squeeze(0).cpu().numpy()  # (B, 3, 4)
+        b_intri = b_intri.squeeze(0).cpu().numpy()   # (B, 3, 3)
+
+        b_depth = pred["depth"].squeeze(0).cpu().numpy()
+        b_conf = pred["depth_conf"].squeeze(0).cpu().numpy()
+        if b_depth.ndim == 4:
+            b_depth = b_depth[..., 0]
+
+        del pred
+        torch.cuda.empty_cache()
+
+        if bi == 0:
+            # First bundle defines the reference frame
+            ref_anchor_w2c = {}
+            for ai in anchor_indices:
+                li = global_to_local[ai]
+                ref_anchor_w2c[ai] = b_extri[li].copy()
+
+            # Store all images owned by bundle 0
+            for li, gi in enumerate(bundle_idx):
+                if best_bundle[gi] == 0:
+                    global_extrinsic[gi] = b_extri[li]
+                    global_intrinsic[gi] = b_intri[li]
+                    global_depth[gi] = b_depth[li]
+                    global_conf[gi] = b_conf[li]
+                    assigned_depth[gi] = True
+
+            print(f"    Reference frame set ({len(ref_anchor_w2c)} anchors)")
+        else:
+            # Align to reference frame via shared anchors
+            anchor_local_indices = [global_to_local[ai] for ai in anchor_indices]
+            bun_anchor_w2c = b_extri[anchor_local_indices]
+            ref_anchor_arr = np.array([ref_anchor_w2c[ai] for ai in anchor_indices])
+
+            R_align, t_align = procrustes_rigid(bun_anchor_w2c, ref_anchor_arr)
+
+            # Alignment error
+            bun_centers = cam_frames(bun_anchor_w2c)[0]
+            ref_centers = cam_frames(ref_anchor_arr)[0]
+            aligned_pos = (R_align @ bun_centers.T).T + t_align
+            per_cam_err = np.sqrt(((aligned_pos - ref_centers) ** 2).sum(axis=1))
+            print(f"    Alignment: mean cam error={per_cam_err.mean():.6f}, "
+                  f"max={per_cam_err.max():.6f} ({n_anchors} anchors)")
+
+            # Store images owned by this bundle (rigid-aligned, no depth scaling)
+            for li, gi in enumerate(bundle_idx):
+                if best_bundle[gi] == bi and not assigned_depth[gi]:
+                    aligned_w2c = transform_w2c(b_extri[li], R_align, t_align)
+                    global_extrinsic[gi] = aligned_w2c
+                    global_intrinsic[gi] = b_intri[li]
+                    global_depth[gi] = b_depth[li]
+                    global_conf[gi] = b_conf[li]
+                    assigned_depth[gi] = True
+
+    # Check coverage
+    missing = np.where(~assigned_depth)[0]
+    if len(missing) > 0:
+        print(f"  WARNING: {len(missing)} images missing depth!")
+        for img_idx in missing:
+            print(f"    Image {img_idx} (best_bundle={best_bundle[img_idx]})")
+
+    # Unproject depth to 3D
+    depth_4d = global_depth[..., None]  # (N, H, W, 1)
+    pts3d = unproject_depth_map_to_point_map(depth_4d, global_extrinsic, global_intrinsic)
+
+    # Build output
+    imgs_np = all_images.cpu().numpy().transpose(0, 2, 3, 1)
+    imgs_list = [imgs_np[i] for i in range(N)]
+    pts3d_list = [pts3d[i] for i in range(N)]
+    conf_list = [global_conf[i] for i in range(N)]
+
+    from PIL import Image as PILImage
+    from PIL.ImageOps import exif_transpose
+    original_sizes = []
+    for p in paths:
+        img = exif_transpose(PILImage.open(p)).convert('RGB')
+        original_sizes.append(img.size)
+
+    del all_images
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print(f"VGGT ensemble complete: {N} views, {n_bundles} bundles")
+    return VGGTScene(imgs_list, global_extrinsic, global_intrinsic, pts3d_list, conf_list, original_sizes)
+
+
 # ── Scene data extraction (handles all backends) ────────────────────────────
 
 def _is_mast3r_scene(scene):
@@ -250,7 +647,8 @@ def _extract_dense_pts3d(scene, min_conf_thr, clean_depth):
 def reconstruct(filelist, backend, optim_level, schedule, niter1, niter2, min_conf_thr,
                 matching_conf_thr,
                 as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
-                scenegraph_type, winsize, refid, shared_intrinsics):
+                scenegraph_type, winsize, refid, shared_intrinsics,
+                vggt_ensemble=False, vggt_equirect=False):
     global _original_paths
 
     if not filelist or len(filelist) == 0:
@@ -264,7 +662,12 @@ def reconstruct(filelist, backend, optim_level, schedule, niter1, niter2, min_co
     _original_paths = list(paths)
 
     if backend == 'vggt':
-        scene = _reconstruct_vggt(paths)
+        if vggt_equirect and len(paths) == 1:
+            scene = _reconstruct_vggt_equirect(paths[0])
+        elif vggt_ensemble and len(paths) > 4:
+            scene = _reconstruct_vggt_ensemble(paths)
+        else:
+            scene = _reconstruct_vggt(paths)
     else:
         # DUSt3R / MASt3R need dust3r-style image loading
         model = load_model(backend)
@@ -566,6 +969,8 @@ def toggle_backend_options(backend):
         gr.update(visible=show_pairing),    # scenegraph_type
         gr.update(visible=show_pairing),    # winsize
         gr.update(visible=show_pairing),    # refid
+        gr.update(visible=is_vggt),         # vggt_ensemble
+        gr.update(visible=is_vggt),         # vggt_equirect
     )
 
 
@@ -624,6 +1029,11 @@ def build_ui():
                                               visible=True)
                 shared_intrinsics = gr.Checkbox(value=False, label="Shared Intrinsics",
                                                 visible=True)
+
+            vggt_ensemble = gr.Checkbox(value=False, label="VGGT Ensemble (bundles of 20 with overlap — scales to many images)",
+                                        visible=False)
+            vggt_equirect = gr.Checkbox(value=False, label="Equirectangular panorama (single 360° image → cubemap depth)",
+                                        visible=False)
 
             run_btn = gr.Button("Reconstruct", variant="primary", size="lg")
 
@@ -687,7 +1097,8 @@ def build_ui():
         backend.change(toggle_backend_options, inputs=[backend],
                        outputs=[optim_level, niter2, matching_conf_thr,
                                 shared_intrinsics, schedule, niter1,
-                                scenegraph_type, winsize, refid])
+                                scenegraph_type, winsize, refid, vggt_ensemble,
+                                vggt_equirect])
 
         scenegraph_type.change(set_scenegraph_options,
                                inputs=[inputfiles, winsize, refid, scenegraph_type],
@@ -701,7 +1112,8 @@ def build_ui():
             inputs=[inputfiles, backend, optim_level, schedule,
                     niter1, niter2, min_conf_thr, matching_conf_thr,
                     as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
-                    scenegraph_type, winsize, refid, shared_intrinsics],
+                    scenegraph_type, winsize, refid, shared_intrinsics,
+                    vggt_ensemble, vggt_equirect],
             outputs=[scene_state, outmodel]
         )
 

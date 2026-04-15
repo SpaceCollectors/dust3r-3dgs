@@ -108,20 +108,30 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
     scale_factors = []
     original_sizes = []
 
-    for i, path in enumerate(image_paths):
+    is_equirect = getattr(scene, '_equirect', False)
+
+    for i in range(n_images):
         name = f'frame_{i:05d}.jpg'
         image_names.append(name)
 
-        orig_img = exif_transpose(Image.open(path)).convert('RGB')
-        orig_W, orig_H = orig_img.size
-        original_sizes.append((orig_W, orig_H))
+        if is_equirect or i >= len(image_paths):
+            # Equirect scene: face images are in scene.imgs, no original files
+            dust3r_H, dust3r_W = imgs[i].shape[:2]
+            original_sizes.append((dust3r_W, dust3r_H))
+            scale_factors.append((1.0, 1.0))
+            face_rgb = (np.clip(imgs[i], 0, 1) * 255).astype(np.uint8)
+            Image.fromarray(face_rgb).save(os.path.join(images_dir, name), quality=95)
+        else:
+            orig_img = exif_transpose(Image.open(image_paths[i])).convert('RGB')
+            orig_W, orig_H = orig_img.size
+            original_sizes.append((orig_W, orig_H))
 
-        dust3r_H, dust3r_W = imgs[i].shape[:2]
-        sx = orig_W / dust3r_W
-        sy = orig_H / dust3r_H
-        scale_factors.append((sx, sy))
+            dust3r_H, dust3r_W = imgs[i].shape[:2]
+            sx = orig_W / dust3r_W
+            sy = orig_H / dust3r_H
+            scale_factors.append((sx, sy))
 
-        orig_img.save(os.path.join(images_dir, name), quality=95)
+            orig_img.save(os.path.join(images_dir, name), quality=95)
 
     # --- Compute scaled intrinsics for each image ---
     cam_params = []  # list of (orig_W, orig_H, fx, fy, cx, cy)
