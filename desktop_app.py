@@ -1420,13 +1420,14 @@ def run_reconstruction(state, scene_gl):
             state.scene = vggt_scene
 
             # Set camera visualizations (always, even if points are sparse)
+            # Invert _extrinsic to get display poses. For VGGT (w2c→c2w).
+            # For lingbot (c2w→w2c) — matches the double-inverted point frame.
             extrinsic = vggt_scene._extrinsic
             cam_poses = []
             for i in range(len(extrinsic)):
-                w2c_44 = np.eye(4, dtype=np.float32)
-                w2c_44[:3, :] = extrinsic[i]
-                c2w = np.linalg.inv(w2c_44)
-                # Sanity check: skip degenerate cameras (NaN/Inf or zero translation)
+                ext_44 = np.eye(4, dtype=np.float32)
+                ext_44[:3, :] = extrinsic[i]
+                c2w = np.linalg.inv(ext_44)
                 if np.isfinite(c2w).all():
                     cam_poses.append(c2w)
                 else:
@@ -2657,6 +2658,136 @@ def _extract_scene_data(state):
     return pts3d_list, confs_list
 
 
+
+
+def _run_decimate_points(state, scene_gl):
+    """Merge nearby points using voxel grid, confidence-weighted position and color.
+
+    Replaces the scene data with a single merged view so mesh generation
+    and all downstream operations use the decimated cloud.
+    """
+    state.refine_progress = "Decimating points..."
+    try:
+        pts3d_list, confs_list = _extract_scene_data(state)
+        scene = state.scene
+        imgs = scene.imgs
+
+        # Collect all points with confidence
+        all_pts, all_cols, all_conf = [], [], []
+        for i in range(len(imgs)):
+            p = pts3d_list[i]
+            c = confs_list[i]
+            img = imgs[i]
+            if p.ndim == 3:
+                H, W = p.shape[:2]
+                conf_2d = c.reshape(H, W) if c.ndim != 2 else c
+                mask = (conf_2d > state.min_conf) & np.isfinite(p).all(axis=-1)
+                all_pts.append(p[mask])
+                all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                all_conf.append(conf_2d[mask])
+            else:
+                c_flat = c.ravel()
+                mask = (c_flat > state.min_conf) & np.isfinite(p).all(axis=-1)
+                all_pts.append(p[mask])
+                all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+                all_conf.append(c_flat[mask])
+
+        points = np.concatenate(all_pts, axis=0).astype(np.float32)
+        colors = np.concatenate(all_cols, axis=0).astype(np.float32)
+        conf = np.concatenate(all_conf, axis=0).astype(np.float32)
+        n_before = len(points)
+
+        if n_before == 0:
+            state.status = "No points to decimate"
+            state.refining = False
+            return
+
+        state.refine_progress = f"Voxel merging {n_before:,d} points..."
+
+        # Use open3d for fast voxel downsampling to estimate good voxel size,
+        # then do confidence-weighted merge manually.
+        import open3d as o3d
+
+        # Target ~200k output points — binary search for voxel size
+        target_pts = min(200_000, n_before // 2)
+        target_pts = max(target_pts, 10_000)
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+        bb_min = pcd.get_min_bound()
+        bb_max = pcd.get_max_bound()
+        extent = np.linalg.norm(bb_max - bb_min)
+
+        # Binary search for voxel size that gives ~target_pts
+        lo, hi = extent / 10000, extent / 10
+        for _ in range(20):
+            mid = (lo + hi) / 2
+            down = pcd.voxel_down_sample(mid)
+            n_down = len(down.points)
+            if n_down > target_pts:
+                lo = mid
+            else:
+                hi = mid
+            if abs(n_down - target_pts) / max(target_pts, 1) < 0.1:
+                break
+        voxel_size = (lo + hi) / 2
+
+        state.refine_progress = f"Confidence-weighted merge (voxel={voxel_size:.4f})..."
+
+        # Quantize to voxel grid
+        grid_coords = np.floor((points - bb_min.astype(np.float32)) / voxel_size).astype(np.int32)
+        grid_max = grid_coords.max(axis=0) + 1
+
+        # Linear voxel index
+        voxel_idx = (grid_coords[:, 0].astype(np.int64) * grid_max[1] * grid_max[2] +
+                     grid_coords[:, 1].astype(np.int64) * grid_max[2] +
+                     grid_coords[:, 2].astype(np.int64))
+
+        unique_voxels, inverse = np.unique(voxel_idx, return_inverse=True)
+        n_voxels = len(unique_voxels)
+
+        # Confidence-weighted accumulation
+        w = conf[:, None]
+        merged_pts = np.zeros((n_voxels, 3), dtype=np.float64)
+        merged_cols = np.zeros((n_voxels, 3), dtype=np.float64)
+        merged_w = np.zeros((n_voxels, 1), dtype=np.float64)
+        merged_conf = np.zeros(n_voxels, dtype=np.float64)
+
+        np.add.at(merged_pts, inverse, points * w)
+        np.add.at(merged_cols, inverse, colors * w)
+        np.add.at(merged_w, inverse, w)
+        np.maximum.at(merged_conf, inverse, conf)
+
+        valid = merged_w[:, 0] > 0
+        merged_pts[valid] /= merged_w[valid]
+        merged_cols[valid] /= merged_w[valid]
+
+        merged_pts = merged_pts[valid].astype(np.float32)
+        merged_cols = np.clip(merged_cols[valid], 0, 255).astype(np.uint8)
+        merged_conf = merged_conf[valid].astype(np.float32)
+
+        print(f"  Decimated: {n_before:,d} → {len(merged_pts):,d} points "
+              f"(voxel={voxel_size:.4f}, extent={extent:.2f})")
+
+        # Update display
+        scene_gl.set_points(merged_pts, merged_cols)
+        state.has_points = True
+        state.points_modified = True
+
+        # Replace scene data so mesh generation uses decimated points
+        # Store as a single flat view in the cached lists
+        state.pts3d_list = [merged_pts]
+        state.confs_list = [merged_conf]
+        scene.imgs = [merged_cols.astype(np.float32) / 255.0]
+        state.status = f"Decimated: {n_before:,d} → {len(merged_pts):,d} points"
+
+    except Exception as e:
+        state.error_msg = str(e)
+        state.status = f"Decimate failed: {e}"
+        import traceback
+        traceback.print_exc()
+    finally:
+        state.refining = False
 
 
 def _run_smooth_preview(state, scene_gl):
@@ -5170,6 +5301,13 @@ def main():
                 state.status = f"Restored {len(pts):,d} points"
             except Exception:
                 pass
+        if state.has_points and not state.refining:
+            if imgui.button("Decimate Points (merge neighbors)", width=-1):
+                state.refining = True
+                state.refine_thread = threading.Thread(
+                    target=_run_decimate_points, args=(state, scene_gl), daemon=True)
+                state.refine_thread.start()
+
         _, state.hole_cap_size = imgui.slider_int("Hole Cap Size", state.hole_cap_size, 0, 500)
         _, state.target_faces = imgui.input_int("Target Faces", state.target_faces, 10000, 50000)
         state.target_faces = max(1000, state.target_faces)

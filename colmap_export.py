@@ -154,9 +154,17 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
         cam_params.append((orig_W, orig_H, K[0, 0], K[1, 1], K[0, 2], K[1, 2]))
 
     # --- Compute poses ---
+    # For lingbot, get_im_poses() returns w2c (due to double-inversion),
+    # so cam2world is actually w2c already. Use _extrinsic_is_c2w flag to detect.
+    is_c2w_stored = getattr(scene, '_extrinsic_is_c2w', False)
     pose_data = []  # list of (qvec, tvec)
     for i in range(n_images):
-        w2c = np.linalg.inv(cam2world[i])
+        if is_c2w_stored:
+            # cam2world is actually w2c (inverted c2w) — use directly
+            w2c = cam2world[i]
+        else:
+            # cam2world is c2w — invert to w2c for COLMAP
+            w2c = np.linalg.inv(cam2world[i])
         pose_data.append((rotmat_to_qvec(w2c[:3, :3]), w2c[:3, 3]))
 
     # --- Write TEXT format (for 3DGS tools) ---

@@ -114,25 +114,28 @@ class VGGTScene:
             original_sizes: list of (W,H) original image sizes
         """
         self.imgs = imgs_np
-        self._extrinsic = extrinsic  # w2c
+        self._extrinsic = extrinsic  # (N, 3, 4) — w2c or c2w depending on backend
         self._intrinsic = intrinsic  # K at internal res
         self._pts3d = pts3d
         self._depth_conf = depth_conf
         self.original_sizes = original_sizes
         self._is_vggt = True
+        self._extrinsic_is_c2w = False  # default: w2c (VGGT convention)
 
     def get_focals(self):
         focals = torch.tensor([self._intrinsic[i][0, 0] for i in range(len(self.imgs))])
         return focals
 
     def get_im_poses(self):
-        # extrinsic is (N, 3, 4) [R|t] w2c. Pad to 4x4, then invert to get c2w.
+        # Return camera-to-world (c2w) 4x4 matrices in the point cloud frame.
+        # For all backends, _extrinsic is inverted to get display c2w.
+        # This ensures cameras match the point cloud regardless of convention.
         c2w_list = []
         for i in range(len(self.imgs)):
-            w2c_34 = self._extrinsic[i]  # (3, 4)
-            w2c = np.eye(4)
-            w2c[:3, :] = w2c_34
-            c2w_list.append(np.linalg.inv(w2c))
+            ext_34 = self._extrinsic[i]  # (3, 4)
+            ext_44 = np.eye(4)
+            ext_44[:3, :] = ext_34
+            c2w_list.append(np.linalg.inv(ext_44))
         return torch.from_numpy(np.stack(c2w_list)).float()
 
 
@@ -325,10 +328,11 @@ def _reconstruct_lingbot(paths, keyframe_interval=1, num_scale_frames=8,
     print(f"LingBot-Map complete: {N} frames, "
           f"conf range [{min(c.min() for c in conf_list):.2f}, "
           f"{max(c.max() for c in conf_list):.2f}]")
-    # Points were unprojected with the double-inversion flow (c2w passed to
-    # unproject which inverts again). Camera viz inverts _extrinsic (w2c→c2w).
-    # Store c2w so the viz inversion produces w2c, matching the point cloud frame.
-    return VGGTScene(imgs_list, c2w_34, intrinsic, pts3d_list, conf_list, original_sizes)
+    # Points were unprojected with the double-inversion flow.
+    # Store c2w extrinsics and flag them so get_im_poses() doesn't invert again.
+    scene = VGGTScene(imgs_list, c2w_34, intrinsic, pts3d_list, conf_list, original_sizes)
+    scene._extrinsic_is_c2w = True
+    return scene
 
 
 def _reconstruct_vggt_equirect(path):
