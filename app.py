@@ -127,15 +127,13 @@ class VGGTScene:
         return focals
 
     def get_im_poses(self):
-        # Return camera-to-world (c2w) 4x4 matrices in the point cloud frame.
-        # For all backends, _extrinsic is inverted to get display c2w.
-        # This ensures cameras match the point cloud regardless of convention.
+        # Deprecated — use CanonicalScene instead.
         c2w_list = []
         for i in range(len(self.imgs)):
-            ext_34 = self._extrinsic[i]  # (3, 4)
-            ext_44 = np.eye(4)
-            ext_44[:3, :] = ext_34
-            c2w_list.append(np.linalg.inv(ext_44))
+            w2c_34 = self._extrinsic[i]  # (3, 4)
+            w2c = np.eye(4)
+            w2c[:3, :] = w2c_34
+            c2w_list.append(np.linalg.inv(w2c))
         return torch.from_numpy(np.stack(c2w_list)).float()
 
 
@@ -224,7 +222,8 @@ def _reconstruct_vggt(paths):
     torch.cuda.empty_cache()
     gc.collect()
 
-    return VGGTScene(imgs_list, extrinsic, intrinsic, pts3d_list, conf_list, original_sizes)
+    from canonical_scene import from_vggt
+    return from_vggt(imgs_list, extrinsic, intrinsic, pts3d_list, conf_list, original_sizes)
 
 
 def _reconstruct_lingbot(paths, keyframe_interval=1, num_scale_frames=8,
@@ -328,11 +327,8 @@ def _reconstruct_lingbot(paths, keyframe_interval=1, num_scale_frames=8,
     print(f"LingBot-Map complete: {N} frames, "
           f"conf range [{min(c.min() for c in conf_list):.2f}, "
           f"{max(c.max() for c in conf_list):.2f}]")
-    # Points were unprojected with the double-inversion flow.
-    # Store c2w extrinsics and flag them so get_im_poses() doesn't invert again.
-    scene = VGGTScene(imgs_list, c2w_34, intrinsic, pts3d_list, conf_list, original_sizes)
-    scene._extrinsic_is_c2w = True
-    return scene
+    from canonical_scene import from_lingbot
+    return from_lingbot(imgs_list, c2w_34, intrinsic, pts3d_list, conf_list, original_sizes)
 
 
 def _reconstruct_vggt_equirect(path):
@@ -476,15 +472,16 @@ def _reconstruct_vggt_equirect(path):
     eq_intrinsic = np.zeros((1, 3, 3), dtype=np.float64)
     eq_intrinsic[0] = np.eye(3)
 
-    scene = VGGTScene(
-        [eq_img], eq_extrinsic, eq_intrinsic,
-        [eq_pts3d], [eq_conf], [(eq_w, eq_h)])
-    scene._equirect = True
-    scene._equirect_merged_pts3d = eq_pts3d
-    scene._equirect_merged_conf = eq_conf
-    scene._equirect_merged_color = eq_color
-    scene._equirect_pano_img = np.array(pano_img)  # uint8 for texture
-    scene._equirect_pano_size = (eq_w, eq_h)
+    from canonical_scene import from_vggt
+    scene = from_vggt([eq_img], eq_extrinsic, eq_intrinsic,
+                      [eq_pts3d], [eq_conf], [(eq_w, eq_h)])
+    scene.equirect = {
+        'merged_pts3d': eq_pts3d,
+        'merged_conf': eq_conf,
+        'merged_color': eq_color,
+        'pano_img': np.array(pano_img),
+        'pano_size': (eq_w, eq_h),
+    }
 
     print(f"VGGT equirectangular complete: {n_faces} faces → {eq_w}x{eq_h} merged")
     return scene
@@ -729,7 +726,8 @@ def _reconstruct_vggt_ensemble(paths, bundle_size=20, n_anchors=16):
     gc.collect()
 
     print(f"VGGT ensemble complete: {N} views, {n_bundles} bundles")
-    return VGGTScene(imgs_list, global_extrinsic, global_intrinsic, pts3d_list, conf_list, original_sizes)
+    from canonical_scene import from_vggt
+    return from_vggt(imgs_list, global_extrinsic, global_intrinsic, pts3d_list, conf_list, original_sizes)
 
 
 # ── Scene data extraction (handles all backends) ────────────────────────────

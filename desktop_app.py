@@ -1419,15 +1419,11 @@ def run_reconstruction(state, scene_gl):
             state.recon_frac = 0.85
             state.scene = vggt_scene
 
-            # Set camera visualizations (always, even if points are sparse)
-            # Invert _extrinsic to get display poses. For VGGT (w2c→c2w).
-            # For lingbot (c2w→w2c) — matches the double-inverted point frame.
-            extrinsic = vggt_scene._extrinsic
+            # Set camera visualizations — c2w from CanonicalScene
+            c2w_all = vggt_scene.get_im_poses().numpy()
             cam_poses = []
-            for i in range(len(extrinsic)):
-                ext_44 = np.eye(4, dtype=np.float32)
-                ext_44[:3, :] = extrinsic[i]
-                c2w = np.linalg.inv(ext_44)
+            for i in range(len(c2w_all)):
+                c2w = c2w_all[i]
                 if np.isfinite(c2w).all():
                     cam_poses.append(c2w)
                 else:
@@ -2627,19 +2623,24 @@ def _detect_subject_masks(image_paths, prompt, keep=True, threshold=0.5):
 
 
 def _extract_scene_data(state):
-    """Extract pts3d and confidence from any backend into normalized numpy lists.
-    Caches the result — only extracts once per reconstruction."""
+    """Extract pts3d and confidence from the scene.
+    CanonicalScene provides these directly. Caches for backward compat."""
     if state.pts3d_list is not None and state.confs_list is not None:
         return state.pts3d_list, state.confs_list
 
-    from dust3r.utils.device import to_numpy
     scene = state.scene
+
+    # CanonicalScene — direct access
+    if hasattr(scene, 'pts3d') and hasattr(scene, 'confidence'):
+        state.pts3d_list = scene.pts3d
+        state.confs_list = scene.confidence
+        return state.pts3d_list, state.confs_list
+
+    # Legacy fallback for raw DUSt3R/MASt3R scenes not yet converted
+    from dust3r.utils.device import to_numpy
     imgs = scene.imgs
 
-    if hasattr(scene, '_is_vggt'):
-        pts3d_list = [np.array(p) for p in scene._pts3d]
-        confs_list = [np.array(c) for c in scene._depth_conf]
-    elif hasattr(scene, 'canonical_paths'):
+    if hasattr(scene, 'canonical_paths'):
         pts3d_raw, _, confs_raw = scene.get_dense_pts3d(clean_depth=True)
         pts3d_list = [to_numpy(pts3d_raw[i]).reshape(imgs[i].shape[0], imgs[i].shape[1], 3)
                       for i in range(len(imgs))]
@@ -3295,12 +3296,12 @@ def run_dense_mesh(state, scene_gl):
         mesh_min_conf = state.min_conf
 
         # ── Equirectangular shortcut: spherical grid mesh from merged points ──
-        if getattr(scene, '_equirect', False):
+        if getattr(scene, 'equirect', None) is not None:
             state.refine_progress = "Building equirectangular mesh..."
             from equirect import equirect_mesh
-            eq_pts3d = scene._equirect_merged_pts3d
-            eq_conf = scene._equirect_merged_conf
-            pano = scene._equirect_pano_img  # uint8
+            eq_pts3d = scene.equirect['merged_pts3d']
+            eq_conf = scene.equirect['merged_conf']
+            pano = scene.equirect['pano_img']  # uint8
             verts, faces, colors, texture, uvs = equirect_mesh(
                 eq_pts3d, eq_conf, pano,
                 min_conf=mesh_min_conf, depth_edge_mult=5.0, step=2)

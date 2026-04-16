@@ -31,11 +31,8 @@ from dust3r.utils.device import to_numpy
 from dust3r.utils.geometry import opencv_to_colmap_intrinsics
 
 
-def _is_mast3r_scene(scene):
-    return hasattr(scene, 'canonical_paths')
-
-
 def _is_vggt_scene(scene):
+    """Check if scene uses VGGT-style intrinsic scaling (backward compat)."""
     return hasattr(scene, '_is_vggt')
 
 
@@ -47,36 +44,12 @@ def rotmat_to_qvec(R):
 
 
 def _extract_scene_data(scene, min_conf_thr, clean_depth):
-    """
-    Extract imgs, intrinsics, cam2world, pts3d, confs from any scene type.
-    Returns everything as numpy with pts3d/confs as lists of (H,W,3) / (H,W).
-    """
-    imgs = scene.imgs  # list of (H,W,3) float [0,1]
-    cam2world = to_numpy(scene.get_im_poses().cpu())  # (N,4,4)
-
-    if _is_vggt_scene(scene):
-        # VGGT already has intrinsics and pts3d as numpy
-        intrinsics = [scene._intrinsic[i] for i in range(len(imgs))]
-        pts3d_list = scene._pts3d  # list of (H,W,3)
-        confs_list = scene._depth_conf  # list of (H,W)
-    elif _is_mast3r_scene(scene):
-        intrinsics = [to_numpy(K.cpu()) for K in scene.intrinsics]
-        pts3d_raw, _, confs_raw = scene.get_dense_pts3d(clean_depth=clean_depth)
-        pts3d_list = []
-        confs_list = []
-        for i in range(len(imgs)):
-            H, W = imgs[i].shape[:2]
-            pts3d_list.append(to_numpy(pts3d_raw[i]).reshape(H, W, 3))
-            confs_list.append(to_numpy(confs_raw[i]))
-    else:
-        # DUSt3R
-        intrinsics = [to_numpy(K) for K in scene.get_intrinsics().cpu()]
-        if clean_depth:
-            scene = scene.clean_pointcloud()
-        pts3d_list = to_numpy(scene.get_pts3d())  # list of (H,W,3)
-        scene.min_conf_thr = float(scene.conf_trf(torch.tensor(min_conf_thr)))
-        confs_raw = [c for c in scene.im_conf]
-        confs_list = to_numpy(confs_raw)  # list of (H,W)
+    """Extract scene data. CanonicalScene provides everything directly."""
+    imgs = scene.images if hasattr(scene, 'images') else scene.imgs
+    cam2world = scene.c2w if hasattr(scene, 'c2w') else to_numpy(scene.get_im_poses().cpu())
+    intrinsics = [scene.intrinsics[i] for i in range(len(imgs))]
+    pts3d_list = scene.pts3d if hasattr(scene, 'pts3d') else scene._pts3d
+    confs_list = scene.confidence if hasattr(scene, 'confidence') else scene._depth_conf
 
     return imgs, intrinsics, cam2world, pts3d_list, confs_list
 
@@ -108,7 +81,7 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
     scale_factors = []
     original_sizes = []
 
-    is_equirect = getattr(scene, '_equirect', False)
+    is_equirect = getattr(scene, 'equirect', None) is not None
 
     for i in range(n_images):
         name = f'frame_{i:05d}.jpg'
@@ -139,7 +112,9 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
         K = intrinsics[i].copy()
         orig_W, orig_H = original_sizes[i]
 
-        if _is_vggt_scene(scene):
+        if hasattr(scene, 'scale_intrinsics_to'):
+            K = scene.scale_intrinsics_to(orig_W, orig_H, i)
+        elif _is_vggt_scene(scene):
             ratio = max(orig_W, orig_H) / 518.0
             K[0, 0] *= ratio
             K[1, 1] *= ratio
@@ -154,17 +129,10 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
         cam_params.append((orig_W, orig_H, K[0, 0], K[1, 1], K[0, 2], K[1, 2]))
 
     # --- Compute poses ---
-    # For lingbot, get_im_poses() returns w2c (due to double-inversion),
-    # so cam2world is actually w2c already. Use _extrinsic_is_c2w flag to detect.
-    is_c2w_stored = getattr(scene, '_extrinsic_is_c2w', False)
+    # cam2world is always c2w (CanonicalScene convention). Invert for COLMAP.
     pose_data = []  # list of (qvec, tvec)
     for i in range(n_images):
-        if is_c2w_stored:
-            # cam2world is actually w2c (inverted c2w) — use directly
-            w2c = cam2world[i]
-        else:
-            # cam2world is c2w — invert to w2c for COLMAP
-            w2c = np.linalg.inv(cam2world[i])
+        w2c = np.linalg.inv(cam2world[i])
         pose_data.append((rotmat_to_qvec(w2c[:3, :3]), w2c[:3, 3]))
 
     # --- Write TEXT format (for 3DGS tools) ---
