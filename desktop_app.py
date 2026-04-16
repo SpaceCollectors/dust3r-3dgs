@@ -1076,11 +1076,12 @@ class AppState:
         self.video_extracting = False     # True while extraction thread runs
 
         # Backend
-        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap, 4=pow3r
-        self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap', 'pow3r']
+        self.backend_idx = 0  # 0=dust3r, 1=mast3r, 2=vggt, 3=colmap, 4=pow3r, 5=lingbot
+        self.backends = ['dust3r', 'mast3r', 'vggt', 'colmap', 'pow3r', 'lingbot']
         self.cached_cameras = None  # reference cameras from first reconstruction (for alignment)
         self.vggt_ensemble = False
         self.vggt_equirect = False  # treat single image as equirectangular panorama
+        self.lingbot_keyframe_interval = 1  # process every Nth frame (1=all)
 
         # Reconstruction
         self.scene = None
@@ -1255,6 +1256,18 @@ def run_reconstruction(state, scene_gl):
             except Exception as e:
                 print(f"  Pre-masking failed: {e}, using original images")
 
+        if backend == 'lingbot':
+            state.status = "Running LingBot-Map streaming..."
+            state.recon_frac = 0.1
+            from app import _reconstruct_lingbot
+            def _lingbot_progress(frac, msg):
+                state.recon_frac = 0.1 + frac * 0.6
+                state.status = msg
+            vggt_scene = _reconstruct_lingbot(
+                state.image_paths,
+                keyframe_interval=state.lingbot_keyframe_interval,
+                progress_cb=_lingbot_progress)
+
         if backend == 'vggt':
             use_ensemble = state.vggt_ensemble and len(state.image_paths) > 4
             use_equirect = state.vggt_equirect and len(state.image_paths) == 1
@@ -1349,6 +1362,7 @@ def run_reconstruction(state, scene_gl):
                 del model, predictions
                 torch.cuda.empty_cache()
 
+        if backend in ('vggt', 'lingbot'):
             # Extract point cloud from VGGTScene for display
             state.status = "Extracting point cloud..."
             state.recon_frac = 0.7
@@ -4885,7 +4899,7 @@ def main():
         # ── Backend ──
         imgui.text("Reconstruction")
         _, state.backend_idx = imgui.combo("Backend",
-            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "COLMAP", "Pow3R"])
+            state.backend_idx, ["DUSt3R", "MASt3R", "VGGT", "COLMAP", "Pow3R", "LingBot-Map"])
 
         if state.backends[state.backend_idx] == 'dust3r':
             _, state.niter1 = imgui.input_int("Iterations##d3r", state.niter1, 50, 100)
@@ -4902,6 +4916,11 @@ def main():
         if state.backends[state.backend_idx] == 'vggt':
             _, state.vggt_ensemble = imgui.checkbox("Ensemble (bundles of 20 w/ overlap)", state.vggt_ensemble)
             _, state.vggt_equirect = imgui.checkbox("Equirectangular panorama (single 360° image)", state.vggt_equirect)
+
+        if state.backends[state.backend_idx] == 'lingbot':
+            _, state.lingbot_keyframe_interval = imgui.slider_int(
+                "Keyframe Interval", state.lingbot_keyframe_interval, 1, 10)
+            imgui.text_colored("Streaming SLAM — handles long videos", 0.5, 0.8, 0.5, 1.0)
 
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
         _, state.mask_sky = imgui.checkbox("Mask Sky", state.mask_sky)

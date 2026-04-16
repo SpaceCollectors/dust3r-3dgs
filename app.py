@@ -24,9 +24,11 @@ import torch.nn.functional as F
 # Add repos to path
 MAST3R_DIR = os.path.join(os.path.dirname(__file__), 'mast3r')
 VGGT_DIR = os.path.join(os.path.dirname(__file__), 'vggt')
+LINGBOT_DIR = os.path.join(os.path.dirname(__file__), 'lingbot_map')
 sys.path.insert(0, MAST3R_DIR)
 sys.path.insert(0, os.path.join(MAST3R_DIR, 'dust3r'))
 sys.path.insert(0, VGGT_DIR)
+sys.path.insert(0, LINGBOT_DIR)
 
 from mast3r.model import AsymmetricMASt3R
 from mast3r.image_pairs import make_pairs as mast3r_make_pairs
@@ -73,6 +75,20 @@ def load_model(backend):
         print("Loading VGGT-1B...")
         model = VGGT.from_pretrained("facebook/VGGT-1B").to(DEVICE)
         model.eval()
+    elif backend == 'lingbot':
+        from lingbot_map.models.gct_stream import GCTStream
+        from huggingface_hub import hf_hub_download
+        print("Loading LingBot-Map (GCT-Stream)...")
+        model = GCTStream(
+            img_size=518, patch_size=14, enable_3d_rope=True,
+            max_frame_num=4096, kv_cache_sliding_window=16,
+            kv_cache_scale_frames=8, kv_cache_cross_frame_special=True,
+            kv_cache_include_scale_frames=True, use_sdpa=True)
+        ckpt_path = hf_hub_download("robbyant/lingbot-map", filename="lingbot-map.pt")
+        ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+        state_dict = ckpt.get("model", ckpt)
+        model.load_state_dict(state_dict, strict=False)
+        model.to(DEVICE).eval()
 
     MODELS[backend] = model
     print(f"{backend} loaded.")
@@ -205,6 +221,110 @@ def _reconstruct_vggt(paths):
     gc.collect()
 
     return VGGTScene(imgs_list, extrinsic, intrinsic, pts3d_list, conf_list, original_sizes)
+
+
+def _reconstruct_lingbot(paths, keyframe_interval=1, progress_cb=None):
+    """Run LingBot-Map streaming reconstruction on a sequence of images.
+
+    Uses causal attention with KV cache — handles long video sequences
+    that would OOM with batch-only models like VGGT.
+
+    Args:
+        paths: list of image file paths
+        keyframe_interval: process every Nth frame (1=all, 2=skip half, etc.)
+        progress_cb: optional callback(frac, msg) for progress updates
+    """
+    from lingbot_map.utils.load_fn import load_and_preprocess_images
+    from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
+
+    model = load_model('lingbot')
+
+    images = load_and_preprocess_images(
+        paths, mode="crop", image_size=518, patch_size=14).to(DEVICE)
+    N = images.shape[0]
+    print(f"LingBot-Map: {N} images, shape {images.shape}, "
+          f"keyframe_interval={keyframe_interval}")
+
+    if progress_cb:
+        progress_cb(0.1, f"Running LingBot-Map on {N} frames...")
+
+    # Streaming inference with KV cache
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", dtype=DTYPE):
+            predictions = model.inference_streaming(
+                images,
+                num_scale_frames=min(8, N),
+                keyframe_interval=keyframe_interval)
+
+    if progress_cb:
+        progress_cb(0.7, "Extracting poses and points...")
+
+    # Decode poses
+    pose_enc = predictions["pose_enc"]  # (1, N, 9)
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+        pose_enc, images.shape[-2:])
+    extrinsic = extrinsic.squeeze(0).cpu().numpy()  # (N, 3, 4) w2c
+    intrinsic = intrinsic.squeeze(0).cpu().numpy()   # (N, 3, 3)
+
+    # Unproject depth to 3D world space
+    # Use lingbot's own unproject which matches its pose convention
+    from lingbot_map.utils.geometry import unproject_depth_map_to_point_map
+    depth_map = predictions["depth"].squeeze(0).cpu().numpy()  # (N, H, W, 1) or (N, H, W)
+    depth_conf = predictions["depth_conf"].squeeze(0).cpu().numpy()  # (N, H, W)
+
+    if depth_map.ndim == 3:
+        depth_map = depth_map[..., None]
+
+    # lingbot demo postprocess() inverts w2c→c2w before passing to unproject.
+    # unproject then inverts again internally (expects w2c, inverts to c2w).
+    # So the double inversion cancels out. To match demo behavior:
+    # pass c2w to unproject (it will invert to w2c, which is wrong... but matches demo).
+    # Actually: let's just replicate what the demo does exactly.
+    from lingbot_map.utils.geometry import closed_form_inverse_se3
+    # extrinsic is (N, 3, 4) w2c. Pad to 4x4, invert to c2w, take 3x4 back.
+    ext_4x4 = np.zeros((N, 4, 4), dtype=extrinsic.dtype)
+    ext_4x4[:, :3, :4] = extrinsic
+    ext_4x4[:, 3, 3] = 1.0
+    c2w_4x4 = closed_form_inverse_se3(ext_4x4)
+    c2w_34 = c2w_4x4[:, :3, :4]  # (N, 3, 4) c2w
+
+    # Pass c2w to unproject (which will invert again → w2c, then unproject correctly)
+    # This matches the demo's double-inversion flow
+    pts3d = unproject_depth_map_to_point_map(depth_map, c2w_34, intrinsic)
+
+    print(f"  depth range: [{depth_map.min():.3f}, {depth_map.max():.3f}]")
+    print(f"  depth_conf range: [{depth_conf.min():.3f}, {depth_conf.max():.3f}]")
+    print(f"  pts3d range: [{pts3d[np.isfinite(pts3d)].min():.3f}, {pts3d[np.isfinite(pts3d)].max():.3f}]")
+
+    # Store c2w as the extrinsic (since camera viz inverts w2c→c2w, passing c2w
+    # means it'll double-invert to w2c... we need to figure out what desktop_app expects)
+    # VGGTScene._extrinsic should be w2c (3,4). Keep original w2c.
+
+    # Build image list
+    imgs_np = images.cpu().numpy().transpose(0, 2, 3, 1)  # (N, H, W, 3)
+    imgs_list = [imgs_np[i] for i in range(N)]
+    pts3d_list = [pts3d[i] for i in range(N)]
+    conf_list = [depth_conf[i] for i in range(N)]
+
+    # Original image sizes for COLMAP export
+    from PIL import Image as PILImage
+    from PIL.ImageOps import exif_transpose
+    original_sizes = []
+    for p in paths:
+        img = exif_transpose(PILImage.open(p)).convert('RGB')
+        original_sizes.append(img.size)
+
+    del predictions, images
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print(f"LingBot-Map complete: {N} frames, "
+          f"conf range [{min(c.min() for c in conf_list):.2f}, "
+          f"{max(c.max() for c in conf_list):.2f}]")
+    # Points were unprojected with the double-inversion flow (c2w passed to
+    # unproject which inverts again). Camera viz inverts _extrinsic (w2c→c2w).
+    # Store c2w so the viz inversion produces w2c, matching the point cloud frame.
+    return VGGTScene(imgs_list, c2w_34, intrinsic, pts3d_list, conf_list, original_sizes)
 
 
 def _reconstruct_vggt_equirect(path):
