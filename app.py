@@ -54,7 +54,7 @@ TMPDIR = tempfile.mkdtemp(prefix='3dgs_pipeline_')
 _original_paths = []
 
 
-def load_model(backend):
+def load_model(backend, **kwargs):
     """Load model on demand, caching for reuse."""
     if backend in MODELS:
         return MODELS[backend]
@@ -79,9 +79,10 @@ def load_model(backend):
         from lingbot_map.models.gct_stream import GCTStream
         from huggingface_hub import hf_hub_download
         print("Loading LingBot-Map (GCT-Stream)...")
+        kv_window = kwargs.get('kv_window', 16)
         model = GCTStream(
             img_size=518, patch_size=14, enable_3d_rope=True,
-            max_frame_num=4096, kv_cache_sliding_window=16,
+            max_frame_num=4096, kv_cache_sliding_window=kv_window,
             kv_cache_scale_frames=8, kv_cache_cross_frame_special=True,
             kv_cache_include_scale_frames=True, use_sdpa=True)
         ckpt_path = hf_hub_download("robbyant/lingbot-map", filename="lingbot-map.pt")
@@ -223,7 +224,8 @@ def _reconstruct_vggt(paths):
     return VGGTScene(imgs_list, extrinsic, intrinsic, pts3d_list, conf_list, original_sizes)
 
 
-def _reconstruct_lingbot(paths, keyframe_interval=1, progress_cb=None):
+def _reconstruct_lingbot(paths, keyframe_interval=1, num_scale_frames=8,
+                         kv_window=16, progress_cb=None):
     """Run LingBot-Map streaming reconstruction on a sequence of images.
 
     Uses causal attention with KV cache — handles long video sequences
@@ -232,12 +234,14 @@ def _reconstruct_lingbot(paths, keyframe_interval=1, progress_cb=None):
     Args:
         paths: list of image file paths
         keyframe_interval: process every Nth frame (1=all, 2=skip half, etc.)
+        num_scale_frames: initial bidirectional frames for scale estimation
+        kv_window: KV cache sliding window size
         progress_cb: optional callback(frac, msg) for progress updates
     """
     from lingbot_map.utils.load_fn import load_and_preprocess_images
     from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 
-    model = load_model('lingbot')
+    model = load_model('lingbot', kv_window=kv_window)
 
     images = load_and_preprocess_images(
         paths, mode="crop", image_size=518, patch_size=14).to(DEVICE)
@@ -253,7 +257,7 @@ def _reconstruct_lingbot(paths, keyframe_interval=1, progress_cb=None):
         with torch.amp.autocast("cuda", dtype=DTYPE):
             predictions = model.inference_streaming(
                 images,
-                num_scale_frames=min(8, N),
+                num_scale_frames=min(num_scale_frames, N),
                 keyframe_interval=keyframe_interval)
 
     if progress_cb:

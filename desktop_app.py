@@ -1082,6 +1082,8 @@ class AppState:
         self.vggt_ensemble = False
         self.vggt_equirect = False  # treat single image as equirectangular panorama
         self.lingbot_keyframe_interval = 1  # process every Nth frame (1=all)
+        self.lingbot_scale_frames = 8      # initial bidirectional frames for scale
+        self.lingbot_kv_window = 16        # sliding window size for KV cache
 
         # Reconstruction
         self.scene = None
@@ -1266,6 +1268,8 @@ def run_reconstruction(state, scene_gl):
             vggt_scene = _reconstruct_lingbot(
                 state.image_paths,
                 keyframe_interval=state.lingbot_keyframe_interval,
+                num_scale_frames=state.lingbot_scale_frames,
+                kv_window=state.lingbot_kv_window,
                 progress_cb=_lingbot_progress)
 
         if backend == 'vggt':
@@ -4918,8 +4922,16 @@ def main():
             _, state.vggt_equirect = imgui.checkbox("Equirectangular panorama (single 360° image)", state.vggt_equirect)
 
         if state.backends[state.backend_idx] == 'lingbot':
+            _, state.lingbot_scale_frames = imgui.slider_int(
+                "Scale Frames", state.lingbot_scale_frames, 2, 16)
             _, state.lingbot_keyframe_interval = imgui.slider_int(
                 "Keyframe Interval", state.lingbot_keyframe_interval, 1, 10)
+            changed_kv, state.lingbot_kv_window = imgui.slider_int(
+                "KV Cache Window", state.lingbot_kv_window, 8, 64)
+            if changed_kv:
+                # Force model reload with new KV window size
+                import app as app_mod
+                app_mod.MODELS.pop('lingbot', None)
             imgui.text_colored("Streaming SLAM — handles long videos", 0.5, 0.8, 0.5, 1.0)
 
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
