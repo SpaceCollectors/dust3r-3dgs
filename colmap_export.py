@@ -1,9 +1,8 @@
 """
-Export DUSt3R or MASt3R scene to COLMAP format for Gaussian Splatting.
+Export a CanonicalScene to COLMAP format for Gaussian Splatting.
 
-Handles both scene types:
-  - DUSt3R: BasePCOptimizer / PairViewer
-  - MASt3R: SparseGA
+All reconstruction backends produce a CanonicalScene, which this module
+consumes uniformly — no backend-specific branching.
 
 Output structure:
   <output_dir>/
@@ -20,20 +19,12 @@ from PIL import Image
 from PIL.ImageOps import exif_transpose
 from scipy.spatial.transform import Rotation
 
-import torch
-
 import sys
 MAST3R_DIR = os.path.join(os.path.dirname(__file__), 'mast3r')
 sys.path.insert(0, MAST3R_DIR)
 sys.path.insert(0, os.path.join(MAST3R_DIR, 'dust3r'))
 
-from dust3r.utils.device import to_numpy
 from dust3r.utils.geometry import opencv_to_colmap_intrinsics
-
-
-def _is_vggt_scene(scene):
-    """Check if scene uses VGGT-style intrinsic scaling (backward compat)."""
-    return hasattr(scene, '_is_vggt')
 
 
 def rotmat_to_qvec(R):
@@ -43,30 +34,21 @@ def rotmat_to_qvec(R):
     return np.array([quat[3], quat[0], quat[1], quat[2]])
 
 
-def _extract_scene_data(scene, min_conf_thr, clean_depth):
-    """Extract scene data. CanonicalScene provides everything directly."""
-    imgs = scene.images if hasattr(scene, 'images') else scene.imgs
-    cam2world = scene.c2w if hasattr(scene, 'c2w') else to_numpy(scene.get_im_poses().cpu())
-    intrinsics = [scene.intrinsics[i] for i in range(len(imgs))]
-    pts3d_list = scene.pts3d if hasattr(scene, 'pts3d') else scene._pts3d
-    confs_list = scene.confidence if hasattr(scene, 'confidence') else scene._depth_conf
-
-    return imgs, intrinsics, cam2world, pts3d_list, confs_list
-
-
 def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
                            clean_depth=True, dense_colors=None):
     """
-    Export a DUSt3R or MASt3R scene to COLMAP text format.
+    Export a CanonicalScene to COLMAP text format.
 
-    Saves original full-resolution images and scales intrinsics
-    (computed at 512px) to match.
+    Saves original full-resolution images and scales intrinsics to match.
     """
     if scene is None:
         raise ValueError("Scene is None, run reconstruction first.")
 
-    imgs, intrinsics, cam2world, pts3d_list, confs_list = \
-        _extract_scene_data(scene, min_conf_thr, clean_depth)
+    imgs = scene.images
+    intrinsics = [scene.intrinsics[i] for i in range(len(imgs))]
+    cam2world = scene.c2w
+    pts3d_list = scene.pts3d
+    confs_list = scene.confidence
 
     n_images = len(imgs)
 
@@ -112,18 +94,7 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
         K = intrinsics[i].copy()
         orig_W, orig_H = original_sizes[i]
 
-        if hasattr(scene, 'scale_intrinsics_to'):
-            K = scene.scale_intrinsics_to(orig_W, orig_H, i)
-        elif _is_vggt_scene(scene):
-            ratio = max(orig_W, orig_H) / 518.0
-            K[0, 0] *= ratio
-            K[1, 1] *= ratio
-            K[0, 2] = orig_W / 2.0
-            K[1, 2] = orig_H / 2.0
-        else:
-            sx, sy = scale_factors[i]
-            K[0, 0] *= sx; K[0, 2] *= sx
-            K[1, 1] *= sy; K[1, 2] *= sy
+        K = scene.scale_intrinsics_to(orig_W, orig_H, i)
 
         K = opencv_to_colmap_intrinsics(K)
         cam_params.append((orig_W, orig_H, K[0, 0], K[1, 1], K[0, 2], K[1, 2]))
@@ -148,6 +119,9 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
     all_colors = []
     all_confs_flat = []
 
+    # Collect all flat points first, then match colors
+    dense_colors_offset = 0  # track offset into dense_colors for flat arrays
+
     for i in range(min(n_images, len(pts3d_list))):
         pts = pts3d_list[i]
         conf = confs_list[i] if i < len(confs_list) else None
@@ -155,28 +129,43 @@ def export_scene_to_colmap(scene, image_paths, output_dir, min_conf_thr=2.0,
         if conf is None:
             continue
 
-        # Skip if pts and image shapes don't match (e.g., dense cloud vs small image)
-        if i < len(imgs) and pts.ndim == 3 and pts.shape[:2] == imgs[i].shape[:2]:
-            if _is_vggt_scene(scene) or _is_mast3r_scene(scene):
-                mask = conf > min_conf_thr
-            else:
-                mask = conf > np.median(conf)
+        if pts.ndim == 3 and i < len(imgs) and pts.shape[:2] == imgs[i].shape[:2]:
+            # Dense per-view pointmap — extract colors from corresponding image
+            mask = conf > min_conf_thr
             all_pts.append(pts[mask])
             all_colors.append((np.clip(imgs[i][mask], 0, 1) * 255).astype(np.uint8))
             all_confs_flat.append(conf[mask])
         elif pts.ndim == 2:
-            # Flat array (e.g., COLMAP dense cloud)
+            # Flat array (decimated/densified cloud)
             mask = conf.ravel() > min_conf_thr if conf is not None else np.ones(len(pts), dtype=bool)
             all_pts.append(pts[mask])
-            # Use dense_colors if available, otherwise grey
-            if dense_colors is not None and len(dense_colors) == len(pts):
+            # Use dense_colors if available
+            if dense_colors is not None and len(dense_colors) >= dense_colors_offset + len(pts):
+                cols = dense_colors[dense_colors_offset:dense_colors_offset + len(pts)][mask]
+                if cols.dtype != np.uint8:
+                    if cols.max() <= 1.0:
+                        cols = (np.clip(cols, 0, 1) * 255).astype(np.uint8)
+                    else:
+                        cols = np.clip(cols, 0, 255).astype(np.uint8)
+                all_colors.append(cols)
+            elif dense_colors is not None and len(dense_colors) == len(pts):
                 cols = dense_colors[mask]
-                if cols.max() <= 1.0:
-                    cols = (np.clip(cols, 0, 1) * 255).astype(np.uint8)
-                all_colors.append(cols.astype(np.uint8))
+                if cols.dtype != np.uint8:
+                    if cols.max() <= 1.0:
+                        cols = (np.clip(cols, 0, 1) * 255).astype(np.uint8)
+                    else:
+                        cols = np.clip(cols, 0, 255).astype(np.uint8)
+                all_colors.append(cols)
             else:
                 all_colors.append(np.full((mask.sum(), 3), 128, dtype=np.uint8))
             all_confs_flat.append(conf.ravel()[mask] if conf is not None else np.ones(mask.sum()))
+            dense_colors_offset += len(pts)
+        elif pts.ndim == 3:
+            # Dense pointmap but no matching image — extract colors if possible
+            mask = conf.reshape(pts.shape[:2]) > min_conf_thr
+            all_pts.append(pts[mask])
+            all_colors.append(np.full((mask.sum(), 3), 180, dtype=np.uint8))
+            all_confs_flat.append(conf.reshape(pts.shape[:2])[mask])
         else:
             continue
 

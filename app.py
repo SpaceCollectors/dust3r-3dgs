@@ -272,39 +272,28 @@ def _reconstruct_lingbot(paths, keyframe_interval=1, num_scale_frames=8,
     extrinsic = extrinsic.squeeze(0).cpu().numpy()  # (N, 3, 4) w2c
     intrinsic = intrinsic.squeeze(0).cpu().numpy()   # (N, 3, 3)
 
-    # Unproject depth to 3D world space
-    # Use lingbot's own unproject which matches its pose convention
-    from lingbot_map.utils.geometry import unproject_depth_map_to_point_map
-    depth_map = predictions["depth"].squeeze(0).cpu().numpy()  # (N, H, W, 1) or (N, H, W)
+    # Unproject depth to 3D world space.
+    # LingBot's streaming inference requires the demo's double-inversion:
+    # invert w2c→c2w, pass c2w to unproject (which inverts again internally).
+    from lingbot_map.utils.geometry import (
+        unproject_depth_map_to_point_map, closed_form_inverse_se3)
+    depth_map = predictions["depth"].squeeze(0).cpu().numpy()
     depth_conf = predictions["depth_conf"].squeeze(0).cpu().numpy()  # (N, H, W)
 
     if depth_map.ndim == 3:
         depth_map = depth_map[..., None]
 
-    # lingbot demo postprocess() inverts w2c→c2w before passing to unproject.
-    # unproject then inverts again internally (expects w2c, inverts to c2w).
-    # So the double inversion cancels out. To match demo behavior:
-    # pass c2w to unproject (it will invert to w2c, which is wrong... but matches demo).
-    # Actually: let's just replicate what the demo does exactly.
-    from lingbot_map.utils.geometry import closed_form_inverse_se3
-    # extrinsic is (N, 3, 4) w2c. Pad to 4x4, invert to c2w, take 3x4 back.
     ext_4x4 = np.zeros((N, 4, 4), dtype=extrinsic.dtype)
     ext_4x4[:, :3, :4] = extrinsic
     ext_4x4[:, 3, 3] = 1.0
     c2w_4x4 = closed_form_inverse_se3(ext_4x4)
     c2w_34 = c2w_4x4[:, :3, :4]  # (N, 3, 4) c2w
 
-    # Pass c2w to unproject (which will invert again → w2c, then unproject correctly)
-    # This matches the demo's double-inversion flow
     pts3d = unproject_depth_map_to_point_map(depth_map, c2w_34, intrinsic)
 
     print(f"  depth range: [{depth_map.min():.3f}, {depth_map.max():.3f}]")
     print(f"  depth_conf range: [{depth_conf.min():.3f}, {depth_conf.max():.3f}]")
     print(f"  pts3d range: [{pts3d[np.isfinite(pts3d)].min():.3f}, {pts3d[np.isfinite(pts3d)].max():.3f}]")
-
-    # Store c2w as the extrinsic (since camera viz inverts w2c→c2w, passing c2w
-    # means it'll double-invert to w2c... we need to figure out what desktop_app expects)
-    # VGGTScene._extrinsic should be w2c (3,4). Keep original w2c.
 
     # Build image list
     imgs_np = images.cpu().numpy().transpose(0, 2, 3, 1)  # (N, H, W, 3)
@@ -327,6 +316,8 @@ def _reconstruct_lingbot(paths, keyframe_interval=1, num_scale_frames=8,
     print(f"LingBot-Map complete: {N} frames, "
           f"conf range [{min(c.min() for c in conf_list):.2f}, "
           f"{max(c.max() for c in conf_list):.2f}]")
+    # Pass c2w_34 — from_lingbot inverts it (the double-inversion frame
+    # requires this extra inversion to produce consistent c2w for the viewport).
     from canonical_scene import from_lingbot
     return from_lingbot(imgs_list, c2w_34, intrinsic, pts3d_list, conf_list, original_sizes)
 
@@ -730,42 +721,13 @@ def _reconstruct_vggt_ensemble(paths, bundle_size=20, n_anchors=16):
     return from_vggt(imgs_list, global_extrinsic, global_intrinsic, pts3d_list, conf_list, original_sizes)
 
 
-# ── Scene data extraction (handles all backends) ────────────────────────────
-
-def _is_mast3r_scene(scene):
-    return hasattr(scene, 'canonical_paths')
-
-
-def _is_vggt_scene(scene):
-    return hasattr(scene, '_is_vggt')
-
+# ── Scene data extraction (all backends go through CanonicalScene) ───────────
 
 def _extract_dense_pts3d(scene, min_conf_thr, clean_depth):
-    """Extract pts3d and masks from any scene type, returning (H,W,3) arrays."""
-    rgbimg = scene.imgs
-
-    if _is_vggt_scene(scene):
-        pts3d = scene._pts3d
-        # VGGT conf is percentile-based, threshold differently
-        msk = [scene._depth_conf[i] > min_conf_thr for i in range(len(rgbimg))]
-        return pts3d, msk
-    elif _is_mast3r_scene(scene):
-        pts3d_raw, _, confs_raw = scene.get_dense_pts3d(clean_depth=clean_depth)
-        pts3d = []
-        msk = []
-        for i in range(len(rgbimg)):
-            H, W = rgbimg[i].shape[:2]
-            pts3d.append(to_numpy(pts3d_raw[i]).reshape(H, W, 3))
-            msk.append(to_numpy(confs_raw[i]) > min_conf_thr)
-        return pts3d, msk
-    else:
-        # DUSt3R
-        if clean_depth:
-            scene = scene.clean_pointcloud()
-        pts3d = to_numpy(scene.get_pts3d())
-        scene.min_conf_thr = float(scene.conf_trf(torch.tensor(min_conf_thr)))
-        msk = to_numpy(scene.get_masks())
-        return pts3d, msk
+    """Extract pts3d and masks from a CanonicalScene."""
+    pts3d = scene.pts3d
+    msk = [scene.confidence[i] > min_conf_thr for i in range(len(scene.images))]
+    return pts3d, msk
 
 
 # ── Core Pipeline ────────────────────────────────────────────────────────────
@@ -811,10 +773,14 @@ def reconstruct(filelist, backend, optim_level, schedule, niter1, niter2, min_co
         scene_graph = '-'.join(sg_parts)
 
         if backend == 'dust3r':
-            scene = _reconstruct_dust3r(paths, imgs, scene_graph, niter1, schedule)
+            raw_scene = _reconstruct_dust3r(paths, imgs, scene_graph, niter1, schedule)
+            from canonical_scene import from_dust3r
+            scene = from_dust3r(raw_scene, _original_paths)
         else:
-            scene = _reconstruct_mast3r(paths, imgs, scene_graph, niter1, niter2,
+            raw_scene = _reconstruct_mast3r(paths, imgs, scene_graph, niter1, niter2,
                                         optim_level, matching_conf_thr, shared_intrinsics)
+            from canonical_scene import from_mast3r
+            scene = from_mast3r(raw_scene, _original_paths)
 
     outfile = get_3d_preview(scene, min_conf_thr, as_pointcloud,
                              mask_sky, clean_depth, transparent_cams, cam_size)

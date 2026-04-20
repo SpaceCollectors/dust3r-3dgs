@@ -6,10 +6,10 @@ consumes only this format.
 
 Conventions:
 - c2w: always camera-to-world (4x4), OpenCV coords (x-right, y-down, z-forward)
-- intrinsics: K matrices at the model's internal resolution
+- intrinsics: K matrices at the model's internal resolution (or original res for colmap)
 - pts3d: world-space 3D points
 - confidence: raw per-pixel confidence (higher = better)
-- images: float [0,1] at model's internal resolution
+- images: float [0,1] at model's internal resolution (or original res for colmap)
 """
 
 import numpy as np
@@ -30,7 +30,8 @@ class CanonicalScene:
             intrinsics: (N,3,3) float64 numpy — K matrices at internal resolution
             original_sizes: list of (W,H) tuples — original image sizes
             backend: str — source backend name
-            internal_resolution: int — model's working resolution (512 or 518)
+            internal_resolution: int — model's working resolution (512 or 518),
+                                 0 means intrinsics are already at original resolution
         """
         self.images = images
         self.pts3d = pts3d
@@ -41,17 +42,14 @@ class CanonicalScene:
         self.backend = backend
         self.internal_resolution = internal_resolution
 
-        # For backward compat with code that checks hasattr(scene, '_is_vggt')
-        self._is_vggt = True
-
         # Optional equirect metadata (set by equirect backend)
         self.equirect = None
 
-    # ── Convenience accessors ──────────────────────────────────────────
+    # ── Convenience accessors ───────────────────���──────────────────────
 
     @property
     def imgs(self):
-        """Alias for images (backward compat)."""
+        """Alias for images."""
         return self.images
 
     @imgs.setter
@@ -73,51 +71,42 @@ class CanonicalScene:
     def scale_intrinsics_to(self, orig_w, orig_h, i):
         """Scale intrinsics from internal resolution to original image size.
 
-        VGGT/LingBot: scale by max(W,H) / internal_res
-        DUSt3R/MASt3R: scale by per-axis ratios
+        colmap: intrinsics already at original resolution, return as-is
+        VGGT/LingBot/DUSt3R/MASt3R: scale by per-axis ratios from model
+               image dimensions to original image dimensions.
+
+        Note: VGGT/LingBot K has cx=int_w/2, cy=int_h/2 from the model,
+        so we replace cx/cy with orig/2 (pinhole at image center).
         """
         K = self.intrinsics[i].copy()
+
+        if self.internal_resolution == 0 or self.backend in ('colmap',):
+            return K
+
         img = self.images[i]
         int_h, int_w = img.shape[:2]
 
-        if self.backend in ('vggt', 'lingbot'):
-            ratio = max(orig_w, orig_h) / float(self.internal_resolution)
-            K[0, 0] *= ratio
-            K[1, 1] *= ratio
-            K[0, 2] = orig_w / 2.0
-            K[1, 2] = orig_h / 2.0
-        else:
-            sx = orig_w / int_w
-            sy = orig_h / int_h
-            K[0, 0] *= sx; K[0, 2] *= sx
-            K[1, 1] *= sy; K[1, 2] *= sy
+        sx = orig_w / int_w
+        sy = orig_h / int_h
+        K[0, 0] *= sx
+        K[1, 1] *= sy
+        K[0, 2] = orig_w / 2.0
+        K[1, 2] = orig_h / 2.0
         return K
 
-    # ── Backward compat shims ─────────────────────────────────────────
 
-    # These properties let old code that reads scene._extrinsic, scene._pts3d,
-    # scene._depth_conf, scene._intrinsic still work during migration.
+# ── Helper ─────────────────────────────────────────────────────────────────
 
-    @property
-    def _extrinsic(self):
-        """Return w2c (3,4) matrices for backward compat."""
-        w2c_list = []
-        for i in range(len(self.images)):
-            w2c = self.get_w2c(i)
-            w2c_list.append(w2c[:3, :4])
-        return np.array(w2c_list)
-
-    @property
-    def _intrinsic(self):
-        return self.intrinsics
-
-    @property
-    def _pts3d(self):
-        return self.pts3d
-
-    @property
-    def _depth_conf(self):
-        return self.confidence
+def _w2c_34_to_c2w_44(w2c_34):
+    """Convert (N, 3, 4) w2c matrices to (N, 4, 4) c2w matrices."""
+    w2c_34 = np.asarray(w2c_34)
+    N = len(w2c_34)
+    c2w = np.zeros((N, 4, 4), dtype=np.float64)
+    for i in range(N):
+        w2c_44 = np.eye(4)
+        w2c_44[:3, :] = w2c_34[i]
+        c2w[i] = np.linalg.inv(w2c_44)
+    return c2w
 
 
 # ── Backend converters ────────────────────────────────────────────────────
@@ -190,14 +179,7 @@ def from_vggt(imgs_list, extrinsic_w2c, intrinsic, pts3d_list, conf_list,
     Args:
         extrinsic_w2c: (N, 3, 4) w2c extrinsics from pose_encoding_to_extri_intri
     """
-    # Convert w2c (3,4) → c2w (4,4)
-    N = len(imgs_list)
-    c2w = np.zeros((N, 4, 4), dtype=np.float64)
-    for i in range(N):
-        w2c_44 = np.eye(4)
-        w2c_44[:3, :] = extrinsic_w2c[i]
-        c2w[i] = np.linalg.inv(w2c_44)
-
+    c2w = _w2c_34_to_c2w_44(extrinsic_w2c)
     return CanonicalScene(
         images=imgs_list, pts3d=pts3d_list, confidence=conf_list,
         c2w=c2w, intrinsics=intrinsic, original_sizes=original_sizes,
@@ -209,21 +191,28 @@ def from_lingbot(imgs_list, c2w_34, intrinsic, pts3d_list, conf_list,
     """Convert LingBot-Map outputs to CanonicalScene.
 
     Args:
-        c2w_34: (N, 3, 4) c2w extrinsics (after the double-inversion flow,
-                these are the poses that are consistent with the point cloud).
+        c2w_34: (N, 3, 4) c2w from the demo's double-inversion flow.
+                The double-inverted unproject produces points in a frame where
+                c2w_34 acts as w2c. Inverting it gives the pose that is
+                consistent with both the points AND the COLMAP projection
+                (verified: K @ inv(stored_c2w) @ pt reprojects to correct pixel).
     """
-    # The c2w_34 from lingbot's double-inversion flow are actually w2c
-    # in the point cloud's frame. Invert to get true c2w in that frame.
-    N = len(imgs_list)
-    c2w = np.zeros((N, 4, 4), dtype=np.float64)
-    for i in range(N):
-        ext_44 = np.eye(4)
-        ext_44[:3, :] = c2w_34[i]
-        # c2w_34 was stored as c2w from the original convention, but in the
-        # double-inverted point frame it acts as w2c. Invert to get c2w.
-        c2w[i] = np.linalg.inv(ext_44)
-
+    c2w = _w2c_34_to_c2w_44(c2w_34)
     return CanonicalScene(
         images=imgs_list, pts3d=pts3d_list, confidence=conf_list,
         c2w=c2w, intrinsics=intrinsic, original_sizes=original_sizes,
         backend='lingbot', internal_resolution=518)
+
+
+def from_w2c(imgs_list, w2c_34, intrinsic, pts3d_list, conf_list,
+             original_sizes, backend='generic', internal_resolution=512):
+    """Generic converter from w2c (N,3,4) extrinsics to CanonicalScene.
+
+    Use this for backends like Pow3R or COLMAP SfM that produce w2c extrinsics.
+    Set internal_resolution=0 when intrinsics are already at original resolution.
+    """
+    c2w = _w2c_34_to_c2w_44(w2c_34)
+    return CanonicalScene(
+        images=imgs_list, pts3d=pts3d_list, confidence=conf_list,
+        c2w=c2w, intrinsics=intrinsic, original_sizes=original_sizes,
+        backend=backend, internal_resolution=internal_resolution)

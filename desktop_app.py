@@ -1340,7 +1340,7 @@ def run_reconstruction(state, scene_gl):
                 pts3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
                 imgs_np = images.cpu().numpy().transpose(0, 2, 3, 1)
 
-                from app import VGGTScene
+                from canonical_scene import from_vggt
                 from PIL import Image as PILImage
                 from PIL.ImageOps import exif_transpose
                 orig_sizes = []
@@ -1360,23 +1360,23 @@ def run_reconstruction(state, scene_gl):
                     pts3d_all.append(pts3d[i])
                     conf_all.append(conf_i)
 
-                vggt_scene = VGGTScene(imgs_list, extrinsic, intrinsic,
+                vggt_scene = from_vggt(imgs_list, extrinsic, intrinsic,
                                        pts3d_all, conf_all, orig_sizes)
 
                 del model, predictions
                 torch.cuda.empty_cache()
 
         if backend in ('vggt', 'lingbot'):
-            # Extract point cloud from VGGTScene for display
+            # Extract point cloud from CanonicalScene for display
             state.status = "Extracting point cloud..."
             state.recon_frac = 0.7
             all_pts = []
             all_colors = []
             min_conf_used = state.min_conf
-            for i in range(len(vggt_scene.imgs)):
-                p = vggt_scene._pts3d[i]
-                c = vggt_scene._depth_conf[i]
-                img = vggt_scene.imgs[i]
+            for i in range(len(vggt_scene.images)):
+                p = vggt_scene.pts3d[i]
+                c = vggt_scene.confidence[i]
+                img = vggt_scene.images[i]
                 conf_mask = c > min_conf_used
                 not_padding = img.mean(axis=-1) < 0.95
                 valid = np.isfinite(p).all(axis=-1)
@@ -1395,10 +1395,10 @@ def run_reconstruction(state, scene_gl):
                 print(f"  WARNING: 0 points with min_conf={min_conf_used:.1f}, retrying with min_conf=0.5")
                 all_pts2 = []
                 all_colors2 = []
-                for i in range(len(vggt_scene.imgs)):
-                    p = vggt_scene._pts3d[i]
-                    c = vggt_scene._depth_conf[i]
-                    img = vggt_scene.imgs[i]
+                for i in range(len(vggt_scene.images)):
+                    p = vggt_scene.pts3d[i]
+                    c = vggt_scene.confidence[i]
+                    img = vggt_scene.images[i]
                     mask = (c > 0.5) & (img.mean(axis=-1) < 0.95) & np.isfinite(p).all(axis=-1)
                     all_pts2.append(p[mask])
                     all_colors2.append((img[mask] * 255).astype(np.uint8))
@@ -1539,7 +1539,7 @@ print('SUCCESS')
                 os.remove(result_path)
 
                 # Build scene from results
-                from app import VGGTScene
+                from canonical_scene import from_w2c
                 pts3d = result['pts3d']
                 confs = result['confs']
                 c2w_all = result['c2w']
@@ -1562,8 +1562,9 @@ print('SUCCESS')
                     orig_sizes.append(im.size)
 
                 # Align to cached cameras if available
-                state.scene = VGGTScene(imgs_np, extrinsic, np.stack(intrinsic_all),
-                                        pts3d, confs, orig_sizes)
+                state.scene = from_w2c(imgs_np, extrinsic, np.stack(intrinsic_all),
+                                       pts3d, confs, orig_sizes,
+                                       backend='pow3r', internal_resolution=512)
 
                 # Display
                 all_pts = [p.reshape(-1, 3) for p in pts3d]
@@ -1630,8 +1631,7 @@ print('SUCCESS')
             print(f"  COLMAP: {len(rec.images)} images, {len(rec.points3D)} points")
 
             # Build scene data compatible with our pipeline
-            # Create a lightweight scene wrapper
-            from app import VGGTScene
+            from canonical_scene import from_w2c
             import torch
 
             imgs_np = []
@@ -1713,9 +1713,10 @@ print('SUCCESS')
 
             state.image_paths = registered_paths
             orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
-            state.scene = VGGTScene(
+            state.scene = from_w2c(
                 imgs_np, np.array(extrinsics), np.array(intrinsics),
-                pts3d_all, conf_all, orig_sizes)
+                pts3d_all, conf_all, orig_sizes,
+                backend='colmap', internal_resolution=0)
 
             # Also build direct point cloud for display
             pts_xyz = np.array([p.xyz for p in rec.points3D.values()], dtype=np.float32)
@@ -1811,31 +1812,34 @@ print('SUCCESS')
                 )
                 state.scene = scene
 
+            # Convert raw DUSt3R/MASt3R scene to CanonicalScene
+            state.status = "Converting to CanonicalScene..."
+            state.recon_frac = 0.7
+            raw_scene = state.scene
+            if backend == 'dust3r':
+                from canonical_scene import from_dust3r
+                state.scene = from_dust3r(raw_scene, state.image_paths)
+                state._raw_dust3r_scene = raw_scene  # for AI depth injection
+            else:
+                from canonical_scene import from_mast3r
+                state.scene = from_mast3r(raw_scene, state.image_paths)
+
             # Extract point cloud for display
             state.status = "Extracting point cloud..."
             state.recon_frac = 0.75
             scene = state.scene
-            rgbimg = scene.imgs
-            pts3d_raw = to_numpy(scene.get_pts3d()) if not hasattr(scene, 'canonical_paths') else None
-
-            if hasattr(scene, 'canonical_paths'):
-                # MASt3R SparseGA
-                pts3d_dense, _, confs = scene.get_dense_pts3d(clean_depth=True)
-                all_pts, all_colors = [], []
-                for i in range(len(rgbimg)):
-                    H, W = rgbimg[i].shape[:2]
-                    p = to_numpy(pts3d_dense[i]).reshape(H, W, 3)
-                    c = to_numpy(confs[i])
-                    mask = c > state.min_conf
+            all_pts, all_colors = [], []
+            for i in range(len(scene.images)):
+                p = scene.pts3d[i]
+                c = scene.confidence[i]
+                img = scene.images[i]
+                if p.ndim == 3:
+                    mask = (c > state.min_conf) & np.isfinite(p).all(axis=-1)
                     all_pts.append(p[mask])
-                    all_colors.append((rgbimg[i][mask] * 255).astype(np.uint8))
-            else:
-                # DUSt3R
-                all_pts, all_colors = [], []
-                for i in range(len(rgbimg)):
-                    p = pts3d_raw[i]
+                    all_colors.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                else:
                     all_pts.append(p.reshape(-1, 3))
-                    all_colors.append((rgbimg[i].reshape(-1, 3) * 255).astype(np.uint8))
+                    all_colors.append((np.clip(img.reshape(-1, 3), 0, 1) * 255).astype(np.uint8))
 
             if all_pts:
                 # Build view_ids: which camera each point came from
@@ -1858,7 +1862,7 @@ print('SUCCESS')
             try:
                 cam_poses = []
                 if state.scene is not None:
-                    c2w_all = state.scene.get_im_poses().detach().cpu().numpy()
+                    c2w_all = state.scene.get_im_poses().numpy()
                     for i in range(len(c2w_all)):
                         cam_poses.append(c2w_all[i])
                 if cam_poses:
@@ -1926,16 +1930,14 @@ print('SUCCESS')
         if state.has_points and state.scene is not None:
             try:
                 print(f"  Alignment check: has_points={state.has_points}, scene={type(state.scene).__name__}, cached={state.cached_cameras is not None}")
-                c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
+                c2w_poses = state.scene.get_im_poses().numpy()
                 pts3d_list, confs_list = _extract_scene_data(state)
 
                 cam_list = []
-                focals = state.scene.get_focals().detach().cpu().numpy()
                 for i in range(len(c2w_poses)):
-                    f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
-                    H, W = pts3d_list[i].shape[:2] if pts3d_list[i].ndim == 3 else (384, 512)
-                    K = np.array([[f, 0, W/2], [0, f, H/2], [0, 0, 1]], dtype=np.float32)
-                    cam_list.append((c2w_poses[i].astype(np.float32), K, W, H))
+                    orig_w, orig_h = state.scene.original_sizes[i]
+                    K = state.scene.scale_intrinsics_to(orig_w, orig_h, i).astype(np.float32)
+                    cam_list.append((c2w_poses[i].astype(np.float32), K, orig_w, orig_h))
 
                 if state.cached_cameras is not None and len(state.cached_cameras) == len(cam_list):
                     # Align this reconstruction to the reference frame
@@ -1981,7 +1983,7 @@ print('SUCCESS')
         # Old auto-align disabled
         if False and state.has_points and state.scene is not None:
             try:
-                c2w_poses = state.scene.get_im_poses().detach().cpu().numpy()
+                c2w_poses = state.scene.get_im_poses().numpy()
 
                 # Method 1: Camera up vectors (try both OpenCV and OpenGL conventions)
                 avg_up_cv = np.zeros(3, dtype=np.float64)   # OpenCV: -Y is up
@@ -2070,6 +2072,10 @@ print('SUCCESS')
 
 def run_depth_injection(state, scene_gl):
     """Inject AI depth into dust3r's scene and regenerate point cloud."""
+    raw_scene = getattr(state, '_raw_dust3r_scene', None)
+    if raw_scene is None:
+        state.status = "AI depth injection requires DUSt3R backend"
+        return
     state.status = "Injecting AI depth..."
     try:
         from depth_inject import inject_ai_depth
@@ -2079,7 +2085,7 @@ def run_depth_injection(state, scene_gl):
             state.status = msg
 
         new_pts3d = inject_ai_depth(
-            state.scene, state.scene.imgs,
+            raw_scene, state.scene.images,
             mix=state.ai_depth_mix,
             highpass_sigma=state.ai_highpass_radius,
             device='cuda', progress_fn=progress)
@@ -2089,10 +2095,14 @@ def run_depth_injection(state, scene_gl):
             from depth_inject import refine_poses_with_ai_depth
             state.status = "Refining camera poses..."
             refine_poses_with_ai_depth(
-                state.scene, niter=state.ai_pose_iters, lr=0.005,
+                raw_scene, niter=state.ai_pose_iters, lr=0.005,
                 progress_fn=progress)
-            # Re-get point cloud with refined poses
-            new_pts3d = to_numpy(state.scene.get_pts3d())
+            new_pts3d = to_numpy(raw_scene.get_pts3d())
+
+        # Update CanonicalScene pts3d with the new depth-injected points
+        for i in range(len(new_pts3d)):
+            state.scene.pts3d[i] = new_pts3d[i]
+        state.pts3d_list = None  # invalidate cache
 
         # Update viewport
         imgs = state.scene.imgs
@@ -2120,7 +2130,7 @@ def run_depth_injection(state, scene_gl):
 
         # Show cameras (with potentially updated poses)
         try:
-            c2w_all = to_numpy(state.scene.get_im_poses().detach().cpu())
+            c2w_all = state.scene.get_im_poses().numpy()
             cam_poses = [c2w_all[i] for i in range(len(imgs))]
             ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
             scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
@@ -2623,40 +2633,14 @@ def _detect_subject_masks(image_paths, prompt, keep=True, threshold=0.5):
 
 
 def _extract_scene_data(state):
-    """Extract pts3d and confidence from the scene.
-    CanonicalScene provides these directly. Caches for backward compat."""
+    """Extract pts3d and confidence from the CanonicalScene. Caches result."""
     if state.pts3d_list is not None and state.confs_list is not None:
         return state.pts3d_list, state.confs_list
 
     scene = state.scene
-
-    # CanonicalScene — direct access
-    if hasattr(scene, 'pts3d') and hasattr(scene, 'confidence'):
-        state.pts3d_list = scene.pts3d
-        state.confs_list = scene.confidence
-        return state.pts3d_list, state.confs_list
-
-    # Legacy fallback for raw DUSt3R/MASt3R scenes not yet converted
-    from dust3r.utils.device import to_numpy
-    imgs = scene.imgs
-
-    if hasattr(scene, 'canonical_paths'):
-        pts3d_raw, _, confs_raw = scene.get_dense_pts3d(clean_depth=True)
-        pts3d_list = [to_numpy(pts3d_raw[i]).reshape(imgs[i].shape[0], imgs[i].shape[1], 3)
-                      for i in range(len(imgs))]
-        confs_list = [to_numpy(confs_raw[i]) for i in range(len(imgs))]
-    else:
-        if hasattr(scene, 'im_conf'):
-            confs_list = [to_numpy(c) for c in scene.im_conf]
-        else:
-            confs_list = [np.ones(imgs[i].shape[:2], dtype=np.float32) * 10 for i in range(len(imgs))]
-        if hasattr(scene, 'clean_pointcloud'):
-            scene = scene.clean_pointcloud()
-        pts3d_list = [to_numpy(p) for p in scene.get_pts3d()]
-
-    state.pts3d_list = pts3d_list
-    state.confs_list = confs_list
-    return pts3d_list, confs_list
+    state.pts3d_list = scene.pts3d
+    state.confs_list = scene.confidence
+    return state.pts3d_list, state.confs_list
 
 
 
@@ -2775,11 +2759,14 @@ def _run_decimate_points(state, scene_gl):
         state.has_points = True
         state.points_modified = True
 
-        # Replace scene data so mesh generation uses decimated points
-        # Store as a single flat view in the cached lists
+        # Sync decimated data into both state cache and CanonicalScene.
+        # Keep original scene.images (needed for COLMAP image export).
+        # Store decimated colors in _dense_colors for COLMAP point colors.
         state.pts3d_list = [merged_pts]
         state.confs_list = [merged_conf]
-        scene.imgs = [merged_cols.astype(np.float32) / 255.0]
+        scene.pts3d = [merged_pts]
+        scene.confidence = [merged_conf]
+        state._dense_colors = merged_cols
         state.status = f"Decimated: {n_before:,d} → {len(merged_pts):,d} points"
 
     except Exception as e:
@@ -2849,38 +2836,17 @@ def run_bundle_adjust(state, scene_gl):
         import torch
 
         scene = state.scene
-        is_vggt = hasattr(scene, '_is_vggt')
-        is_mast3r = hasattr(scene, 'canonical_paths')
 
-        # Extract cameras
-        c2w_all = scene.get_im_poses().detach().cpu().numpy() if hasattr(scene.get_im_poses(), 'detach') \
-            else scene.get_im_poses().numpy() if hasattr(scene.get_im_poses(), 'numpy') \
-            else np.array(scene.get_im_poses())
+        # Extract cameras — CanonicalScene always returns a plain tensor
+        c2w_all = scene.get_im_poses().numpy()
         c2w_list = [c2w_all[i].astype(np.float32) for i in range(len(c2w_all))]
 
         # Extract pointmaps and intrinsics
         pts3d_list, confs_list = _extract_scene_data(state)
         K_list = []
-        from PIL import Image as PILImage
         for i in range(len(c2w_list)):
-            if is_vggt:
-                K_model = scene._intrinsic[i].copy()
-                img_pil = PILImage.open(state.image_paths[i])
-                W_full, H_full = img_pil.size
-                ratio = max(W_full, H_full) / 518.0
-                K = np.array([[K_model[0, 0] * ratio, 0, W_full / 2],
-                              [0, K_model[1, 1] * ratio, H_full / 2],
-                              [0, 0, 1]], dtype=np.float32)
-            else:
-                focals = scene.get_focals().detach().cpu().numpy()
-                f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
-                img_pil = PILImage.open(state.image_paths[i])
-                W_full, H_full = img_pil.size
-                W_model = pts3d_list[i].shape[1] if i < len(pts3d_list) and pts3d_list[i].ndim == 3 else 512
-                f_full = f * (W_full / W_model)
-                K = np.array([[f_full, 0, W_full / 2],
-                              [0, f_full, H_full / 2],
-                              [0, 0, 1]], dtype=np.float32)
+            orig_w, orig_h = scene.original_sizes[i]
+            K = scene.scale_intrinsics_to(orig_w, orig_h, i).astype(np.float32)
             K_list.append(K)
 
         def progress(msg):
@@ -2904,32 +2870,24 @@ def run_bundle_adjust(state, scene_gl):
         n = len(refined)
         old_c2w = [c2w_list[i].astype(np.float64) for i in range(n)]
 
-        # Write refined cameras back into the scene
-        if is_vggt:
-            for i in range(n):
-                c2w, K_new, W, H = refined[i]
-                w2c = np.linalg.inv(c2w.astype(np.float64))
-                scene._extrinsic[i] = w2c[:3, :].astype(np.float32)
-                if state.ba_refine_focal:
-                    scene._intrinsic[i][0, 0] = K_new[0, 0] * 518.0 / max(W, H)
-                    scene._intrinsic[i][1, 1] = K_new[1, 1] * 518.0 / max(W, H)
-        elif is_mast3r:
-            for i in range(n):
-                c2w, K_new, W, H = refined[i]
-                scene._set_pose(scene.im_poses, i,
-                                torch.tensor(c2w, dtype=torch.float32, device=scene.device),
-                                force=True)
-        else:
-            if hasattr(scene, '_set_pose'):
-                for i in range(n):
-                    c2w, K_new, W, H = refined[i]
-                    scene._set_pose(scene.im_poses, i,
-                                    torch.tensor(c2w, dtype=torch.float32, device=scene.device),
-                                    force=True)
-            elif hasattr(scene, 'im_poses') and hasattr(scene.im_poses, 'data'):
-                for i in range(n):
-                    c2w, K_new, W, H = refined[i]
-                    scene.im_poses.data[i] = torch.tensor(c2w, dtype=torch.float32)
+        # Write refined cameras back into the CanonicalScene
+        for i in range(n):
+            c2w_new, K_new, W, H = refined[i]
+            scene.c2w[i] = c2w_new.astype(np.float64)
+            if state.ba_refine_focal:
+                # Scale K_new (at original res) back to model's internal resolution
+                if scene.internal_resolution > 0 and scene.backend in ('vggt', 'lingbot'):
+                    ratio = max(W, H) / float(scene.internal_resolution)
+                    scene.intrinsics[i][0, 0] = K_new[0, 0] / ratio
+                    scene.intrinsics[i][1, 1] = K_new[1, 1] / ratio
+                elif scene.internal_resolution > 0:
+                    img = scene.images[i]
+                    int_h, int_w = img.shape[:2]
+                    scene.intrinsics[i][0, 0] = K_new[0, 0] * int_w / W
+                    scene.intrinsics[i][1, 1] = K_new[1, 1] * int_h / H
+                else:
+                    scene.intrinsics[i][0, 0] = K_new[0, 0]
+                    scene.intrinsics[i][1, 1] = K_new[1, 1]
 
         # Transform pointmaps to match refined cameras.
         # Pointmaps are in world space baked with the OLD cameras. After BA moves
@@ -2955,16 +2913,8 @@ def run_bundle_adjust(state, scene_gl):
                 transformed = (delta[:3, :3] @ flat.T).T + delta[:3, 3]
                 pts3d_list[i] = transformed.astype(np.float32)
 
-            # Update backend's internal pointmaps so COLMAP export stays consistent
-            if is_vggt and hasattr(scene, '_pts3d') and i < len(scene._pts3d):
-                scene._pts3d[i] = pts3d_list[i]
-            elif not is_vggt and not is_mast3r:
-                # DUSt3R: update internal pts3d tensor
-                pts3d_all = scene.get_pts3d()
-                if i < len(pts3d_all) and hasattr(pts3d_all[i], 'data'):
-                    pts3d_all[i].data.copy_(torch.tensor(pts3d_list[i],
-                                            dtype=pts3d_all[i].dtype,
-                                            device=pts3d_all[i].device))
+            # Update CanonicalScene's pointmaps directly
+            scene.pts3d[i] = pts3d_list[i]
 
         # Cache the transformed pointmaps
         state.pts3d_list = pts3d_list
@@ -2973,10 +2923,10 @@ def run_bundle_adjust(state, scene_gl):
 
         # Display points with updated cameras
         all_pts, all_cols = [], []
-        for i in range(len(scene.imgs)):
+        for i in range(len(scene.images)):
             p = pts3d_list[i]
             c = confs_list[i]
-            img = scene.imgs[i]
+            img = scene.images[i]
             if p.ndim == 3:
                 mask = c.reshape(p.shape[:2]) > state.min_conf if c is not None else np.ones(p.shape[:2], dtype=bool)
                 all_pts.append(p[mask])
@@ -2990,9 +2940,7 @@ def run_bundle_adjust(state, scene_gl):
             scene_gl.set_points(points, colors)
 
         # Update camera display
-        cam_poses = scene.get_im_poses()
-        if hasattr(cam_poses, 'detach'):
-            cam_poses = cam_poses.detach().cpu().numpy()
+        cam_poses = scene.get_im_poses().numpy()
         ext = np.linalg.norm(points.max(axis=0) - points.min(axis=0)) if len(all_pts) > 0 and len(points) > 0 else 1.0
         scene_gl.set_cameras([cam_poses[i] for i in range(len(cam_poses))],
                              scale=float(ext) * 0.05)
@@ -3014,26 +2962,14 @@ def run_densify_colmap(state, scene_gl):
         from mesh_export import densify_colmap
 
         # Get cameras
-        c2w_all = state.scene.get_im_poses().detach().cpu().numpy()
-        focals = state.scene.get_focals().detach().cpu().numpy()
-
+        scene = state.scene
+        c2w_all = scene.get_im_poses().numpy()
         c2w_list = [c2w_all[i].astype(np.float32) for i in range(len(c2w_all))]
         K_list = []
         pts3d_list, confs_list = _extract_scene_data(state)
         for i in range(len(c2w_all)):
-            f = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
-            # Scale focal to full-res image
-            from PIL import Image as PILImage
-            img_pil = PILImage.open(state.image_paths[i])
-            W_full, H_full = img_pil.size
-            if i < len(pts3d_list) and pts3d_list[i].ndim == 3:
-                W_model = pts3d_list[i].shape[1]
-            else:
-                W_model = 512
-            f_full = f * (W_full / W_model)
-            K = np.array([[f_full, 0, W_full / 2],
-                          [0, f_full, H_full / 2],
-                          [0, 0, 1]], dtype=np.float32)
+            orig_w, orig_h = scene.original_sizes[i]
+            K = scene.scale_intrinsics_to(orig_w, orig_h, i).astype(np.float32)
             K_list.append(K)
 
         def progress(msg):
@@ -3062,6 +2998,8 @@ def run_densify_colmap(state, scene_gl):
             # Replace point data with dense cloud, keep existing scene/cameras
             state.pts3d_list = [dense_pts]
             state.confs_list = [np.ones(len(dense_pts), dtype=np.float32) * 10.0]
+            state.scene.pts3d = state.pts3d_list
+            state.scene.confidence = state.confs_list
             state._dense_colors = dense_cols
             state.points_modified = True
 
@@ -3106,7 +3044,7 @@ def run_upscale_points(state, scene_gl):
 
         # Get existing scene data for depth alignment
         pts3d_list, confs_list = _extract_scene_data(state)
-        c2w_all = scene.get_im_poses().detach().cpu().numpy()
+        c2w_all = scene.get_im_poses().numpy()
         n_imgs = len(state.image_paths)
 
         # Load mono depth model
@@ -3212,14 +3150,13 @@ def run_upscale_points(state, scene_gl):
             aligned_depth = np.maximum(aligned_depth, 0.01).astype(np.float32)
 
             # Back-project full-res pixels to 3D using known camera
-            # Estimate K at full resolution from existing scene
             try:
-                focals = scene.get_focals().detach().cpu().numpy()
-                f_val = float(focals[i].item() if hasattr(focals[i], 'item') else focals[i])
-                fx = fy = f_val * (W_full / (existing_pts.shape[1] if existing_pts is not None and existing_pts.ndim == 3 else W_full))
+                K_full = scene.scale_intrinsics_to(W_full, H_full, i)
+                fx, fy = K_full[0, 0], K_full[1, 1]
+                cx, cy = K_full[0, 2], K_full[1, 2]
             except Exception:
                 fx = fy = W_full  # fallback
-            cx, cy = W_full / 2.0, H_full / 2.0
+                cx, cy = W_full / 2.0, H_full / 2.0
             c2w = c2w_all[i]
 
             # Create pixel grid
@@ -3325,7 +3262,7 @@ def run_dense_mesh(state, scene_gl):
         cam_poses = None
         cam_center = None
         try:
-            c2w = scene.get_im_poses().detach().cpu().numpy()
+            c2w = scene.get_im_poses().numpy()
             cam_poses = [c2w[i] for i in range(len(imgs))]
             cam_center = np.mean([c[:3, 3] for c in cam_poses], axis=0)
         except Exception:
@@ -4946,7 +4883,7 @@ def main():
             if folder:
                 try:
                     from train import load_colmap_dataset, parse_colmap_cameras, parse_colmap_images, parse_colmap_points3d
-                    from app import VGGTScene
+                    from canonical_scene import from_w2c
                     from PIL import Image as PILImage
 
                     sparse_dir = os.path.join(folder, 'sparse', '0')
@@ -5001,10 +4938,10 @@ def main():
                                 colmap_cams.append((c2w, K, W_c, H_c))
 
                             orig_sizes = [(img.shape[1], img.shape[0]) for img in imgs_np]
-                            state.scene = VGGTScene(
+                            state.scene = from_w2c(
                                 imgs_np, extrinsic, np.stack(intrinsic_all),
                                 [points], [np.ones(len(points), dtype=np.float32) * 10],
-                                orig_sizes)
+                                orig_sizes, backend='colmap', internal_resolution=0)
                             state.image_paths = img_paths
                             state.image_dir = images_dir
                             state.pts3d_list = [points]
@@ -5533,9 +5470,7 @@ def main():
                 # Fallback to scene
                 if pts is None and state.scene is not None:
                     try:
-                        from dust3r.utils.device import to_numpy
-                        all_p = to_numpy(state.scene.get_pts3d())
-                        pts = np.concatenate([p.reshape(-1, 3) for p in all_p], axis=0)
+                        pts = np.concatenate([p.reshape(-1, 3) for p in state.scene.pts3d], axis=0)
                     except Exception:
                         pass
                 if pts is not None and len(pts) > 0:
