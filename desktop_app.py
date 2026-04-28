@@ -15,6 +15,7 @@ import math
 import threading
 import io
 import collections
+import tempfile
 import numpy as np
 from pathlib import Path
 
@@ -961,7 +962,20 @@ class GLScene:
         self.cam_line_count = len(data)
 
 
-# ── App State ────────────────────────────────────────────────────────────────
+# ── App Name & Temp Dirs ─────────────────────────────────────────────────────
+
+APP_NAME = "1825_Reconstructor"
+
+# All temp data goes under one persistent folder so it can be cleaned up
+# even after a crash.  Each run creates timestamped sub-folders inside it.
+_APP_TMP_ROOT = os.path.join(tempfile.gettempdir(), APP_NAME)
+os.makedirs(_APP_TMP_ROOT, exist_ok=True)
+
+def _app_mkdtemp(prefix=""):
+    """Create a temp directory under the app's temp root and track it."""
+    path = tempfile.mkdtemp(prefix=prefix, dir=_APP_TMP_ROOT)
+    _tracked_tmpdirs.add(str(path))
+    return path
 
 def _track_tmpdir(path):
     """Register a temp directory for cleanup."""
@@ -981,6 +995,14 @@ def cleanup_temp_dirs():
             pass
     _tracked_tmpdirs.clear()
     return removed
+
+def cleanup_all_app_temps():
+    """Delete the entire app temp root (clears leftovers from crashed sessions)."""
+    import shutil
+    if os.path.isdir(_APP_TMP_ROOT):
+        shutil.rmtree(_APP_TMP_ROOT, ignore_errors=True)
+        os.makedirs(_APP_TMP_ROOT, exist_ok=True)
+        print(f"Cleaned app temp root: {_APP_TMP_ROOT}")
 
 _tracked_tmpdirs = set()
 
@@ -1023,7 +1045,7 @@ def _extract_video_frames(video_path, state):
         max_size = state.video_max_size if state.video_max_size > 0 else 999999
         est_total = min(max_frames, total_frames // step)
 
-        tmpdir = _track_tmpdir(tempfile.mkdtemp(prefix="video_frames_"))
+        tmpdir = _app_mkdtemp(prefix="video_frames_")
 
         extracted = []
         frame_idx = 0
@@ -1454,7 +1476,7 @@ def run_reconstruction(state, scene_gl):
             state.recon_frac = 0.3
 
             # Write a temp script that runs Pow3R in a clean Python environment
-            result_path = os.path.join(tempfile.gettempdir(), 'pow3r_result.pkl')
+            result_path = os.path.join(_APP_TMP_ROOT, 'pow3r_result.pkl')
             script = f'''# -*- coding: utf-8 -*-
 import sys, os, pickle, numpy as np, torch
 os.chdir({repr(SCRIPT_DIR)})
@@ -1592,7 +1614,7 @@ print('SUCCESS')
             import tempfile, shutil
             from PIL import Image as PILImage
 
-            workdir = Path(_track_tmpdir(tempfile.mkdtemp(prefix="colmap_")))
+            workdir = Path(_app_mkdtemp(prefix="colmap_"))
             state._colmap_workdir = str(workdir)  # save for densify reuse
             image_dir = workdir / "images"
             image_dir.mkdir()
@@ -1798,7 +1820,7 @@ print('SUCCESS')
                 pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
 
                 import tempfile
-                cache_dir = _track_tmpdir(tempfile.mkdtemp())
+                cache_dir = _app_mkdtemp()
                 optim_levels = ['coarse', 'refine', 'refine+depth']
                 opt = optim_levels[state.optim_level]
 
@@ -1823,6 +1845,9 @@ print('SUCCESS')
             else:
                 from canonical_scene import from_mast3r
                 state.scene = from_mast3r(raw_scene, state.image_paths)
+
+            del model
+            torch.cuda.empty_cache()
 
             # Extract point cloud for display
             state.status = "Extracting point cloud..."
@@ -1870,9 +1895,6 @@ print('SUCCESS')
                     scene_gl.set_cameras(cam_poses, scale=float(ext) * 0.05)
             except Exception:
                 pass
-
-            del model
-            torch.cuda.empty_cache()
 
         # Recentering handled by main loop via needs_recenter flag
 
@@ -1924,6 +1946,39 @@ print('SUCCESS')
                     print(f"  Subject mask applied: '{state.mask_prompt}'")
             except Exception as e:
                 print(f"  Subject masking failed: {e}")
+
+        # Rebuild point cloud after masking so sky/subject removal is visible
+        if (state.mask_sky or state.mask_prompt.strip()) and state.has_points and state.scene is not None:
+            try:
+                state.status = "Rebuilding point cloud after masking..."
+                pts3d_list, confs_list = _extract_scene_data(state)
+                scene = state.scene
+                all_pts, all_cols = [], []
+                for i in range(len(scene.imgs)):
+                    p = pts3d_list[i]
+                    c = confs_list[i]
+                    img = scene.imgs[i]
+                    if p.ndim == 3:
+                        H, W = p.shape[:2]
+                        conf_2d = c.reshape(H, W) if c.ndim != 2 else c
+                        mask = (conf_2d > state.min_conf) & np.isfinite(p).all(axis=-1)
+                        all_pts.append(p[mask])
+                        all_cols.append((np.clip(img[mask], 0, 1) * 255).astype(np.uint8))
+                    else:
+                        c_flat = c.ravel() if c is not None else np.ones(len(p), dtype=np.float32)
+                        mask = c_flat > state.min_conf
+                        all_pts.append(p[mask])
+                        all_cols.append((np.clip(img.reshape(-1, 3)[mask], 0, 1) * 255).astype(np.uint8))
+                if all_pts:
+                    points = np.concatenate(all_pts, axis=0)
+                    colors = np.concatenate(all_cols, axis=0)
+                    if len(points) > 200000:
+                        idx = np.random.choice(len(points), 200000, replace=False)
+                        points, colors = points[idx], colors[idx]
+                    scene_gl.set_points(points, colors)
+                    print(f"  Rebuilt point cloud: {len(points):,d} points after masking")
+            except Exception as e:
+                print(f"  Point cloud rebuild after masking failed: {e}")
 
         # Align to reference frame: if this is the first reconstruction, cache cameras.
         # If subsequent reconstruction, align to the cached cameras via Procrustes.
@@ -2279,11 +2334,38 @@ def _raycast_to_surface(state, camera, mx, my, window, circle_px=40, subsample=1
     if len(neighborhood) < 10:
         return None
 
-    centroid = neighborhood.mean(axis=0)
-    cov = (neighborhood - centroid).T @ (neighborhood - centroid)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    normal = eigvecs[:, 0].astype(np.float32)
+    # Average normals from many random 3-point triplets.
+    # Each triplet gives a candidate normal via cross product.
+    # Orient all to the same hemisphere, then average — outlier
+    # triplets get diluted by the large number of good ones.
+    n_pts = len(neighborhood)
+    n_samples = 500
+    rng = np.random.default_rng()
+    idx = rng.integers(0, n_pts, size=(n_samples, 3))
+
+    p0 = neighborhood[idx[:, 0]]
+    p1 = neighborhood[idx[:, 1]]
+    p2 = neighborhood[idx[:, 2]]
+    normals = np.cross(p1 - p0, p2 - p0)  # (n_samples, 3)
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    valid = lengths[:, 0] > 1e-10
+    normals = normals[valid]
+    lengths = lengths[valid]
+    normals /= lengths
+
+    if len(normals) < 10:
+        return None
+
+    # Orient all normals to same hemisphere (flip those pointing opposite to majority)
+    ref = normals[0]
+    dots = normals @ ref
+    normals[dots < 0] *= -1
+
+    # Average and normalize
+    normal = normals.mean(axis=0).astype(np.float32)
     normal /= max(np.linalg.norm(normal), 1e-8)
+
+    centroid = neighborhood.mean(axis=0)
 
     # Orient normal toward camera
     cam_pos = camera.get_position()
@@ -2486,34 +2568,40 @@ def _align_to_cached_cameras(pts3d_list, cam_poses_c2w, cached_cameras):
 
 
 def _detect_sky_masks(image_paths):
-    """Detect sky pixels in images using SegFormer semantic segmentation.
+    """Detect sky pixels in images using UperNet semantic segmentation (ADE20K).
     Returns list of (H, W) boolean masks where True = sky."""
     try:
-        from transformers import pipeline as hf_pipeline
+        from transformers import AutoModelForSemanticSegmentation, AutoImageProcessor
         from PIL import Image as PILImage
         import torch
 
+        SKY_LABEL_ID = 2  # ADE20K: index 2 = sky
+
         print("  Loading sky segmentation model...")
-        seg = hf_pipeline('image-segmentation', model='nvidia/segformer-b0-finetuned-ade-20k',
-                          device='cuda' if torch.cuda.is_available() else 'cpu')
+        model_name = 'openmmlab/upernet-swin-tiny'
+        processor = AutoImageProcessor.from_pretrained(model_name)
+        model = AutoModelForSemanticSegmentation.from_pretrained(model_name)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model = model.to(device).eval()
 
         sky_masks = []
         for i, path in enumerate(image_paths):
             img = PILImage.open(path).convert('RGB')
-            results = seg(img)
-
-            # Find sky segment (label 'sky' in ADE20K)
-            sky_mask = np.zeros((img.height, img.width), dtype=bool)
-            for r in results:
-                if 'sky' in r['label'].lower():
-                    mask = np.array(r['mask'].convert('L')) > 128
-                    sky_mask |= mask
+            inputs = processor(images=img, return_tensors="pt").to(device)
+            with torch.no_grad():
+                outputs = model(**inputs)
+            # Upsample logits to original image size
+            logits = torch.nn.functional.interpolate(
+                outputs.logits, size=(img.height, img.width),
+                mode='bilinear', align_corners=False)
+            seg_map = logits.argmax(dim=1)[0].cpu().numpy()
+            sky_mask = seg_map == SKY_LABEL_ID
 
             sky_masks.append(sky_mask)
             n_sky = sky_mask.sum()
             print(f"    Image {i+1}: {n_sky:,d} sky pixels ({n_sky * 100 // max(sky_mask.size, 1)}%)")
 
-        del seg
+        del model, processor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return sky_masks
@@ -2529,7 +2617,7 @@ def _create_masked_images(image_paths, prompt, keep=True, mask_sky=False, thresh
     from PIL import Image as PILImage
     import tempfile
 
-    tmpdir = _track_tmpdir(tempfile.mkdtemp(prefix="masked_"))
+    tmpdir = _app_mkdtemp(prefix="masked_")
     masks = []
 
     # Get subject masks if prompt given
@@ -3463,7 +3551,7 @@ def run_refinement(state, scene_gl, debug_imgs=None):
         from colmap_export import export_scene_to_colmap
 
         # Export COLMAP for camera data
-        tmpdir = _track_tmpdir(tempfile.mkdtemp())
+        tmpdir = _app_mkdtemp()
         export_dir = os.path.join(tmpdir, 'colmap')
         state.refine_progress = "Exporting cameras..."
         export_scene_to_colmap(
@@ -3943,7 +4031,7 @@ def run_recolor_mesh(state, scene_gl):
         verts, faces, colors = state.mesh_data
 
         # Export cameras
-        tmpdir = _track_tmpdir(tempfile.mkdtemp())
+        tmpdir = _app_mkdtemp()
         export_dir = os.path.join(tmpdir, 'colmap')
         state.refine_progress = "Exporting cameras..."
         export_scene_to_colmap(
@@ -4105,7 +4193,7 @@ def run_create_uvs(state, scene_gl):
         if state.scene is not None:
             try:
                 state.refine_progress = "Loading cameras for UV projection..."
-                tmpdir = _track_tmpdir(tempfile.mkdtemp())
+                tmpdir = _app_mkdtemp()
                 export_dir = os.path.join(tmpdir, 'colmap')
                 export_scene_to_colmap(
                     scene=state.scene, image_paths=state.image_paths,
@@ -4146,7 +4234,7 @@ def run_texture(state, scene_gl):
         views = getattr(state, '_cached_views', None)
         if views is None:
             state.refine_progress = "Exporting cameras..."
-            tmpdir = _track_tmpdir(tempfile.mkdtemp())
+            tmpdir = _app_mkdtemp()
             export_dir = os.path.join(tmpdir, 'colmap')
             export_scene_to_colmap(
                 scene=state.scene, image_paths=state.image_paths,
@@ -4241,7 +4329,7 @@ def run_train_splats(state, scene_gl):
             print(f"  Using imported COLMAP dataset: {export_dir}")
         else:
             state.splat_progress = "Exporting cameras..."
-            tmpdir = _track_tmpdir(tempfile.mkdtemp())
+            tmpdir = _app_mkdtemp()
             export_dir = os.path.join(tmpdir, 'colmap')
             export_scene_to_colmap(
                 scene=state.scene, image_paths=state.image_paths,
@@ -4487,6 +4575,9 @@ def _texture_pymeshlab(verts, faces, colors, views, output_dir, state):
 def main():
     _console.install()
 
+    # Clean stale temp data from any previous crashed sessions
+    cleanup_all_app_temps()
+
     if not glfw.init():
         print("Could not initialize GLFW")
         return
@@ -4495,7 +4586,7 @@ def main():
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 
-    window = glfw.create_window(1600, 900, "3D Reconstruction Studio", None, None)
+    window = glfw.create_window(1600, 900, APP_NAME, None, None)
     if not window:
         glfw.terminate()
         return
@@ -4636,6 +4727,8 @@ def main():
 
         # ── Project ──
         if imgui.button("New Project"):
+            # Clean all temp files
+            cleanup_all_app_temps()
             # Reset everything
             if hasattr(state, '_ever_centered'):
                 del state._ever_centered
@@ -4998,9 +5091,11 @@ def main():
             changed_kv, state.lingbot_kv_window = imgui.slider_int(
                 "KV Cache Window", state.lingbot_kv_window, 8, 64)
             if changed_kv:
-                # Force model reload with new KV window size
+                # Update KV window in-place if model is loaded (no reload needed)
                 import app as app_mod
-                app_mod.MODELS.pop('lingbot', None)
+                lingbot_model = app_mod.MODELS.get('lingbot', None)
+                if lingbot_model is not None:
+                    app_mod._update_lingbot_kv_window(lingbot_model, state.lingbot_kv_window)
             imgui.text_colored("Streaming SLAM — handles long videos", 0.5, 0.8, 0.5, 1.0)
 
         changed_conf, state.min_conf = imgui.slider_float("Min Confidence", state.min_conf, 0.1, 20.0)
@@ -5168,6 +5263,32 @@ def main():
                         state.status = f"Exported to {folder}"
                     except Exception as e:
                         state.error_msg = str(e)
+
+            if imgui.button("Export Cameras (.dae)", width=-1):
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                fpath = filedialog.asksaveasfilename(
+                    title="Export Cameras as COLLADA",
+                    defaultextension=".dae",
+                    filetypes=[("COLLADA", "*.dae")])
+                root.destroy()
+                if fpath:
+                    try:
+                        from colmap_export import export_cameras_to_collada
+                        export_cameras_to_collada(state.scene, fpath, state.image_paths)
+                        state.status = f"Cameras exported to {fpath}"
+                    except Exception as e:
+                        state.error_msg = str(e)
+            imgui.same_line()
+            imgui.text_disabled("(XSI / Blender / Maya)")
+
+        if state.has_mesh and (state.scene is not None or state.has_points):
+            if imgui.button("Export Mesh (.obj, Y-up)", width=-1):
+                state._deferred_action = 'export_mesh_obj_yup'
+            imgui.same_line()
+            imgui.text_disabled("(aligned with .dae cameras)")
 
         imgui.separator()
 
@@ -5413,6 +5534,18 @@ def main():
                 root.destroy()
                 if path:
                     _export_textured_obj(state, path)
+
+            elif action == 'export_mesh_obj_yup':
+                path = filedialog.asksaveasfilename(
+                    title="Export Mesh (Y-up, for XSI)",
+                    defaultextension=".obj",
+                    filetypes=[("OBJ files", "*.obj")])
+                root.destroy()
+                if path and state.mesh_data is not None:
+                    from colmap_export import export_mesh_obj_yup
+                    v, f, c = state.mesh_data
+                    export_mesh_obj_yup(v, f, c, path)
+                    state.status = f"Mesh exported to {path}"
 
             elif action == 'save_mesh_ply':
                 path = filedialog.asksaveasfilename(

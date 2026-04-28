@@ -49,7 +49,9 @@ from colmap_export import export_scene_to_colmap
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 MODELS = {}
-TMPDIR = tempfile.mkdtemp(prefix='3dgs_pipeline_')
+_APP_TMP_ROOT = os.path.join(tempfile.gettempdir(), '1825_Reconstructor')
+os.makedirs(_APP_TMP_ROOT, exist_ok=True)
+TMPDIR = tempfile.mkdtemp(prefix='gradio_', dir=_APP_TMP_ROOT)
 
 _original_paths = []
 
@@ -85,11 +87,26 @@ def load_model(backend, **kwargs):
             max_frame_num=4096, kv_cache_sliding_window=kv_window,
             kv_cache_scale_frames=8, kv_cache_cross_frame_special=True,
             kv_cache_include_scale_frames=True, use_sdpa=True)
-        ckpt_path = hf_hub_download("robbyant/lingbot-map", filename="lingbot-map.pt")
+        # Use local cache first to avoid unnecessary network round-trips
+        try:
+            ckpt_path = hf_hub_download("robbyant/lingbot-map", filename="lingbot-map.pt",
+                                        local_files_only=True)
+            print(f"  Loaded lingbot-map.pt from cache")
+        except Exception:
+            print(f"  Downloading lingbot-map.pt from HuggingFace...")
+            ckpt_path = hf_hub_download("robbyant/lingbot-map", filename="lingbot-map.pt")
         ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
         state_dict = ckpt.get("model", ckpt)
         model.load_state_dict(state_dict, strict=False)
         model.to(DEVICE).eval()
+
+
+def _update_lingbot_kv_window(model, kv_window):
+    """Update kv_cache_sliding_window on all submodules in-place (no reload)."""
+    for module in model.modules():
+        if hasattr(module, 'kv_cache_sliding_window'):
+            module.kv_cache_sliding_window = kv_window
+    print(f"  LingBot KV cache window updated to {kv_window}")
 
     MODELS[backend] = model
     print(f"{backend} loaded.")

@@ -511,3 +511,127 @@ def _voxel_downsample(pts, colors, confs, voxel_size=None):
 
     print(f"  Voxel downsample: {len(pts)} -> {len(selected)} points (voxel_size={voxel_size:.6f})")
     return pts[selected], colors[selected]
+
+
+# ── COLLADA (.dae) camera exporter (for Softimage XSI / Crosswalk) ───────────
+
+def export_cameras_to_collada(scene, output_path, image_paths=None):
+    """
+    Export cameras from a CanonicalScene to COLLADA (.dae) format.
+
+    Works with Softimage XSI (via Crosswalk), Blender, Maya, etc.
+    Converts from OpenCV convention (y-down, z-forward) to COLLADA Y-up.
+    Camera names are derived from source image filenames when available.
+    """
+    import math
+    import re
+
+    if scene is None:
+        raise ValueError("Scene is None, run reconstruction first.")
+
+    n = len(scene.images)
+    cam2world = scene.c2w
+    intrinsics = scene.intrinsics
+
+    # Derive camera names from image filenames
+    cam_names = []
+    for i in range(n):
+        if image_paths and i < len(image_paths):
+            stem = os.path.splitext(os.path.basename(image_paths[i]))[0]
+            # Sanitize for XML id: replace non-alphanumeric with underscore
+            safe = re.sub(r'[^A-Za-z0-9_.-]', '_', stem)
+            cam_names.append(safe)
+        else:
+            cam_names.append(f"camera_{i:03d}")
+
+    # OpenCV -> Y-up flip: diag(1, -1, -1, 1)
+    flip = np.diag([1.0, -1.0, -1.0, 1.0])
+
+    lines = []
+    lines.append('<?xml version="1.0" encoding="utf-8"?>')
+    lines.append('<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">')
+    lines.append('  <asset>')
+    lines.append('    <up_axis>Y_UP</up_axis>')
+    lines.append('  </asset>')
+
+    # Library: camera optics
+    lines.append('  <library_cameras>')
+    for i in range(n):
+        K = intrinsics[i]
+        fx, fy = K[0, 0], K[1, 1]
+        H, W = scene.images[i].shape[:2]
+        yfov_rad = 2.0 * math.atan2(H, 2.0 * fy)
+        yfov_deg = math.degrees(yfov_rad)
+        aspect = W / H
+        name = cam_names[i]
+
+        lines.append(f'    <camera id="{name}_cam" name="{name}">')
+        lines.append(f'      <optics>')
+        lines.append(f'        <technique_common>')
+        lines.append(f'          <perspective>')
+        lines.append(f'            <yfov>{yfov_deg:.6f}</yfov>')
+        lines.append(f'            <aspect_ratio>{aspect:.6f}</aspect_ratio>')
+        lines.append(f'            <znear>0.01</znear>')
+        lines.append(f'            <zfar>10000</zfar>')
+        lines.append(f'          </perspective>')
+        lines.append(f'        </technique_common>')
+        lines.append(f'      </optics>')
+        lines.append(f'    </camera>')
+    lines.append('  </library_cameras>')
+
+    # Visual scene: camera nodes with transforms
+    lines.append('  <library_visual_scenes>')
+    lines.append('    <visual_scene id="Scene" name="Scene">')
+    for i in range(n):
+        c2w_dae = flip @ cam2world[i] @ flip
+        # COLLADA matrix is row-major in the XML
+        m = c2w_dae
+        mat_str = ' '.join(f'{m[r, c]:.10f}' for r in range(4) for c in range(4))
+        name = cam_names[i]
+
+        lines.append(f'      <node id="{name}_node" name="{name}" type="NODE">')
+        lines.append(f'        <matrix sid="transform">{mat_str}</matrix>')
+        lines.append(f'        <instance_camera url="#{name}_cam"/>')
+        lines.append(f'      </node>')
+    lines.append('    </visual_scene>')
+    lines.append('  </library_visual_scenes>')
+
+    lines.append('  <scene>')
+    lines.append('    <instance_visual_scene url="#Scene"/>')
+    lines.append('  </scene>')
+    lines.append('</COLLADA>')
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+
+    print(f"COLLADA cameras exported: {n} cameras -> {output_path}")
+
+
+def export_mesh_obj_yup(verts, faces, colors, output_path):
+    """
+    Export a vertex-colored mesh to OBJ with the same Y-up coordinate
+    transform used by export_cameras_to_collada, so they align in XSI.
+
+    Applies flip: (x, y, z) -> (x, -y, -z)
+    """
+    n_v = len(verts)
+    n_f = len(faces)
+    has_colors = colors is not None and len(colors) == n_v
+
+    with open(output_path, 'w') as f:
+        f.write(f"# OBJ export (Y-up, aligned with COLLADA cameras)\n")
+        f.write(f"# {n_v} vertices, {n_f} faces\n")
+        for i in range(n_v):
+            x, y, z = float(verts[i, 0]), float(-verts[i, 1]), float(-verts[i, 2])
+            if has_colors:
+                r, g, b = colors[i]
+                if not isinstance(r, float) or r > 1.0:
+                    r, g, b = r / 255.0, g / 255.0, b / 255.0
+                f.write(f"v {x:.6f} {y:.6f} {z:.6f} {r:.4f} {g:.4f} {b:.4f}\n")
+            else:
+                f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+        for i in range(n_f):
+            a, b, c = faces[i] + 1  # OBJ is 1-indexed
+            f.write(f"f {a} {b} {c}\n")
+
+    print(f"OBJ mesh exported (Y-up): {n_v} verts, {n_f} faces -> {output_path}")
